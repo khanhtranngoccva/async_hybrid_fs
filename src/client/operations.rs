@@ -108,7 +108,7 @@ impl Client {
             let uring = self.uring.as_ref().expect(
                 "should be able to resolve uring because is_uring_operation_supported() is true",
             );
-            let target = file.as_target(&uring.identity);
+            let target = unsafe { file.as_target(&uring.identity) };
             let (tx, rx) = oneshot::channel();
             self.send(Command::Read {
                 req: ReadRequest {
@@ -181,7 +181,7 @@ impl Client {
             let uring = self.uring.as_ref().expect(
                 "should be able to resolve uring because is_uring_operation_supported() is true",
             );
-            let target = file.as_target(&uring.identity);
+            let target = unsafe { file.as_target(&uring.identity) };
             let (tx, rx) = oneshot::channel();
             let iovec_buffers = IovecArray(
                 bufs.iter_mut()
@@ -246,7 +246,7 @@ impl Client {
             let uring = self.uring.as_ref().expect(
                 "should be able to resolve uring because is_uring_operation_supported() is true",
             );
-            let target = file.as_target(&uring.identity);
+            let target = unsafe { file.as_target(&uring.identity) };
             let (tx, rx) = oneshot::channel();
             let iovec_buffers = IovecArray(
                 bufs.iter_mut()
@@ -339,7 +339,7 @@ impl Client {
             let uring = self.uring.as_ref().expect(
                 "should be able to resolve uring because is_uring_operation_supported() is true",
             );
-            let target = file.as_target(&uring.identity);
+            let target = unsafe { file.as_target(&uring.identity) };
             let (tx, rx) = oneshot::channel();
             self.send(Command::Read {
                 req: ReadRequest {
@@ -644,7 +644,7 @@ impl Client {
             let uring = self.uring.as_ref().expect(
                 "should be able to resolve uring because is_uring_operation_supported() is true",
             );
-            let target = file.as_target(&uring.identity);
+            let target = unsafe { file.as_target(&uring.identity) };
             let (tx, rx) = oneshot::channel();
             self.send(Command::Write {
                 req: WriteRequest {
@@ -700,7 +700,7 @@ impl Client {
             let uring = self.uring.as_ref().expect(
                 "should be able to resolve uring because is_uring_operation_supported() is true",
             );
-            let target = file.as_target(&uring.identity);
+            let target = unsafe { file.as_target(&uring.identity) };
             let (tx, rx) = oneshot::channel();
             let iovec_buffers = IovecArray(
                 bufs.iter_mut()
@@ -826,7 +826,7 @@ impl Client {
             let uring = self.uring.as_ref().expect(
                 "should be able to resolve uring because is_uring_operation_supported() is true",
             );
-            let target = file.as_target(&uring.identity);
+            let target = unsafe { file.as_target(&uring.identity) };
             let (tx, rx) = oneshot::channel();
             self.send(Command::Write {
                 req: WriteRequest {
@@ -873,7 +873,7 @@ impl Client {
             let uring = self.uring.as_ref().expect(
                 "should be able to resolve uring because is_uring_operation_supported() is true",
             );
-            let target = file.as_target(&uring.identity);
+            let target = unsafe { file.as_target(&uring.identity) };
             let (tx, rx) = oneshot::channel();
             let transmuted = IovecArray(
                 bufs.iter()
@@ -1040,7 +1040,7 @@ impl Client {
             let uring = self.uring.as_ref().expect(
                 "should be able to resolve uring because is_uring_operation_supported() is true",
             );
-            let target = file.as_target(&uring.identity);
+            let target = unsafe { file.as_target(&uring.identity) };
             let (tx, rx) = oneshot::channel();
             self.send(Command::Sync {
                 req: SyncRequest {
@@ -1070,7 +1070,7 @@ impl Client {
             let uring = self.uring.as_ref().expect(
                 "should be able to resolve uring because is_uring_operation_supported() is true",
             );
-            let target = file.as_target(&uring.identity);
+            let target = unsafe { file.as_target(&uring.identity) };
             let (tx, rx) = oneshot::channel();
             self.send(Command::Sync {
                 req: SyncRequest {
@@ -1099,7 +1099,7 @@ impl Client {
             let uring = self.uring.as_ref().expect(
                 "should be able to resolve uring because is_uring_operation_supported() is true",
             );
-            let target = file.as_target(&uring.identity);
+            let target = unsafe { file.as_target(&uring.identity) };
             let (tx, rx) = oneshot::channel();
             self.send(Command::Statx {
                 req: StatxRequest {
@@ -1225,7 +1225,7 @@ impl Client {
             let uring = self.uring.as_ref().expect(
                 "should be able to resolve uring because is_uring_operation_supported() is true",
             );
-            let target = file.as_target(&uring.identity);
+            let target = unsafe { file.as_target(&uring.identity) };
             let (tx, rx) = oneshot::channel();
             self.send(Command::Fallocate {
                 req: FallocateRequest {
@@ -1278,7 +1278,7 @@ impl Client {
             let uring = self.uring.as_ref().expect(
                 "should be able to resolve uring because is_uring_operation_supported() is true",
             );
-            let target = file.as_target(&uring.identity);
+            let target = unsafe { file.as_target(&uring.identity) };
             let (tx, rx) = oneshot::channel();
             self.send(Command::Fadvise {
                 req: FadviseRequest {
@@ -1326,7 +1326,7 @@ impl Client {
             let uring = self.uring.as_ref().expect(
                 "should be able to resolve uring because is_uring_operation_supported() is true",
             );
-            let target = file.as_target(&uring.identity);
+            let target = unsafe { file.as_target(&uring.identity) };
             let (tx, rx) = oneshot::channel();
             self.send(Command::Ftruncate {
                 req: FtruncateRequest { target, len },

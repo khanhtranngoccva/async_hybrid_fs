@@ -1,20 +1,52 @@
-use std::{ffi::CString, mem::MaybeUninit, ops::Deref, os::fd::RawFd};
-
+use crate::UringTarget;
 use libc::iovec;
+use std::{
+    ffi::CString,
+    mem::MaybeUninit,
+    ops::Deref,
+    os::fd::{BorrowedFd, RawFd},
+    sync::Arc,
+};
 
-#[derive(Clone, Copy)]
+/// A raw target object that can be used by the io_uring client, which represents either a borrowed file descriptor or a borrowed fixed entry.
+///
+/// A user may obtain a mutable Target object by calling the unsafe `as_target` method on an immutable UringTarget object, which allows bypassing mutable checks to avoid certain overhead.
+#[derive(Clone)]
 pub enum Target {
     Fd(RawFd),
-    Fixed { index: u32, raw_fd: RawFd },
+    Fixed {
+        index: u32,
+        raw_fd: RawFd,
+        uring_identity: Arc<()>,
+    },
 }
 
-impl Target {
-    #[allow(unused)]
-    pub(crate) fn fd(&self) -> RawFd {
+impl UringTarget for Target {
+    fn as_fd(&self) -> BorrowedFd<'_> {
         match self {
-            Target::Fd(fd) => *fd,
-            #[allow(unused)]
-            Target::Fixed { index, raw_fd } => *raw_fd,
+            Target::Fd(fd) => unsafe { BorrowedFd::borrow_raw(*fd) },
+            Target::Fixed { raw_fd, .. } => unsafe { BorrowedFd::borrow_raw(*raw_fd) },
+        }
+    }
+
+    unsafe fn as_target(&self, _uring_identity: &Arc<()>) -> Target {
+        match self {
+            Target::Fd(fd) => Target::Fd(*fd),
+            Target::Fixed {
+                index,
+                raw_fd,
+                uring_identity,
+            } => {
+                if Arc::ptr_eq(uring_identity, _uring_identity) {
+                    Target::Fixed {
+                        index: *index,
+                        raw_fd: *raw_fd,
+                        uring_identity: uring_identity.clone(),
+                    }
+                } else {
+                    Target::Fd(*raw_fd)
+                }
+            }
         }
     }
 }

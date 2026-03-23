@@ -16,11 +16,10 @@ use dashmap::{DashMap, DashSet};
 use io_uring::IoUring;
 use io_uring::cqueue::Entry as CEntry;
 use io_uring::squeue::Entry as SEntry;
+pub use register::OwnedRegisteredFile;
 pub use register::RegisterError;
 pub use register::RegisteredFile;
-pub use register::OwnedRegisteredFile;
-
-use crate::client::requests::Target;
+pub use requests::Target;
 
 /// Maximum length for a single io_uring read/write operation.
 ///
@@ -299,18 +298,18 @@ fn completion_thread(
 }
 
 pub trait UringTarget {
-    /// Internal method for converting the target to a file descriptor.
+    /// Method for converting the target to a borrowed file descriptor.
     fn as_fd(&self) -> BorrowedFd<'_>;
 
-    /// Internal method for converting the target to a target that can be used by the io_uring client.
-    fn as_target(&self, _uring_identity: &Arc<()>) -> Target;
+    /// Method for converting the target to a raw target object that can be used by the io_uring client.
+    unsafe fn as_target(&self, _uring_identity: &Arc<()>) -> Target;
 }
 
 impl<T> UringTarget for T
 where
     T: AsFd + ?Sized,
 {
-    fn as_target(&self, _uring_identity: &Arc<()>) -> Target {
+    unsafe fn as_target(&self, _uring_identity: &Arc<()>) -> Target {
         Target::Fd(self.as_fd().as_raw_fd())
     }
 

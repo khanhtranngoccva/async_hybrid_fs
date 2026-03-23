@@ -50,6 +50,7 @@ pub use client::ClientUring;
 pub use client::OwnedRegisteredFile;
 pub use client::RegisterError;
 pub use client::RegisteredFile;
+pub use client::Target;
 pub use client::UringCfg;
 pub use client::UringTarget;
 pub use default::default_client;

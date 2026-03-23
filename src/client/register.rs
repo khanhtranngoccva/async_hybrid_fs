@@ -73,11 +73,12 @@ impl UringTarget for RegisteredFile<'_> {
         self.fd
     }
 
-    fn as_target(&self, _uring_identity: &Arc<()>) -> Target {
+    unsafe fn as_target(&self, _uring_identity: &Arc<()>) -> Target {
         if Arc::ptr_eq(&self.uring_identity, _uring_identity) {
             Target::Fixed {
                 index: self.index.unwrap(),
                 raw_fd: self.fd.as_raw_fd(),
+                uring_identity: self.uring_identity.clone(),
             }
         } else {
             // If the RegisteredFile is used with a different Client instance, return the raw file descriptor to allow the file to be used normally,
@@ -129,11 +130,12 @@ impl UringTarget for OwnedRegisteredFile {
         AsFd::as_fd(self.fd.as_ref().unwrap())
     }
 
-    fn as_target(&self, _uring_identity: &Arc<()>) -> Target {
+    unsafe fn as_target(&self, _uring_identity: &Arc<()>) -> Target {
         if Arc::ptr_eq(&self.uring_identity, _uring_identity) {
             Target::Fixed {
                 index: self.index,
                 raw_fd: self.fd.as_ref().unwrap().as_raw_fd(),
+                uring_identity: self.uring_identity.clone(),
             }
         } else {
             // If the OwnedRegisteredFile is used with a different Client instance, return the raw file descriptor to allow the file to be used normally,
