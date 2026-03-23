@@ -435,6 +435,28 @@ pub trait HybridFile: UringTarget {
         default_client().hard_link_file(self, new_path).await
     }
 
+    /// Method for syncing the metadata and data of a file.
+    #[inline]
+    async fn sync_all(&self) -> io::Result<()> {
+        self.hybrid_sync_all().await
+    }
+
+    /// Alias for [`HybridFile::sync_all`].
+    async fn hybrid_sync_all(&self) -> io::Result<()> {
+        default_client().sync_all(self).await
+    }
+
+    /// Method for syncing the data of a file.
+    #[inline]
+    async fn sync_data(&self) -> io::Result<()> {
+        self.hybrid_sync_data().await
+    }
+
+    /// Alias for [`HybridFile::sync_data`].
+    async fn hybrid_sync_data(&self) -> io::Result<()> {
+        default_client().sync_data(self).await
+    }
+
     /// Register a file for use with the global io_uring instance.
     fn register<'a>(&'a self) -> Result<RegisteredFile<'a>, RegisterError>
     where

@@ -1042,7 +1042,7 @@ impl Client {
     /// Synchronize file data and metadata to disk (fsync). This ensures that all data and metadata modifications are flushed to the underlying storage device. Even when using direct I/O, this is necessary to ensure the device itself has flushed any internal caches.
     ///
     /// **Note on ordering**: io_uring does not guarantee ordering between operations. If you need to ensure writes complete before fsync, you should await the write first, then call fsync.
-    pub async fn sync_all(&self, file: &mut (impl UringTarget + ?Sized)) -> io::Result<()> {
+    pub async fn sync_all(&self, file: &(impl UringTarget + ?Sized)) -> io::Result<()> {
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Fsync::CODE)
         {
@@ -1072,7 +1072,7 @@ impl Client {
     /// Synchronize file data to disk (fdatasync). This ensures that only data modifications are flushed to the underlying storage device. This is useful for ensuring that data is written but not metadata.
     ///
     /// **Note on ordering**: io_uring does not guarantee ordering between operations. If you need to ensure writes complete before fdatasync, you should await the write first, then call fdatasync.
-    pub async fn sync_data(&self, file: &mut (impl UringTarget + ?Sized)) -> io::Result<()> {
+    pub async fn sync_data(&self, file: &(impl UringTarget + ?Sized)) -> io::Result<()> {
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Fsync::CODE)
         {
