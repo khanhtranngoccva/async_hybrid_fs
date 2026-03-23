@@ -10,7 +10,7 @@ use std::{
 
 /// A raw target object that can be used by the io_uring client, which represents either a borrowed file descriptor or a borrowed fixed entry.
 ///
-/// A user may obtain a mutable Target object by calling the unsafe `as_target` method on an immutable UringTarget object, which allows bypassing mutable checks to avoid certain overhead.
+/// A user may obtain a mutable Target object by calling the unsafe [`Client::as_target`](crate::Client::as_target) method on an immutable UringTarget object, which allows bypassing mutable checks to avoid certain overhead.
 #[derive(Clone)]
 pub enum Target {
     Fd(RawFd),
