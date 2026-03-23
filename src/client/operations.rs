@@ -57,7 +57,7 @@ impl Client {
     }
 
     /// Obtain a raw target object for use in mutable operations, which bypasses mutable checks.
-    pub unsafe fn to_target(&self, target: &impl UringTarget) -> Target {
+    pub unsafe fn to_target(&self, target: &(impl UringTarget + ?Sized)) -> Target {
         match &self.uring {
             None => Target::Fd(target.as_fd().as_raw_fd()),
             Some(uring) => unsafe { target.as_target(&uring.identity) },
