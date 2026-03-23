@@ -54,6 +54,7 @@ pub use client::Target;
 pub use client::UringCfg;
 pub use client::UringTarget;
 pub use default::default_client;
+pub use fs::OpenOptions;
 
 #[async_trait::async_trait]
 pub trait HybridRead: UringTarget {
@@ -558,16 +559,29 @@ pub trait HybridDir: UringTarget {
     }
 }
 
-#[async_trait::async_trait]
-impl<T> HybridRead for T where T: UringTarget + ?Sized {}
-#[async_trait::async_trait]
-impl<T> HybridWrite for T where T: UringTarget + ?Sized {}
-#[async_trait::async_trait]
-impl<T> HybridSeek for T where T: UringTarget + ?Sized {}
-#[async_trait::async_trait]
-impl<T> HybridFile for T where T: UringTarget + ?Sized {}
-#[async_trait::async_trait]
-impl<T> HybridDir for T where T: UringTarget + ?Sized {}
+macro_rules! hybrid_impl {
+    ($struct:ty) => {
+        #[async_trait::async_trait]
+        impl HybridRead for $struct {}
+        #[async_trait::async_trait]
+        impl HybridWrite for $struct {}
+        #[async_trait::async_trait]
+        impl HybridSeek for $struct {}
+        #[async_trait::async_trait]
+        impl HybridFile for $struct {}
+        #[async_trait::async_trait]
+        impl HybridDir for $struct {}
+    };
+}
+
+// Implementations for raw file types (do not allow support for arbitrary AsFd/UringTarget type because the trait methods are *much* easier to misuse for wrapper types)
+hybrid_impl!(std::fs::File);
+hybrid_impl!(tokio::fs::File);
+hybrid_impl!(BorrowedFd<'_>);
+hybrid_impl!(OwnedFd);
+hybrid_impl!(RegisteredFile<'_>);
+hybrid_impl!(OwnedRegisteredFile);
+hybrid_impl!(Target);
 
 // Dynamic trait object compiler checks.
 type _DynCompatibleHybridRead = Box<dyn HybridRead>;
