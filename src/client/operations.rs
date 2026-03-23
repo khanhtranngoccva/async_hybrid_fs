@@ -1,5 +1,6 @@
 use super::command::Command;
 use crate::{
+    Target,
     borrowed_buf::BorrowedBuf,
     client::{
         Client, URING_LEN_MAX, UringTarget,
@@ -53,6 +54,14 @@ impl Client {
     /// Enable or disable io_uring dynamically, which is useful if the target system does not allow io_uring for security reasons. If disabled, the client will fall back to using [`tokio::task::spawn_blocking`] for all operations.
     pub fn enable_uring_operation(&self, enabled: bool) {
         self.uring_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Obtain a raw target object for use in mutable operations, which bypasses mutable checks.
+    unsafe fn to_target(&self, target: &impl UringTarget) -> Target {
+        match &self.uring {
+            None => Target::Fd(target.as_fd().as_raw_fd()),
+            Some(uring) => unsafe { target.as_target(&uring.identity) },
+        }
     }
 
     fn send(&self, command: Command) {
