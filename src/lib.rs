@@ -559,6 +559,12 @@ pub trait HybridDir: UringTarget {
     }
 }
 
+#[async_trait::async_trait]
+pub trait HybridExt:
+    UringTarget + HybridRead + HybridWrite + HybridSeek + HybridFile + HybridDir
+{
+}
+
 macro_rules! hybrid_impl {
     ($struct:ty) => {
         #[async_trait::async_trait]
@@ -571,6 +577,8 @@ macro_rules! hybrid_impl {
         impl HybridFile for $struct {}
         #[async_trait::async_trait]
         impl HybridDir for $struct {}
+        #[async_trait::async_trait]
+        impl HybridExt for $struct {}
     };
 }
 
@@ -589,6 +597,7 @@ type _DynCompatibleHybridWrite = Box<dyn HybridWrite>;
 type _DynCompatibleHybridSeek = Box<dyn HybridSeek>;
 type _DynCompatibleHybridFile = Box<dyn HybridFile>;
 type _DynCompatibleHybridDir = Box<dyn HybridDir>;
+type _DynCompatibleHybridExt = Box<dyn HybridExt>;
 
 #[cfg(test)]
 mod tests {
