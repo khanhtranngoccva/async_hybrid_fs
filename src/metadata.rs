@@ -6,6 +6,8 @@ use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+use nix::sys::stat::SFlag;
+
 /// File metadata returned by statx. Provides an interface compatible with [`std::fs::Metadata`] and [`std::os::unix::fs::MetadataExt`].
 pub struct Metadata(pub(crate) libc::statx);
 
@@ -213,6 +215,75 @@ impl fmt::Debug for FileType {
             "unknown"
         };
         write!(f, "FileType({kind})")
+    }
+}
+
+// =============================================================================
+// CreateNodeType
+// =============================================================================
+
+/// Representation of device numbers in the major-minor form. Defaults to 0 for both major and minor. Can be converted to and from [`libc::dev_t`] with the [`From`] and [`Into`] traits.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct DeviceNumber {
+    pub major: u32,
+    pub minor: u32,
+}
+
+impl From<libc::dev_t> for DeviceNumber {
+    fn from(dev: libc::dev_t) -> Self {
+        Self {
+            major: libc::major(dev),
+            minor: libc::minor(dev),
+        }
+    }
+}
+
+impl Into<libc::dev_t> for DeviceNumber {
+    fn into(self) -> libc::dev_t {
+        libc::makedev(self.major, self.minor)
+    }
+}
+
+/// High-level representation of types that can be created with `mknodat(2)`.
+///
+/// # Note
+/// - Symlinks are not supported by this type.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MknodType {
+    BlockDevice(DeviceNumber),
+    CharDevice(DeviceNumber),
+    Fifo,
+    Socket,
+    RegularFile,
+    Directory,
+}
+
+impl MknodType {
+    pub fn to_sflag_and_device(&self) -> (SFlag, DeviceNumber) {
+        match self {
+            MknodType::BlockDevice(device) => (SFlag::S_IFBLK, *device),
+            MknodType::CharDevice(device) => (SFlag::S_IFCHR, *device),
+            MknodType::Fifo => (SFlag::S_IFIFO, DeviceNumber::default()),
+            MknodType::Socket => (SFlag::S_IFSOCK, DeviceNumber::default()),
+            MknodType::RegularFile => (SFlag::S_IFREG, DeviceNumber::default()),
+            MknodType::Directory => (SFlag::S_IFDIR, DeviceNumber::default()),
+        }
+    }
+
+    /// Create a `MknodType` from a [`SFlag`] and a [`DeviceNumber`].
+    pub fn from_sflag_and_device(sflag: SFlag, device: DeviceNumber) -> io::Result<Self> {
+        match (sflag, device) {
+            (SFlag::S_IFBLK, device) => Ok(MknodType::BlockDevice(device)),
+            (SFlag::S_IFCHR, device) => Ok(MknodType::CharDevice(device)),
+            (SFlag::S_IFIFO, _) => Ok(MknodType::Fifo),
+            (SFlag::S_IFSOCK, _) => Ok(MknodType::Socket),
+            (SFlag::S_IFREG, _) => Ok(MknodType::RegularFile),
+            (SFlag::S_IFDIR, _) => Ok(MknodType::Directory),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Invalid SFlag and device",
+            )),
+        }
     }
 }
 

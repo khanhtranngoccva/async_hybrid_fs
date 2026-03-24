@@ -15,7 +15,7 @@ use crate::{
     flags::MetadataAtFlags,
     helpers,
     iobuf::{IoBuf, IoBufMut},
-    metadata::{Metadata, Permissions},
+    metadata::{Metadata, MknodType, Permissions},
 };
 use core::fmt;
 use io_uring::opcode;
@@ -1730,6 +1730,39 @@ impl Client {
         }
     }
 
+    /// Create a directory and all missing parent directories with the specified permissions.
+    pub async fn create_dir_all_with_permissions(
+        &self,
+        path: impl AsRef<Path>,
+        permissions: Permissions,
+    ) -> io::Result<()> {
+        let path = path.as_ref();
+        if path == Path::new("") {
+            return Ok(());
+        }
+
+        match self.mkdir(path, permissions).await {
+            Ok(()) => return Ok(()),
+            Err(ref e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(_) if path.is_dir() => return Ok(()),
+            Err(e) => return Err(e),
+        }
+        match path.parent() {
+            Some(p) => self.create_dir_all_with_permissions(p, permissions).await?,
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "failed to create whole tree",
+                ));
+            }
+        }
+        match self.mkdir(path, permissions).await {
+            Ok(()) => Ok(()),
+            Err(_) if path.is_dir() => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Create a symbolic link relative to a directory fd. This is the io_uring equivalent of `symlinkat(2)`.
     pub async fn symlink_at(
         &self,
@@ -1901,7 +1934,7 @@ impl Client {
     }
 
     /// Set the permissions of a file or directory relative to a directory fd, which is equivalent to `fchmodat(2)`.
-    pub async fn fchmodat(
+    pub async fn fchmod_at(
         &self,
         fd: &(impl UringTarget + ?Sized),
         path: impl AsRef<Path>,
@@ -1968,7 +2001,7 @@ impl Client {
     }
 
     /// Set the user and/or group ownership of a file or directory relative to a directory fd, which is equivalent to `fchownat(2)`.
-    pub async fn fchownat(
+    pub async fn fchown_at(
         &self,
         fd: &(impl UringTarget + ?Sized),
         path: impl AsRef<Path>,
@@ -2056,7 +2089,7 @@ impl Client {
     }
 
     /// Set file times of a file or directory using a path relative to a directory fd, which is equivalent to `utimensat(2)`.
-    pub async fn utimensat(
+    pub async fn utimens_at(
         &self,
         fd: &(impl UringTarget + ?Sized),
         path: impl AsRef<Path>,
@@ -2089,5 +2122,45 @@ impl Client {
     /// Read a symbolic link. This is equivalent to `readlink(2)`.
     pub async fn read_link(&self, path: impl AsRef<Path>) -> io::Result<PathBuf> {
         tokio::fs::read_link(path).await
+    }
+
+    /// Create a device node at a relative path to a directory fd, which is equivalent to `mknodat(2)`.
+    pub async fn mknod_at(
+        &self,
+        dir_fd: &(impl UringTarget + ?Sized),
+        path: impl AsRef<Path>,
+        kind: MknodType,
+        permissions: Permissions,
+    ) -> io::Result<()> {
+        let path = path.as_ref().to_owned();
+        let raw_fd = dir_fd.as_fd().as_raw_fd();
+        tokio::task::spawn_blocking(move || unsafe {
+            let (kind, device) = kind.to_sflag_and_device();
+            nix::sys::stat::mknodat(
+                BorrowedFd::borrow_raw(raw_fd),
+                &path,
+                kind,
+                Mode::from_bits_retain(permissions.mode()),
+                device.into(),
+            )
+        })
+        .await??;
+        Ok(())
+    }
+
+    /// Create a device node using path syntax, which is equivalent to `mknod(2)`.
+    pub async fn mknod(
+        &self,
+        path: impl AsRef<Path>,
+        kind: MknodType,
+        permissions: Permissions,
+    ) -> io::Result<()> {
+        self.mknod_at(
+            &unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) },
+            path,
+            kind,
+            permissions,
+        )
+        .await
     }
 }

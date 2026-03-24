@@ -1,6 +1,9 @@
 use nix::{
     fcntl::OFlag,
-    sys::{stat::UtimensatFlags, time::TimeSpec},
+    sys::{
+        stat::{Mode, UtimensatFlags},
+        time::TimeSpec,
+    },
     unistd::{Gid, Uid},
 };
 use std::{
@@ -169,6 +172,7 @@ impl OpenOptions {
         Ok(File::from_std(std::fs::File::from(fd)))
     }
 
+    /// Get access mode flags
     pub fn get_access_flags(&self) -> io::Result<OFlag> {
         match (self.read, self.write, self.append) {
             (true, false, false) => Ok(OFlag::O_RDONLY),
@@ -194,6 +198,7 @@ impl OpenOptions {
         }
     }
 
+    /// Get creation flags
     pub fn get_creation_flags(&self) -> io::Result<OFlag> {
         match (self.write, self.append) {
             (true, false) => {}
@@ -224,8 +229,23 @@ impl OpenOptions {
         })
     }
 
+    /// Get creation permissions
     pub fn get_creation_permissions(&self) -> Permissions {
         self.permissions
+    }
+
+    /// Create an OpenOptions from low-level [`OFlag`] and [`Mode`] structs
+    pub fn from_flag_and_mode(flags: OFlag, mode: Mode) -> Self {
+        Self {
+            read: flags.contains(OFlag::O_RDONLY) || flags.contains(OFlag::O_RDWR),
+            write: flags.contains(OFlag::O_WRONLY) || flags.contains(OFlag::O_RDWR),
+            append: flags.contains(OFlag::O_APPEND),
+            truncate: flags.contains(OFlag::O_TRUNC),
+            create: flags.contains(OFlag::O_CREAT),
+            create_new: flags.contains(OFlag::O_EXCL),
+            permissions: Permissions::from_mode(mode.bits()),
+            custom_flags: flags & !Self::get_managed_flags(),
+        }
     }
 
     #[inline]
@@ -272,6 +292,22 @@ pub async fn create_dir(path: impl AsRef<Path>) -> io::Result<()> {
 
 pub async fn create_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
     default::default_client().create_dir_all(path).await
+}
+
+pub async fn create_dir_with_permissions(
+    path: impl AsRef<Path>,
+    permissions: Permissions,
+) -> io::Result<()> {
+    default::default_client().mkdir(path, permissions).await
+}
+
+pub async fn create_dir_all_with_permissions(
+    path: impl AsRef<Path>,
+    permissions: Permissions,
+) -> io::Result<()> {
+    default::default_client()
+        .create_dir_all_with_permissions(path, permissions)
+        .await
 }
 
 pub async fn exists(path: impl AsRef<Path>) -> io::Result<bool> {
@@ -408,7 +444,7 @@ pub async fn set_times(
     mtime: Option<TimeSpec>,
 ) -> io::Result<()> {
     default::default_client()
-        .utimensat(
+        .utimens_at(
             &unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) },
             path,
             atime,
@@ -424,7 +460,7 @@ pub async fn set_times_nofollow(
     mtime: Option<TimeSpec>,
 ) -> io::Result<()> {
     default::default_client()
-        .utimensat(
+        .utimens_at(
             &unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) },
             path,
             atime,

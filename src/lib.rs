@@ -41,8 +41,10 @@ use std::os::fd::FromRawFd;
 use std::os::fd::IntoRawFd;
 use std::os::fd::OwnedFd;
 use std::path::Path;
+use tokio::fs::File;
 
 pub use crate::metadata::Metadata;
+use crate::metadata::MknodType;
 pub use crate::metadata::Permissions;
 pub use client::Client;
 pub use client::ClientBuildError;
@@ -577,6 +579,123 @@ pub trait HybridDir: UringTarget {
                 new_path,
                 flags,
             )
+            .await
+    }
+
+    /// Method for opening a file from a relative path to the directory fd.
+    /// Unlike the client methods, this method always returns a [`tokio::fs::File`].
+    #[inline]
+    async fn open_at(
+        &self,
+        path: impl AsRef<Path> + Send,
+        options: &OpenOptions,
+    ) -> io::Result<File> {
+        self.hybrid_open_at(path, options).await
+    }
+
+    /// Alias for [`HybridDir::open_at`].
+    async fn hybrid_open_at(
+        &self,
+        path: impl AsRef<Path> + Send,
+        options: &OpenOptions,
+    ) -> io::Result<File> {
+        Ok(File::from_std(std::fs::File::from(
+            default_client()
+                .open_at(
+                    self,
+                    path,
+                    options.get_flags()?,
+                    options.get_creation_permissions(),
+                )
+                .await?,
+        )))
+    }
+
+    /// Method for creating a file using a relative path to the directory fd.
+    /// Unlike the client methods, this method always returns a [`tokio::fs::File`].
+    #[inline]
+    async fn create_at(
+        &self,
+        path: impl AsRef<Path> + Send,
+        options: &OpenOptions,
+    ) -> io::Result<File> {
+        self.hybrid_create_at(path, options).await
+    }
+
+    /// Alias for [`HybridDir::create_at`].
+    async fn hybrid_create_at(
+        &self,
+        path: impl AsRef<Path> + Send,
+        options: &OpenOptions,
+    ) -> io::Result<File> {
+        let mut options = options.clone();
+        options.create(true);
+        self.hybrid_open_at(path, &options).await
+    }
+
+    /// Method for creating a file using a relative path to the directory fd,
+    /// ensuring that the file is always created or an error is returned.
+    /// Unlike the client methods, this method always returns a [`tokio::fs::File`].
+    #[inline]
+    async fn create_new_at(
+        &self,
+        path: impl AsRef<Path> + Send,
+        options: &OpenOptions,
+    ) -> io::Result<File> {
+        self.hybrid_create_new_at(path, options).await
+    }
+
+    /// Alias method for [`HybridDir::create_new_at`].
+    async fn hybrid_create_new_at(
+        &self,
+        path: impl AsRef<Path> + Send,
+        options: &OpenOptions,
+    ) -> io::Result<File> {
+        let mut options = options.clone();
+        options.create_new(true);
+        options.create(true);
+        self.hybrid_open_at(path, &options).await
+    }
+
+    /// Method for creating a directory using a relative path to the directory fd.
+    #[inline]
+    async fn create_dir_at(
+        &self,
+        path: impl AsRef<Path> + Send,
+        permissions: Permissions,
+    ) -> io::Result<()> {
+        self.hybrid_create_dir_at(path, permissions).await
+    }
+
+    /// Alias for [`HybridDir::create_dir_at`].
+    async fn hybrid_create_dir_at(
+        &self,
+        path: impl AsRef<Path> + Send,
+        permissions: Permissions,
+    ) -> io::Result<()> {
+        default_client().mkdir_at(self, path, permissions).await
+    }
+
+    /// Method for creating a node at a relative path to the directory fd.
+    #[inline]
+    async fn create_node_at(
+        &self,
+        path: impl AsRef<Path> + Send,
+        kind: MknodType,
+        permissions: Permissions,
+    ) -> io::Result<()> {
+        self.hybrid_create_node_at(path, kind, permissions).await
+    }
+
+    /// Alias for [`HybridDir::create_node_at`].
+    async fn hybrid_create_node_at(
+        &self,
+        path: impl AsRef<Path> + Send,
+        kind: MknodType,
+        permissions: Permissions,
+    ) -> io::Result<()> {
+        default_client()
+            .mknod_at(self, path, kind, permissions)
             .await
     }
 }
