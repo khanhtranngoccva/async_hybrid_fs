@@ -15,7 +15,7 @@ use tokio::fs::File;
 
 use crate::{
     default::{self},
-    metadata::{Metadata, Permissions},
+    metadata::{Metadata, MknodType, Permissions},
 };
 
 /// Options for opening files, mirroring [`std::fs::OpenOptions`].
@@ -307,6 +307,16 @@ pub async fn create_dir_all_with_permissions(
 ) -> io::Result<()> {
     default::default_client()
         .create_dir_all_with_permissions(path, permissions)
+        .await
+}
+
+pub async fn create_node(
+    path: impl AsRef<Path>,
+    kind: MknodType,
+    permissions: Permissions,
+) -> io::Result<()> {
+    default::default_client()
+        .mknod(path, kind, permissions)
         .await
 }
 
