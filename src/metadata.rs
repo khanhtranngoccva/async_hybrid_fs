@@ -9,6 +9,7 @@ use std::time::UNIX_EPOCH;
 use nix::sys::stat::SFlag;
 
 /// File metadata returned by statx. Provides an interface compatible with [`std::fs::Metadata`] and [`std::os::unix::fs::MetadataExt`].
+#[derive(Clone)]
 pub struct Metadata(pub(crate) libc::statx);
 
 impl Metadata {
