@@ -2121,7 +2121,37 @@ impl Client {
 
     /// Read a symbolic link. This is equivalent to `readlink(2)`.
     pub async fn read_link(&self, path: impl AsRef<Path>) -> io::Result<PathBuf> {
-        tokio::fs::read_link(path).await
+        let path = path.as_ref().to_owned();
+        let output = tokio::task::spawn_blocking(move || unsafe {
+            nix::fcntl::readlinkat(BorrowedFd::borrow_raw(libc::AT_FDCWD), &path)
+        })
+        .await??;
+        Ok(PathBuf::from(output))
+    }
+
+    /// Read a symbolic link at a relative path to a directory fd, which is equivalent to `readlinkat(2)`.
+    pub async fn read_link_at(
+        &self,
+        dir_fd: &(impl UringTarget + ?Sized),
+        path: impl AsRef<Path>,
+    ) -> io::Result<PathBuf> {
+        let path = path.as_ref().to_owned();
+        let raw_fd = dir_fd.as_fd().as_raw_fd();
+        let output = tokio::task::spawn_blocking(move || unsafe {
+            nix::fcntl::readlinkat(BorrowedFd::borrow_raw(raw_fd), &path)
+        })
+        .await??;
+        Ok(PathBuf::from(output))
+    }
+
+    /// Read a symbolic link at a file descriptor opened with [`OFlag::O_PATH`] and [`OFlag::O_NOFOLLOW`].
+    pub async fn read_link_file(&self, fd: &(impl UringTarget + ?Sized)) -> io::Result<PathBuf> {
+        let raw_fd = fd.as_fd().as_raw_fd();
+        let output = tokio::task::spawn_blocking(move || unsafe {
+            nix::fcntl::readlinkat(BorrowedFd::borrow_raw(raw_fd), Path::new(""))
+        })
+        .await??;
+        Ok(PathBuf::from(output))
     }
 
     /// Create a device node at a relative path to a directory fd, which is equivalent to `mknodat(2)`.

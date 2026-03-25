@@ -41,6 +41,7 @@ use std::os::fd::FromRawFd;
 use std::os::fd::IntoRawFd;
 use std::os::fd::OwnedFd;
 use std::path::Path;
+use std::path::PathBuf;
 use tokio::fs::File;
 
 pub use crate::metadata::Metadata;
@@ -400,32 +401,6 @@ pub trait HybridFile: UringTarget {
         default_client().fchown(self, uid, gid).await
     }
 
-    /// Method for creating a hard link to the file at the specified path relative to the specified directory fd.
-    #[inline]
-    async fn hard_link_at(
-        &self,
-        old_path: impl AsRef<Path> + Send,
-        new_dir_fd: &(impl UringTarget + Sync + ?Sized),
-        new_path: impl AsRef<Path> + Send,
-        flags: LinkatFlags,
-    ) -> io::Result<()> {
-        self.hybrid_hard_link_at(old_path, new_dir_fd, new_path, flags)
-            .await
-    }
-
-    /// Alias for [`HybridFile::hard_link_at`].
-    async fn hybrid_hard_link_at(
-        &self,
-        old_path: impl AsRef<Path> + Send,
-        new_dir_fd: &(impl UringTarget + Sync + ?Sized),
-        new_path: impl AsRef<Path> + Send,
-        flags: LinkatFlags,
-    ) -> io::Result<()> {
-        default_client()
-            .hard_link_at(self, old_path, new_dir_fd, new_path, flags)
-            .await
-    }
-
     /// Method for creating a hard link to the file at the specified path.
     #[inline]
     async fn hard_link(&self, new_path: impl AsRef<Path> + Send) -> io::Result<()> {
@@ -435,6 +410,17 @@ pub trait HybridFile: UringTarget {
     /// Alias for [`HybridFile::hard_link`].
     async fn hybrid_hard_link(&self, new_path: impl AsRef<Path> + Send) -> io::Result<()> {
         default_client().hard_link_file(self, new_path).await
+    }
+
+    /// Method for reading the target of the symlink file descriptor (requires opening via [`OFlag::O_PATH`] and [`OFlag::O_NOFOLLOW`]).
+    #[inline]
+    async fn read_link(&self) -> io::Result<PathBuf> {
+        self.hybrid_read_link().await
+    }
+
+    /// Alias for [`HybridFile::read_link`].
+    async fn hybrid_read_link(&self) -> io::Result<PathBuf> {
+        default_client().read_link_file(self).await
     }
 
     /// Method for syncing the metadata and data of a file.
@@ -478,6 +464,32 @@ pub trait HybridFile: UringTarget {
 
 #[async_trait::async_trait]
 pub trait HybridDir: UringTarget {
+    /// Method for creating a hard link to the file at the specified path relative to the specified directory fd.
+    #[inline]
+    async fn hard_link_at(
+        &self,
+        old_path: impl AsRef<Path> + Send,
+        new_dir_fd: &(impl UringTarget + Sync + ?Sized),
+        new_path: impl AsRef<Path> + Send,
+        flags: LinkatFlags,
+    ) -> io::Result<()> {
+        self.hybrid_hard_link_at(old_path, new_dir_fd, new_path, flags)
+            .await
+    }
+
+    /// Alias for [`HybridFile::hard_link_at`].
+    async fn hybrid_hard_link_at(
+        &self,
+        old_path: impl AsRef<Path> + Send,
+        new_dir_fd: &(impl UringTarget + Sync + ?Sized),
+        new_path: impl AsRef<Path> + Send,
+        flags: LinkatFlags,
+    ) -> io::Result<()> {
+        default_client()
+            .hard_link_at(self, old_path, new_dir_fd, new_path, flags)
+            .await
+    }
+
     /// Method for unlinking a file at the specified path relative to the specified directory fd.
     #[inline]
     async fn unlink_at(&self, path: impl AsRef<Path> + Send) -> io::Result<()> {
@@ -697,6 +709,18 @@ pub trait HybridDir: UringTarget {
         default_client()
             .mknod_at(self, path, kind, permissions)
             .await
+    }
+
+    /// Method for reading the target of the symlink at the specified path relative to the specified directory fd.
+    /// If the path is empty, the call is identical to [`HybridFile::read_link`].
+    #[inline]
+    async fn read_link_at(&self, path: impl AsRef<Path> + Send) -> io::Result<PathBuf> {
+        default_client().read_link_at(self, path).await
+    }
+
+    /// Alias for [`HybridFile::read_link_at`].
+    async fn hybrid_read_link_at(&self, path: impl AsRef<Path> + Send) -> io::Result<PathBuf> {
+        default_client().read_link_at(self, path).await
     }
 }
 
