@@ -240,7 +240,7 @@ impl fmt::Debug for FileType {
 // =============================================================================
 
 /// Representation of device numbers in the major-minor form. Defaults to 0 for both major and minor. Can be converted to and from [`libc::dev_t`] with the [`From`] and [`Into`] traits.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct DeviceNumber {
     pub major: u32,
     pub minor: u32,
@@ -265,7 +265,7 @@ impl Into<libc::dev_t> for DeviceNumber {
 ///
 /// # Note
 /// - Symlinks are not supported by this type.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MknodType {
     BlockDevice(DeviceNumber),
     CharDevice(DeviceNumber),
