@@ -1,12 +1,15 @@
 //! File metadata types compatible with `std::fs::Metadata`.
 
+use nix::sys::stat::SFlag;
 use std::fmt;
 use std::io;
 use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-use nix::sys::stat::SFlag;
+// =============================================================================
+// Metadata
+// =============================================================================
 
 /// File metadata returned by statx. Provides an interface compatible with [`std::fs::Metadata`] and [`std::os::unix::fs::MetadataExt`].
 #[derive(Clone)]
@@ -155,6 +158,19 @@ impl fmt::Debug for Metadata {
             .field("gid", &self.gid())
             .field("ino", &self.ino())
             .finish_non_exhaustive()
+    }
+}
+
+// Conversion traits to and from libc::statx for flexible low-level mutation (e.g. if custom wrappers want to modify values in the structure)
+impl From<libc::statx> for Metadata {
+    fn from(statx: libc::statx) -> Self {
+        Self(statx)
+    }
+}
+
+impl Into<libc::statx> for Metadata {
+    fn into(self) -> libc::statx {
+        self.0
     }
 }
 
