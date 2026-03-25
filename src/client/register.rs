@@ -69,7 +69,7 @@ impl<'a> Drop for RegisteredFile<'a> {
 }
 
 impl UringTarget for RegisteredFile<'_> {
-    fn as_fd(&self) -> BorrowedFd<'_> {
+    fn as_file_descriptor(&self) -> BorrowedFd<'_> {
         self.fd
     }
 
@@ -126,7 +126,7 @@ impl Drop for OwnedRegisteredFile {
 }
 
 impl UringTarget for OwnedRegisteredFile {
-    fn as_fd(&self) -> BorrowedFd<'_> {
+    fn as_file_descriptor(&self) -> BorrowedFd<'_> {
         AsFd::as_fd(self.fd.as_ref().unwrap())
     }
 

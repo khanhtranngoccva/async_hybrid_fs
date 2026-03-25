@@ -299,7 +299,7 @@ fn completion_thread(
 
 pub trait UringTarget {
     /// Method for converting the target to a borrowed file descriptor.
-    fn as_fd(&self) -> BorrowedFd<'_>;
+    fn as_file_descriptor(&self) -> BorrowedFd<'_>;
 
     /// Method for converting the target to a raw target object that can be used by the io_uring client.
     unsafe fn as_target(&self, _uring_identity: &Arc<()>) -> Target;
@@ -313,7 +313,7 @@ where
         Target::Fd(self.as_fd().as_raw_fd())
     }
 
-    fn as_fd(&self) -> BorrowedFd<'_> {
+    fn as_file_descriptor(&self) -> BorrowedFd<'_> {
         self.as_fd()
     }
 }

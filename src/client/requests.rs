@@ -22,7 +22,7 @@ pub enum Target {
 }
 
 impl UringTarget for Target {
-    fn as_fd(&self) -> BorrowedFd<'_> {
+    fn as_file_descriptor(&self) -> BorrowedFd<'_> {
         match self {
             Target::Fd(fd) => unsafe { BorrowedFd::borrow_raw(*fd) },
             Target::Fixed { raw_fd, .. } => unsafe { BorrowedFd::borrow_raw(*raw_fd) },

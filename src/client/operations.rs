@@ -59,7 +59,7 @@ impl Client {
     /// Obtain a raw target object for use in mutable operations, which bypasses mutable checks.
     pub unsafe fn to_target(&self, target: &(impl UringTarget + ?Sized)) -> Target {
         match &self.uring {
-            None => Target::Fd(target.as_fd().as_raw_fd()),
+            None => Target::Fd(target.as_file_descriptor().as_raw_fd()),
             Some(uring) => unsafe { target.as_target(&uring.identity) },
         }
     }
@@ -78,9 +78,9 @@ impl Client {
         &self,
         file: &mut (impl UringTarget + ?Sized),
     ) -> Option<usize> {
-        let size = self.metadata(&file.as_fd()).await.ok()?.size();
+        let size = self.metadata(&file.as_file_descriptor()).await.ok()?.size();
         let pos = self
-            .seek(&mut file.as_fd(), SeekFrom::Current(0))
+            .seek(&mut file.as_file_descriptor(), SeekFrom::Current(0))
             .await
             .ok()?;
         // Don't worry about `usize` overflow because reading will fail regardless
@@ -136,7 +136,7 @@ impl Client {
             })
         } else {
             let slice = unsafe { std::slice::from_raw_parts_mut(ptr, cap) };
-            let raw = file.as_fd().as_raw_fd();
+            let raw = file.as_file_descriptor().as_raw_fd();
             let bytes_read = tokio::task::spawn_blocking(move || unsafe {
                 nix::sys::uio::pread(BorrowedFd::borrow_raw(raw), slice, offset as i64)
             })
@@ -215,7 +215,7 @@ impl Client {
                 bytes_read: bytes_read as usize,
             })
         } else {
-            let fd = file.as_fd().as_raw_fd();
+            let fd = file.as_file_descriptor().as_raw_fd();
             let mut transmuted = bufs
                 .iter_mut()
                 .map(|buf| {
@@ -280,7 +280,7 @@ impl Client {
                 bytes_read: bytes_read as usize,
             })
         } else {
-            let fd = file.as_fd().as_raw_fd();
+            let fd = file.as_file_descriptor().as_raw_fd();
             let mut transmuted = bufs
                 .iter_mut()
                 .map(|buf| {
@@ -368,7 +368,7 @@ impl Client {
             })
         } else {
             let slice = unsafe { std::slice::from_raw_parts_mut(ptr, cap) };
-            let raw = file.as_fd().as_raw_fd();
+            let raw = file.as_file_descriptor().as_raw_fd();
             let bytes_read = tokio::task::spawn_blocking(move || unsafe {
                 nix::unistd::read(BorrowedFd::borrow_raw(raw), slice)
             })
@@ -671,7 +671,7 @@ impl Client {
             })
         } else {
             let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
-            let raw = file.as_fd().as_raw_fd();
+            let raw = file.as_file_descriptor().as_raw_fd();
             let bytes_written = tokio::task::spawn_blocking(move || unsafe {
                 nix::unistd::write(BorrowedFd::borrow_raw(raw), slice)
             })
@@ -740,7 +740,7 @@ impl Client {
                     IoSlice::<'static>::new(std::slice::from_raw_parts(buf.as_ptr(), buf.len()))
                 })
                 .collect::<Vec<_>>();
-            let raw = file.as_fd().as_raw_fd();
+            let raw = file.as_file_descriptor().as_raw_fd();
             let bytes_written = tokio::task::spawn_blocking(move || unsafe {
                 nix::sys::uio::pwritev(BorrowedFd::borrow_raw(raw), &slice, offset as i64)
             })
@@ -853,7 +853,7 @@ impl Client {
             })
         } else {
             let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
-            let raw = file.as_fd().as_raw_fd();
+            let raw = file.as_file_descriptor().as_raw_fd();
             let bytes_written = tokio::task::spawn_blocking(move || unsafe {
                 nix::unistd::write(BorrowedFd::borrow_raw(raw), slice)
             })
@@ -913,7 +913,7 @@ impl Client {
                     IoSlice::<'static>::new(std::slice::from_raw_parts(buf.as_ptr(), buf.len()))
                 })
                 .collect::<Vec<_>>();
-            let raw = file.as_fd().as_raw_fd();
+            let raw = file.as_file_descriptor().as_raw_fd();
             let bytes_written = tokio::task::spawn_blocking(move || unsafe {
                 nix::sys::uio::writev(BorrowedFd::borrow_raw(raw), &slices)
             })
@@ -1006,7 +1006,7 @@ impl Client {
         let offset: i64 = offset
             .try_into()
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "offset exceeds i64::MAX"))?;
-        let fd = file.as_fd().as_raw_fd();
+        let fd = file.as_file_descriptor().as_raw_fd();
         let new_offset = tokio::task::spawn_blocking(move || unsafe {
             nix::unistd::lseek(BorrowedFd::borrow_raw(fd), offset, whence)
         })
@@ -1020,7 +1020,7 @@ impl Client {
         file: &mut (impl UringTarget + ?Sized),
         seek: SeekFrom,
     ) -> io::Result<u64> {
-        let fd = file.as_fd().as_raw_fd();
+        let fd = file.as_file_descriptor().as_raw_fd();
         let (whence, offset) = match seek {
             SeekFrom::Start(offset) => (
                 nix::unistd::Whence::SeekSet,
@@ -1060,7 +1060,7 @@ impl Client {
             });
             rx.await.expect("uring completion channel dropped")
         } else {
-            let fd = file.as_fd().as_raw_fd();
+            let fd = file.as_file_descriptor().as_raw_fd();
             tokio::task::spawn_blocking(move || unsafe {
                 nix::unistd::fsync(BorrowedFd::borrow_raw(fd))
             })
@@ -1090,7 +1090,7 @@ impl Client {
             });
             rx.await.expect("uring completion channel dropped")
         } else {
-            let fd = file.as_fd().as_raw_fd();
+            let fd = file.as_file_descriptor().as_raw_fd();
             tokio::task::spawn_blocking(move || unsafe {
                 nix::unistd::fdatasync(BorrowedFd::borrow_raw(fd))
             })
@@ -1119,7 +1119,7 @@ impl Client {
             });
             rx.await.expect("uring completion channel dropped")
         } else {
-            let fd = file.as_fd().as_raw_fd();
+            let fd = file.as_file_descriptor().as_raw_fd();
             let metadata = tokio::task::spawn_blocking(move || -> io::Result<Metadata> {
                 unsafe {
                     helpers::syscall_cvt(libc::statx(
@@ -1153,7 +1153,7 @@ impl Client {
             let (tx, rx) = oneshot::channel();
             self.send(Command::StatxPath {
                 req: StatxPathRequest {
-                    dir_fd: fd.as_fd().as_raw_fd(),
+                    dir_fd: fd.as_file_descriptor().as_raw_fd(),
                     flags: flags.bits(),
                     path: path_cstr,
                     statx_buf: statx_buf,
@@ -1163,7 +1163,7 @@ impl Client {
             let metadata = rx.await.expect("uring completion channel dropped")?;
             Ok(metadata)
         } else {
-            let fd = fd.as_fd().as_raw_fd();
+            let fd = fd.as_file_descriptor().as_raw_fd();
             let metadata = tokio::task::spawn_blocking(move || -> io::Result<Metadata> {
                 unsafe {
                     helpers::syscall_cvt(libc::statx(
@@ -1247,7 +1247,7 @@ impl Client {
             });
             rx.await.expect("uring completion channel dropped")
         } else {
-            let fd = file.as_fd().as_raw_fd();
+            let fd = file.as_file_descriptor().as_raw_fd();
             tokio::task::spawn_blocking(move || unsafe {
                 nix::fcntl::fallocate(
                     BorrowedFd::borrow_raw(fd),
@@ -1300,7 +1300,7 @@ impl Client {
             });
             rx.await.expect("uring completion channel dropped")
         } else {
-            let fd = file.as_fd().as_raw_fd();
+            let fd = file.as_file_descriptor().as_raw_fd();
             tokio::task::spawn_blocking(move || unsafe {
                 nix::fcntl::posix_fadvise(
                     BorrowedFd::borrow_raw(fd),
@@ -1343,7 +1343,7 @@ impl Client {
             });
             rx.await.expect("uring completion channel dropped")
         } else {
-            let fd = file.as_fd().as_raw_fd();
+            let fd = file.as_file_descriptor().as_raw_fd();
             tokio::task::spawn_blocking(move || unsafe {
                 nix::unistd::ftruncate(BorrowedFd::borrow_raw(fd), len as i64)
             })
@@ -1377,7 +1377,7 @@ impl Client {
             let (tx, rx) = oneshot::channel();
             self.send(Command::OpenAt {
                 req: OpenAtRequest {
-                    dir_fd: dir_fd.as_fd().as_raw_fd(),
+                    dir_fd: dir_fd.as_file_descriptor().as_raw_fd(),
                     path,
                     flags: flags.bits(),
                     mode: permissions.mode(),
@@ -1386,7 +1386,7 @@ impl Client {
             });
             rx.await.expect("uring completion channel dropped")
         } else {
-            let raw_fd = dir_fd.as_fd().as_raw_fd();
+            let raw_fd = dir_fd.as_file_descriptor().as_raw_fd();
             let path = path.as_ref().to_owned();
             let fd = tokio::task::spawn_blocking(move || {
                 nix::fcntl::openat(
@@ -1537,9 +1537,9 @@ impl Client {
             let (tx, rx) = oneshot::channel();
             self.send(Command::RenameAt {
                 req: RenameAtRequest {
-                    old_dir_fd: old_dir_fd.as_fd().as_raw_fd(),
+                    old_dir_fd: old_dir_fd.as_file_descriptor().as_raw_fd(),
                     old_path,
-                    new_dir_fd: new_dir_fd.as_fd().as_raw_fd(),
+                    new_dir_fd: new_dir_fd.as_file_descriptor().as_raw_fd(),
                     new_path,
                     flags: flags.bits(),
                 },
@@ -1547,8 +1547,8 @@ impl Client {
             });
             rx.await.expect("uring completion channel dropped")
         } else {
-            let old_dir_fd = old_dir_fd.as_fd().as_raw_fd();
-            let new_dir_fd = new_dir_fd.as_fd().as_raw_fd();
+            let old_dir_fd = old_dir_fd.as_file_descriptor().as_raw_fd();
+            let new_dir_fd = new_dir_fd.as_file_descriptor().as_raw_fd();
             let old_path = old_path.as_ref().to_owned();
             let new_path = new_path.as_ref().to_owned();
             tokio::task::spawn_blocking(move || unsafe {
@@ -1597,7 +1597,7 @@ impl Client {
             let (tx, rx) = oneshot::channel();
             self.send(Command::UnlinkAt {
                 req: UnlinkAtRequest {
-                    dir_fd: dir_fd.as_fd().as_raw_fd(),
+                    dir_fd: dir_fd.as_file_descriptor().as_raw_fd(),
                     path,
                     flags: match flags {
                         UnlinkatFlags::RemoveDir => libc::AT_REMOVEDIR,
@@ -1608,7 +1608,7 @@ impl Client {
             });
             rx.await.expect("uring completion channel dropped")
         } else {
-            let dir_fd = dir_fd.as_fd().as_raw_fd();
+            let dir_fd = dir_fd.as_file_descriptor().as_raw_fd();
             let path = path.as_ref().to_owned();
             tokio::task::spawn_blocking(move || unsafe {
                 nix::unistd::unlinkat(BorrowedFd::borrow_raw(dir_fd), &path, flags)
@@ -1658,7 +1658,7 @@ impl Client {
             let (tx, rx) = oneshot::channel();
             self.send(Command::MkdirAt {
                 req: MkdirAtRequest {
-                    dir_fd: dir_fd.as_fd().as_raw_fd(),
+                    dir_fd: dir_fd.as_file_descriptor().as_raw_fd(),
                     path,
                     mode: permissions.mode(),
                 },
@@ -1666,7 +1666,7 @@ impl Client {
             });
             rx.await.expect("uring completion channel dropped")
         } else {
-            let dir_fd = dir_fd.as_fd().as_raw_fd();
+            let dir_fd = dir_fd.as_file_descriptor().as_raw_fd();
             let path = path.as_ref().to_owned();
             tokio::task::spawn_blocking(move || unsafe {
                 nix::sys::stat::mkdirat(
@@ -1779,7 +1779,7 @@ impl Client {
             self.send(Command::SymlinkAt {
                 req: SymlinkAtRequest {
                     target,
-                    new_dir_fd: new_dir_fd.as_fd().as_raw_fd(),
+                    new_dir_fd: new_dir_fd.as_file_descriptor().as_raw_fd(),
                     link_path,
                 },
                 res: tx,
@@ -1787,7 +1787,7 @@ impl Client {
             rx.await.expect("uring completion channel dropped")
         } else {
             let target = target.as_ref().to_owned();
-            let new_dir_fd = new_dir_fd.as_fd().as_raw_fd();
+            let new_dir_fd = new_dir_fd.as_file_descriptor().as_raw_fd();
             let link_path = link_path.as_ref().to_owned();
             tokio::task::spawn_blocking(move || unsafe {
                 nix::unistd::symlinkat(&target, BorrowedFd::borrow_raw(new_dir_fd), &link_path)
@@ -1828,9 +1828,9 @@ impl Client {
             let (tx, rx) = oneshot::channel();
             self.send(Command::LinkAt {
                 req: LinkAtRequest {
-                    old_dir_fd: old_dir_fd.as_fd().as_raw_fd(),
+                    old_dir_fd: old_dir_fd.as_file_descriptor().as_raw_fd(),
                     old_path,
-                    new_dir_fd: new_dir_fd.as_fd().as_raw_fd(),
+                    new_dir_fd: new_dir_fd.as_file_descriptor().as_raw_fd(),
                     new_path,
                     flags: flags.bits(),
                 },
@@ -1838,8 +1838,8 @@ impl Client {
             });
             rx.await.expect("uring completion channel dropped")
         } else {
-            let old_dir_fd = old_dir_fd.as_fd().as_raw_fd();
-            let new_dir_fd = new_dir_fd.as_fd().as_raw_fd();
+            let old_dir_fd = old_dir_fd.as_file_descriptor().as_raw_fd();
+            let new_dir_fd = new_dir_fd.as_file_descriptor().as_raw_fd();
             let old_path = old_path.as_ref().to_owned();
             let new_path = new_path.as_ref().to_owned();
             tokio::task::spawn_blocking(move || unsafe {
@@ -1922,7 +1922,7 @@ impl Client {
         fd: &(impl UringTarget + ?Sized),
         permissions: Permissions,
     ) -> io::Result<()> {
-        let raw_fd = fd.as_fd().as_raw_fd();
+        let raw_fd = fd.as_file_descriptor().as_raw_fd();
         tokio::task::spawn_blocking(move || {
             nix::sys::stat::fchmod(
                 unsafe { BorrowedFd::borrow_raw(raw_fd) },
@@ -1942,7 +1942,7 @@ impl Client {
         flags: FchmodatFlags,
     ) -> io::Result<()> {
         let path = path.as_ref().to_owned();
-        let raw_fd = fd.as_fd().as_raw_fd();
+        let raw_fd = fd.as_file_descriptor().as_raw_fd();
         tokio::task::spawn_blocking(move || unsafe {
             nix::sys::stat::fchmodat(
                 BorrowedFd::borrow_raw(raw_fd),
@@ -1992,7 +1992,7 @@ impl Client {
         uid: Option<Uid>,
         gid: Option<Gid>,
     ) -> io::Result<()> {
-        let raw_fd = fd.as_fd().as_raw_fd();
+        let raw_fd = fd.as_file_descriptor().as_raw_fd();
         tokio::task::spawn_blocking(move || unsafe {
             nix::unistd::fchown(BorrowedFd::borrow_raw(raw_fd), uid, gid)
         })
@@ -2010,7 +2010,7 @@ impl Client {
         flags: FchownatFlags,
     ) -> io::Result<()> {
         let path = path.as_ref().to_owned();
-        let raw_fd = fd.as_fd().as_raw_fd();
+        let raw_fd = fd.as_file_descriptor().as_raw_fd();
         tokio::task::spawn_blocking(move || unsafe {
             nix::unistd::fchownat(BorrowedFd::borrow_raw(raw_fd), &path, uid, gid, flags)
         })
@@ -2078,7 +2078,7 @@ impl Client {
         atime: Option<TimeSpec>,
         mtime: Option<TimeSpec>,
     ) -> io::Result<()> {
-        let raw_fd = fd.as_fd().as_raw_fd();
+        let raw_fd = fd.as_file_descriptor().as_raw_fd();
         let _atime = atime.unwrap_or(TimeSpec::UTIME_OMIT);
         let _mtime = mtime.unwrap_or(TimeSpec::UTIME_OMIT);
         tokio::task::spawn_blocking(move || {
@@ -2100,7 +2100,7 @@ impl Client {
         let path = path.as_ref().to_owned();
         let _atime = atime.unwrap_or(TimeSpec::UTIME_OMIT);
         let _mtime = mtime.unwrap_or(TimeSpec::UTIME_OMIT);
-        let raw_fd = fd.as_fd().as_raw_fd();
+        let raw_fd = fd.as_file_descriptor().as_raw_fd();
         tokio::task::spawn_blocking(move || unsafe {
             nix::sys::stat::utimensat(
                 BorrowedFd::borrow_raw(raw_fd),
@@ -2136,7 +2136,7 @@ impl Client {
         path: impl AsRef<Path>,
     ) -> io::Result<PathBuf> {
         let path = path.as_ref().to_owned();
-        let raw_fd = dir_fd.as_fd().as_raw_fd();
+        let raw_fd = dir_fd.as_file_descriptor().as_raw_fd();
         let output = tokio::task::spawn_blocking(move || unsafe {
             nix::fcntl::readlinkat(BorrowedFd::borrow_raw(raw_fd), &path)
         })
@@ -2146,7 +2146,7 @@ impl Client {
 
     /// Read a symbolic link at a file descriptor opened with [`OFlag::O_PATH`] and [`OFlag::O_NOFOLLOW`].
     pub async fn read_link_file(&self, fd: &(impl UringTarget + ?Sized)) -> io::Result<PathBuf> {
-        let raw_fd = fd.as_fd().as_raw_fd();
+        let raw_fd = fd.as_file_descriptor().as_raw_fd();
         let output = tokio::task::spawn_blocking(move || unsafe {
             nix::fcntl::readlinkat(BorrowedFd::borrow_raw(raw_fd), Path::new(""))
         })
@@ -2163,7 +2163,7 @@ impl Client {
         permissions: Permissions,
     ) -> io::Result<()> {
         let path = path.as_ref().to_owned();
-        let raw_fd = dir_fd.as_fd().as_raw_fd();
+        let raw_fd = dir_fd.as_file_descriptor().as_raw_fd();
         tokio::task::spawn_blocking(move || unsafe {
             let (kind, device) = kind.to_sflag_and_device();
             nix::sys::stat::mknodat(
