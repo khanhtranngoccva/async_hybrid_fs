@@ -29,6 +29,7 @@ use nix::{
 };
 use std::{
     cmp,
+    ffi::OsString,
     io::{self, IoSlice, IoSliceMut, SeekFrom},
     mem::MaybeUninit,
     os::fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd},
@@ -136,11 +137,18 @@ impl Client {
             })
         } else {
             let slice = unsafe { std::slice::from_raw_parts_mut(ptr, cap) };
-            let raw = file.as_file_descriptor().as_raw_fd();
-            let bytes_read = tokio::task::spawn_blocking(move || unsafe {
-                nix::sys::uio::pread(BorrowedFd::borrow_raw(raw), slice, offset as i64)
-            })
-            .await??;
+            let file_descriptor = file.as_file_descriptor();
+            let (_, mut futures) = unsafe {
+                async_scoped::TokioScope::scope_and_collect(move |scope| {
+                    scope.spawn_blocking(move || {
+                        nix::sys::uio::pread(file_descriptor, slice, offset as i64)
+                    });
+                    ()
+                })
+                .await
+            };
+            let future = futures.pop().expect("no future returned");
+            let bytes_read = future.expect("future failed to join")?;
             Ok(ReadResult { buf, bytes_read })
         }
     }
@@ -215,19 +223,26 @@ impl Client {
                 bytes_read: bytes_read as usize,
             })
         } else {
-            let fd = file.as_file_descriptor().as_raw_fd();
             let mut transmuted = bufs
                 .iter_mut()
                 .map(|buf| {
-                    IoSliceMut::<'static>::new(unsafe {
+                    IoSliceMut::new(unsafe {
                         std::slice::from_raw_parts_mut(buf.as_mut_ptr(), buf.capacity())
                     })
                 })
                 .collect::<Vec<_>>();
-            let bytes_read = tokio::task::spawn_blocking(move || unsafe {
-                nix::sys::uio::preadv(BorrowedFd::borrow_raw(fd), &mut transmuted, offset as i64)
-            })
-            .await??;
+            let file_descriptor = file.as_file_descriptor();
+            let (_, mut futures) = unsafe {
+                async_scoped::TokioScope::scope_and_collect(move |scope| {
+                    scope.spawn_blocking(move || {
+                        nix::sys::uio::preadv(file_descriptor, &mut transmuted, offset as i64)
+                    });
+                    ()
+                })
+                .await
+            };
+            let future = futures.pop().expect("no future returned");
+            let bytes_read = future.expect("future failed to join")?;
             Ok(ReadvResult {
                 bufs,
                 bytes_read: bytes_read as usize,
@@ -280,19 +295,26 @@ impl Client {
                 bytes_read: bytes_read as usize,
             })
         } else {
-            let fd = file.as_file_descriptor().as_raw_fd();
+            let file_descriptor = file.as_file_descriptor();
             let mut transmuted = bufs
                 .iter_mut()
                 .map(|buf| {
-                    IoSliceMut::<'static>::new(unsafe {
+                    IoSliceMut::new(unsafe {
                         std::slice::from_raw_parts_mut(buf.as_mut_ptr(), buf.capacity())
                     })
                 })
                 .collect::<Vec<_>>();
-            let bytes_read = tokio::task::spawn_blocking(move || unsafe {
-                nix::sys::uio::readv(BorrowedFd::borrow_raw(fd), &mut transmuted)
-            })
-            .await??;
+            let (_, mut futures) = unsafe {
+                async_scoped::TokioScope::scope_and_collect(move |scope| {
+                    scope.spawn_blocking(move || {
+                        nix::sys::uio::readv(file_descriptor, &mut transmuted)
+                    });
+                    ()
+                })
+                .await
+            };
+            let future = futures.pop().expect("no future returned");
+            let bytes_read = future.expect("future failed to join")?;
             Ok(ReadvResult {
                 bufs,
                 bytes_read: bytes_read as usize,
@@ -368,11 +390,16 @@ impl Client {
             })
         } else {
             let slice = unsafe { std::slice::from_raw_parts_mut(ptr, cap) };
-            let raw = file.as_file_descriptor().as_raw_fd();
-            let bytes_read = tokio::task::spawn_blocking(move || unsafe {
-                nix::unistd::read(BorrowedFd::borrow_raw(raw), slice)
-            })
-            .await??;
+            let file_descriptor = file.as_file_descriptor();
+            let (_, mut futures) = unsafe {
+                async_scoped::TokioScope::scope_and_collect(move |scope| {
+                    scope.spawn_blocking(move || nix::unistd::read(file_descriptor, slice));
+                    ()
+                })
+                .await
+            };
+            let future = futures.pop().expect("no future returned");
+            let bytes_read = future.expect("future failed to join")?;
             Ok(ReadResult { buf, bytes_read })
         }
     }
@@ -671,11 +698,18 @@ impl Client {
             })
         } else {
             let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
-            let raw = file.as_file_descriptor().as_raw_fd();
-            let bytes_written = tokio::task::spawn_blocking(move || unsafe {
-                nix::unistd::write(BorrowedFd::borrow_raw(raw), slice)
-            })
-            .await??;
+            let file_descriptor = file.as_file_descriptor();
+            let (_, mut futures) = unsafe {
+                async_scoped::TokioScope::scope_and_collect(move |scope| {
+                    scope.spawn_blocking(move || {
+                        nix::sys::uio::pwrite(file_descriptor, slice, offset as i64)
+                    });
+                    ()
+                })
+                .await
+            };
+            let future = futures.pop().expect("no future returned");
+            let bytes_written = future.expect("future failed to join")?;
             Ok(WriteResult { buf, bytes_written })
         }
     }
@@ -737,14 +771,21 @@ impl Client {
             let slice = bufs
                 .iter_mut()
                 .map(|buf| unsafe {
-                    IoSlice::<'static>::new(std::slice::from_raw_parts(buf.as_ptr(), buf.len()))
+                    IoSlice::new(std::slice::from_raw_parts(buf.as_ptr(), buf.len()))
                 })
                 .collect::<Vec<_>>();
-            let raw = file.as_file_descriptor().as_raw_fd();
-            let bytes_written = tokio::task::spawn_blocking(move || unsafe {
-                nix::sys::uio::pwritev(BorrowedFd::borrow_raw(raw), &slice, offset as i64)
-            })
-            .await??;
+            let file_descriptor = file.as_file_descriptor();
+            let (_, mut futures) = unsafe {
+                async_scoped::TokioScope::scope_and_collect(move |scope| {
+                    scope.spawn_blocking(move || {
+                        nix::sys::uio::pwritev(file_descriptor, &slice, offset as i64)
+                    });
+                    ()
+                })
+                .await
+            };
+            let future = futures.pop().expect("no future returned");
+            let bytes_written = future.expect("future failed to join")?;
             Ok(WritevResult {
                 bufs,
                 bytes_written,
@@ -853,11 +894,16 @@ impl Client {
             })
         } else {
             let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
-            let raw = file.as_file_descriptor().as_raw_fd();
-            let bytes_written = tokio::task::spawn_blocking(move || unsafe {
-                nix::unistd::write(BorrowedFd::borrow_raw(raw), slice)
-            })
-            .await??;
+            let file_descriptor = file.as_file_descriptor();
+            let (_, mut futures) = unsafe {
+                async_scoped::TokioScope::scope_and_collect(move |scope| {
+                    scope.spawn_blocking(move || nix::unistd::write(file_descriptor, slice));
+                    ()
+                })
+                .await
+            };
+            let future = futures.pop().expect("no future returned");
+            let bytes_written = future.expect("future failed to join")?;
             Ok(WriteResult { buf, bytes_written })
         }
     }
@@ -913,11 +959,16 @@ impl Client {
                     IoSlice::<'static>::new(std::slice::from_raw_parts(buf.as_ptr(), buf.len()))
                 })
                 .collect::<Vec<_>>();
-            let raw = file.as_file_descriptor().as_raw_fd();
-            let bytes_written = tokio::task::spawn_blocking(move || unsafe {
-                nix::sys::uio::writev(BorrowedFd::borrow_raw(raw), &slices)
-            })
-            .await??;
+            let file_descriptor = file.as_file_descriptor();
+            let (_, mut futures) = unsafe {
+                async_scoped::TokioScope::scope_and_collect(move |scope| {
+                    scope.spawn_blocking(move || nix::sys::uio::writev(file_descriptor, &slices));
+                    ()
+                })
+                .await
+            };
+            let future = futures.pop().expect("no future returned");
+            let bytes_written = future.expect("future failed to join")?;
             Ok(WritevResult {
                 bufs,
                 bytes_written,
@@ -1006,11 +1057,16 @@ impl Client {
         let offset: i64 = offset
             .try_into()
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "offset exceeds i64::MAX"))?;
-        let fd = file.as_file_descriptor().as_raw_fd();
-        let new_offset = tokio::task::spawn_blocking(move || unsafe {
-            nix::unistd::lseek(BorrowedFd::borrow_raw(fd), offset, whence)
-        })
-        .await??;
+        let file_descriptor = file.as_file_descriptor();
+        let (_, mut futures) = unsafe {
+            async_scoped::TokioScope::scope_and_collect(move |scope| {
+                scope.spawn_blocking(move || nix::unistd::lseek(file_descriptor, offset, whence));
+                ()
+            })
+            .await
+        };
+        let future = futures.pop().expect("no future returned");
+        let new_offset = future.expect("future failed to join")?;
         Ok(new_offset as u64)
     }
 
@@ -1020,7 +1076,6 @@ impl Client {
         file: &mut (impl UringTarget + ?Sized),
         seek: SeekFrom,
     ) -> io::Result<u64> {
-        let fd = file.as_file_descriptor().as_raw_fd();
         let (whence, offset) = match seek {
             SeekFrom::Start(offset) => (
                 nix::unistd::Whence::SeekSet,
@@ -1032,10 +1087,16 @@ impl Client {
             SeekFrom::Current(offset) => (nix::unistd::Whence::SeekCur, offset as i64),
         };
         // io_uring does not have a method to seek the file, fallback to spawn_blocking
-        let new_offset = tokio::task::spawn_blocking(move || unsafe {
-            nix::unistd::lseek(BorrowedFd::borrow_raw(fd), offset, whence)
-        })
-        .await??;
+        let file_descriptor = file.as_file_descriptor();
+        let (_, mut futures) = unsafe {
+            async_scoped::TokioScope::scope_and_collect(move |scope| {
+                scope.spawn_blocking(move || nix::unistd::lseek(file_descriptor, offset, whence));
+                ()
+            })
+            .await
+        };
+        let future = futures.pop().expect("no future returned");
+        let new_offset = future.expect("future failed to join")?;
         Ok(new_offset as u64)
     }
 
@@ -1060,18 +1121,21 @@ impl Client {
             });
             rx.await.expect("uring completion channel dropped")
         } else {
-            let fd = file.as_file_descriptor().as_raw_fd();
-            tokio::task::spawn_blocking(move || unsafe {
-                nix::unistd::fsync(BorrowedFd::borrow_raw(fd))
-            })
-            .await??;
+            let file_descriptor = file.as_file_descriptor();
+            let (_, mut futures) = unsafe {
+                async_scoped::TokioScope::scope_and_collect(move |scope| {
+                    scope.spawn_blocking(move || nix::unistd::fsync(file_descriptor));
+                    ()
+                })
+                .await
+            };
+            let future = futures.pop().expect("no future returned");
+            future.expect("future failed to join")?;
             Ok(())
         }
     }
 
     /// Synchronize file data to disk (fdatasync). This ensures that only data modifications are flushed to the underlying storage device. This is useful for ensuring that data is written but not metadata.
-    ///
-    /// **Note on ordering**: io_uring does not guarantee ordering between operations. If you need to ensure writes complete before fdatasync, you should await the write first, then call fdatasync.
     pub async fn sync_data(&self, file: &(impl UringTarget + ?Sized)) -> io::Result<()> {
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Fsync::CODE)
@@ -1090,11 +1154,16 @@ impl Client {
             });
             rx.await.expect("uring completion channel dropped")
         } else {
-            let fd = file.as_file_descriptor().as_raw_fd();
-            tokio::task::spawn_blocking(move || unsafe {
-                nix::unistd::fdatasync(BorrowedFd::borrow_raw(fd))
-            })
-            .await??;
+            let file_descriptor = file.as_file_descriptor();
+            let (_, mut futures) = unsafe {
+                async_scoped::TokioScope::scope_and_collect(move |scope| {
+                    scope.spawn_blocking(move || nix::unistd::fdatasync(file_descriptor));
+                    ()
+                })
+                .await
+            };
+            let future = futures.pop().expect("no future returned");
+            future.expect("future failed to join")?;
             Ok(())
         }
     }
@@ -1119,21 +1188,26 @@ impl Client {
             });
             rx.await.expect("uring completion channel dropped")
         } else {
-            let fd = file.as_file_descriptor().as_raw_fd();
-            let metadata = tokio::task::spawn_blocking(move || -> io::Result<Metadata> {
-                unsafe {
-                    helpers::syscall_cvt(libc::statx(
-                        fd,
-                        c"".as_ptr(),
-                        libc::AT_EMPTY_PATH,
-                        libc::STATX_BASIC_STATS,
-                        statx_buf.as_mut_ptr(),
-                    ))?;
-                    let statx = (*statx_buf).assume_init();
-                    Ok(Metadata(statx))
-                }
-            })
-            .await??;
+            let fd = file.as_file_descriptor();
+            let (_, mut futures) = unsafe {
+                async_scoped::TokioScope::scope_and_collect(move |scope| {
+                    scope.spawn_blocking(move || -> Result<Metadata, io::Error> {
+                        helpers::syscall_cvt(libc::statx(
+                            fd.as_raw_fd(),
+                            c"".as_ptr(),
+                            libc::AT_EMPTY_PATH,
+                            libc::STATX_BASIC_STATS,
+                            statx_buf.as_mut_ptr(),
+                        ))?;
+                        let statx = (*statx_buf).assume_init();
+                        Ok(Metadata(statx))
+                    });
+                    ()
+                })
+                .await
+            };
+            let future = futures.pop().expect("no future returned");
+            let metadata = future.expect("future failed to join")?;
             Ok(metadata)
         }
     }
@@ -1163,21 +1237,26 @@ impl Client {
             let metadata = rx.await.expect("uring completion channel dropped")?;
             Ok(metadata)
         } else {
-            let fd = fd.as_file_descriptor().as_raw_fd();
-            let metadata = tokio::task::spawn_blocking(move || -> io::Result<Metadata> {
-                unsafe {
-                    helpers::syscall_cvt(libc::statx(
-                        fd,
-                        path_cstr.as_ptr(),
-                        flags.bits(),
-                        libc::STATX_BASIC_STATS,
-                        statx_buf.as_mut_ptr(),
-                    ))?;
-                    let statx = (*statx_buf).assume_init();
-                    Ok(Metadata(statx))
-                }
-            })
-            .await??;
+            let fd = fd.as_file_descriptor();
+            let (_, mut futures) = unsafe {
+                async_scoped::TokioScope::scope_and_collect(move |scope| {
+                    scope.spawn_blocking(move || -> Result<Metadata, io::Error> {
+                        helpers::syscall_cvt(libc::statx(
+                            fd.as_raw_fd(),
+                            path_cstr.as_ptr(),
+                            flags.bits(),
+                            libc::STATX_BASIC_STATS,
+                            statx_buf.as_mut_ptr(),
+                        ))?;
+                        let statx = (*statx_buf).assume_init();
+                        Ok(Metadata(statx))
+                    });
+                    ()
+                })
+                .await
+            };
+            let future = futures.pop().expect("no future returned");
+            let metadata = future.expect("future failed to join")?;
             Ok(metadata)
         }
     }
@@ -1247,16 +1326,23 @@ impl Client {
             });
             rx.await.expect("uring completion channel dropped")
         } else {
-            let fd = file.as_file_descriptor().as_raw_fd();
-            tokio::task::spawn_blocking(move || unsafe {
-                nix::fcntl::fallocate(
-                    BorrowedFd::borrow_raw(fd),
-                    nix::fcntl::FallocateFlags::from_bits_retain(mode.bits()),
-                    offset as i64,
-                    len as i64,
-                )
-            })
-            .await??;
+            let file_descriptor = file.as_file_descriptor();
+            let (_, mut futures) = unsafe {
+                async_scoped::TokioScope::scope_and_collect(move |scope| {
+                    scope.spawn_blocking(move || {
+                        nix::fcntl::fallocate(
+                            file_descriptor,
+                            nix::fcntl::FallocateFlags::from_bits_retain(mode.bits()),
+                            offset as i64,
+                            len as i64,
+                        )
+                    });
+                    ()
+                })
+                .await
+            };
+            let future = futures.pop().expect("no future returned");
+            future.expect("future failed to join")?;
             Ok(())
         }
     }
@@ -1300,16 +1386,23 @@ impl Client {
             });
             rx.await.expect("uring completion channel dropped")
         } else {
-            let fd = file.as_file_descriptor().as_raw_fd();
-            tokio::task::spawn_blocking(move || unsafe {
-                nix::fcntl::posix_fadvise(
-                    BorrowedFd::borrow_raw(fd),
-                    offset as i64,
-                    len as i64,
-                    advice.into(),
-                )
-            })
-            .await??;
+            let file_descriptor = file.as_file_descriptor();
+            let (_, mut futures) = unsafe {
+                async_scoped::TokioScope::scope_and_collect(move |scope| {
+                    scope.spawn_blocking(move || {
+                        nix::fcntl::posix_fadvise(
+                            file_descriptor,
+                            offset as i64,
+                            len as i64,
+                            advice.into(),
+                        )
+                    });
+                    ()
+                })
+                .await
+            };
+            let future = futures.pop().expect("no future returned");
+            future.expect("future failed to join")?;
             Ok(())
         }
     }
@@ -1343,11 +1436,18 @@ impl Client {
             });
             rx.await.expect("uring completion channel dropped")
         } else {
-            let fd = file.as_file_descriptor().as_raw_fd();
-            tokio::task::spawn_blocking(move || unsafe {
-                nix::unistd::ftruncate(BorrowedFd::borrow_raw(fd), len as i64)
-            })
-            .await??;
+            let file_descriptor = file.as_file_descriptor();
+            let (_, mut futures) = unsafe {
+                async_scoped::TokioScope::scope_and_collect(move |scope| {
+                    scope.spawn_blocking(move || {
+                        nix::unistd::ftruncate(file_descriptor, len as i64)
+                    });
+                    ()
+                })
+                .await
+            };
+            let future = futures.pop().expect("no future returned");
+            future.expect("future failed to join")?;
             Ok(())
         }
     }
@@ -1386,17 +1486,24 @@ impl Client {
             });
             rx.await.expect("uring completion channel dropped")
         } else {
-            let raw_fd = dir_fd.as_file_descriptor().as_raw_fd();
-            let path = path.as_ref().to_owned();
-            let fd = tokio::task::spawn_blocking(move || {
-                nix::fcntl::openat(
-                    unsafe { BorrowedFd::borrow_raw(raw_fd) },
-                    &path,
-                    OFlag::from_bits_retain(flags.bits()),
-                    Mode::from_bits_retain(permissions.mode()),
-                )
-            })
-            .await??;
+            let file_descriptor = dir_fd.as_file_descriptor();
+            let path = path.as_ref();
+            let (_, mut futures) = unsafe {
+                async_scoped::TokioScope::scope_and_collect(move |scope| {
+                    scope.spawn_blocking(move || {
+                        nix::fcntl::openat(
+                            file_descriptor,
+                            path,
+                            OFlag::from_bits_retain(flags.bits()),
+                            Mode::from_bits_retain(permissions.mode()),
+                        )
+                    });
+                    ()
+                })
+                .await
+            };
+            let future = futures.pop().expect("no future returned");
+            let fd = future.expect("future failed to join")?;
             Ok(fd)
         }
     }
@@ -1510,10 +1617,8 @@ impl Client {
             });
             rx.await.expect("uring completion channel dropped")
         } else {
-            tokio::task::spawn_blocking(move || {
-                nix::unistd::close(unsafe { OwnedFd::from_raw_fd(raw_fd) })
-            })
-            .await??;
+            let owned_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+            tokio::task::spawn_blocking(move || nix::unistd::close(owned_fd)).await??;
             Ok(())
         }
     }
@@ -1547,20 +1652,21 @@ impl Client {
             });
             rx.await.expect("uring completion channel dropped")
         } else {
-            let old_dir_fd = old_dir_fd.as_file_descriptor().as_raw_fd();
-            let new_dir_fd = new_dir_fd.as_file_descriptor().as_raw_fd();
-            let old_path = old_path.as_ref().to_owned();
-            let new_path = new_path.as_ref().to_owned();
-            tokio::task::spawn_blocking(move || unsafe {
-                nix::fcntl::renameat2(
-                    BorrowedFd::borrow_raw(old_dir_fd),
-                    &old_path,
-                    BorrowedFd::borrow_raw(new_dir_fd),
-                    &new_path,
-                    RenameFlags::from_bits_retain(flags.bits()),
-                )
-            })
-            .await??;
+            let old_dir_fd = old_dir_fd.as_file_descriptor();
+            let new_dir_fd = new_dir_fd.as_file_descriptor();
+            let old_path = old_path.as_ref();
+            let new_path = new_path.as_ref();
+            let (_, mut futures) = unsafe {
+                async_scoped::TokioScope::scope_and_collect(move |scope| {
+                    scope.spawn_blocking(move || {
+                        nix::fcntl::renameat2(old_dir_fd, old_path, new_dir_fd, new_path, flags)
+                    });
+                    ()
+                })
+                .await
+            };
+            let future = futures.pop().expect("no future returned");
+            future.expect("future failed to join")?;
             Ok(())
         }
     }
@@ -1608,12 +1714,17 @@ impl Client {
             });
             rx.await.expect("uring completion channel dropped")
         } else {
-            let dir_fd = dir_fd.as_file_descriptor().as_raw_fd();
-            let path = path.as_ref().to_owned();
-            tokio::task::spawn_blocking(move || unsafe {
-                nix::unistd::unlinkat(BorrowedFd::borrow_raw(dir_fd), &path, flags)
-            })
-            .await??;
+            let dir_fd = dir_fd.as_file_descriptor();
+            let path = path.as_ref();
+            let (_, mut futures) = unsafe {
+                async_scoped::TokioScope::scope_and_collect(move |scope| {
+                    scope.spawn_blocking(move || nix::unistd::unlinkat(dir_fd, path, flags));
+                    ()
+                })
+                .await
+            };
+            let future = futures.pop().expect("no future returned");
+            future.expect("future failed to join")?;
             Ok(())
         }
     }
@@ -1666,16 +1777,23 @@ impl Client {
             });
             rx.await.expect("uring completion channel dropped")
         } else {
-            let dir_fd = dir_fd.as_file_descriptor().as_raw_fd();
-            let path = path.as_ref().to_owned();
-            tokio::task::spawn_blocking(move || unsafe {
-                nix::sys::stat::mkdirat(
-                    BorrowedFd::borrow_raw(dir_fd),
-                    &path,
-                    Mode::from_bits_retain(permissions.mode()),
-                )
-            })
-            .await??;
+            let dir_fd = dir_fd.as_file_descriptor();
+            let path = path.as_ref();
+            let (_, mut futures) = unsafe {
+                async_scoped::TokioScope::scope_and_collect(move |scope| {
+                    scope.spawn_blocking(move || {
+                        nix::sys::stat::mkdirat(
+                            dir_fd,
+                            path,
+                            Mode::from_bits_retain(permissions.mode()),
+                        )
+                    });
+                    ()
+                })
+                .await
+            };
+            let future = futures.pop().expect("no future returned");
+            future.expect("future failed to join")?;
             Ok(())
         }
     }
@@ -1786,13 +1904,20 @@ impl Client {
             });
             rx.await.expect("uring completion channel dropped")
         } else {
-            let target = target.as_ref().to_owned();
-            let new_dir_fd = new_dir_fd.as_file_descriptor().as_raw_fd();
-            let link_path = link_path.as_ref().to_owned();
-            tokio::task::spawn_blocking(move || unsafe {
-                nix::unistd::symlinkat(&target, BorrowedFd::borrow_raw(new_dir_fd), &link_path)
-            })
-            .await??;
+            let target = target.as_ref();
+            let new_dir_fd = new_dir_fd.as_file_descriptor();
+            let link_path = link_path.as_ref();
+            let (_, mut futures) = unsafe {
+                async_scoped::TokioScope::scope_and_collect(move |scope| {
+                    scope.spawn_blocking(move || {
+                        nix::unistd::symlinkat(target, new_dir_fd, link_path)
+                    });
+                    ()
+                })
+                .await
+            };
+            let future = futures.pop().expect("no future returned");
+            future.expect("future failed to join")?;
             Ok(())
         }
     }
@@ -1838,20 +1963,21 @@ impl Client {
             });
             rx.await.expect("uring completion channel dropped")
         } else {
-            let old_dir_fd = old_dir_fd.as_file_descriptor().as_raw_fd();
-            let new_dir_fd = new_dir_fd.as_file_descriptor().as_raw_fd();
-            let old_path = old_path.as_ref().to_owned();
-            let new_path = new_path.as_ref().to_owned();
-            tokio::task::spawn_blocking(move || unsafe {
-                nix::unistd::linkat(
-                    BorrowedFd::borrow_raw(old_dir_fd),
-                    &old_path,
-                    BorrowedFd::borrow_raw(new_dir_fd),
-                    &new_path,
-                    flags,
-                )
-            })
-            .await??;
+            let old_dir_fd = old_dir_fd.as_file_descriptor();
+            let new_dir_fd = new_dir_fd.as_file_descriptor();
+            let old_path = old_path.as_ref();
+            let new_path = new_path.as_ref();
+            let (_, mut futures) = unsafe {
+                async_scoped::TokioScope::scope_and_collect(move |scope| {
+                    scope.spawn_blocking(move || {
+                        nix::unistd::linkat(old_dir_fd, old_path, new_dir_fd, new_path, flags)
+                    });
+                    ()
+                })
+                .await
+            };
+            let future = futures.pop().expect("no future returned");
+            future.expect("future failed to join")?;
             Ok(())
         }
     }
@@ -1922,14 +2048,18 @@ impl Client {
         fd: &(impl UringTarget + ?Sized),
         permissions: Permissions,
     ) -> io::Result<()> {
-        let raw_fd = fd.as_file_descriptor().as_raw_fd();
-        tokio::task::spawn_blocking(move || {
-            nix::sys::stat::fchmod(
-                unsafe { BorrowedFd::borrow_raw(raw_fd) },
-                Mode::from_bits_retain(permissions.mode()),
-            )
-        })
-        .await??;
+        let raw_fd = fd.as_file_descriptor();
+        let (_, mut futures) = unsafe {
+            async_scoped::TokioScope::scope_and_collect(move |scope| {
+                scope.spawn_blocking(move || {
+                    nix::sys::stat::fchmod(raw_fd, Mode::from_bits_retain(permissions.mode()))
+                });
+                ()
+            })
+            .await
+        };
+        let future = futures.pop().expect("no future returned");
+        future.expect("future failed to join")?;
         Ok(())
     }
 
@@ -1941,47 +2071,68 @@ impl Client {
         permissions: Permissions,
         flags: FchmodatFlags,
     ) -> io::Result<()> {
-        let path = path.as_ref().to_owned();
-        let raw_fd = fd.as_file_descriptor().as_raw_fd();
-        tokio::task::spawn_blocking(move || unsafe {
-            nix::sys::stat::fchmodat(
-                BorrowedFd::borrow_raw(raw_fd),
-                &path,
-                Mode::from_bits_retain(permissions.mode()),
-                flags,
-            )
-        })
-        .await??;
+        let path = path.as_ref();
+        let dir_fd = fd.as_file_descriptor();
+        let (_, mut futures) = unsafe {
+            async_scoped::TokioScope::scope_and_collect(move |scope| {
+                scope.spawn_blocking(move || {
+                    nix::sys::stat::fchmodat(
+                        dir_fd,
+                        path,
+                        Mode::from_bits_retain(permissions.mode()),
+                        flags,
+                    )
+                });
+                ()
+            })
+            .await
+        };
+        let future = futures.pop().expect("no future returned");
+        future.expect("future failed to join")?;
         Ok(())
     }
 
     /// Set the permissions of a file or directory using path syntax, equivalent to `chmod(2)`.
     pub async fn chmod(&self, path: impl AsRef<Path>, permissions: Permissions) -> io::Result<()> {
-        let path = path.as_ref().to_owned();
-        tokio::task::spawn_blocking(move || unsafe {
-            nix::sys::stat::fchmodat(
-                BorrowedFd::borrow_raw(libc::AT_FDCWD),
-                &path,
-                Mode::from_bits_retain(permissions.mode()),
-                FchmodatFlags::FollowSymlink,
-            )
-        })
-        .await??;
+        let path = path.as_ref();
+        let (_, mut futures) = unsafe {
+            async_scoped::TokioScope::scope_and_collect(move |scope| {
+                scope.spawn_blocking(move || {
+                    nix::sys::stat::fchmodat(
+                        BorrowedFd::borrow_raw(libc::AT_FDCWD),
+                        path,
+                        Mode::from_bits_retain(permissions.mode()),
+                        FchmodatFlags::FollowSymlink,
+                    )
+                });
+                ()
+            })
+            .await
+        };
+        let future = futures.pop().expect("no future returned");
+        future.expect("future failed to join")?;
         Ok(())
     }
 
     /// Set the permissions of a file or directory using path syntax, but can target a symlink.
     pub async fn lchmod(&self, path: impl AsRef<Path>, permissions: Permissions) -> io::Result<()> {
-        let path = path.as_ref().to_owned();
-        tokio::task::spawn_blocking(move || unsafe {
-            nix::sys::stat::fchmodat(
-                BorrowedFd::borrow_raw(libc::AT_FDCWD),
-                &path,
-                Mode::from_bits_retain(permissions.mode()),
-                FchmodatFlags::NoFollowSymlink,
-            )
-        })
-        .await??;
+        let path = path.as_ref();
+        let (_, mut futures) = unsafe {
+            async_scoped::TokioScope::scope_and_collect(move |scope| {
+                scope.spawn_blocking(move || {
+                    nix::sys::stat::fchmodat(
+                        BorrowedFd::borrow_raw(libc::AT_FDCWD),
+                        path,
+                        Mode::from_bits_retain(permissions.mode()),
+                        FchmodatFlags::NoFollowSymlink,
+                    )
+                });
+                ()
+            })
+            .await
+        };
+        let future = futures.pop().expect("no future returned");
+        future.expect("future failed to join")?;
         Ok(())
     }
 
@@ -1992,11 +2143,16 @@ impl Client {
         uid: Option<Uid>,
         gid: Option<Gid>,
     ) -> io::Result<()> {
-        let raw_fd = fd.as_file_descriptor().as_raw_fd();
-        tokio::task::spawn_blocking(move || unsafe {
-            nix::unistd::fchown(BorrowedFd::borrow_raw(raw_fd), uid, gid)
-        })
-        .await??;
+        let raw_fd = fd.as_file_descriptor();
+        let (_, mut futures) = unsafe {
+            async_scoped::TokioScope::scope_and_collect(move |scope| {
+                scope.spawn_blocking(move || nix::unistd::fchown(raw_fd, uid, gid));
+                ()
+            })
+            .await
+        };
+        let future = futures.pop().expect("no future returned");
+        future.expect("future failed to join")?;
         Ok(())
     }
 
@@ -2009,12 +2165,17 @@ impl Client {
         gid: Option<Gid>,
         flags: FchownatFlags,
     ) -> io::Result<()> {
-        let path = path.as_ref().to_owned();
-        let raw_fd = fd.as_file_descriptor().as_raw_fd();
-        tokio::task::spawn_blocking(move || unsafe {
-            nix::unistd::fchownat(BorrowedFd::borrow_raw(raw_fd), &path, uid, gid, flags)
-        })
-        .await??;
+        let path = path.as_ref();
+        let dir_fd = fd.as_file_descriptor();
+        let (_, mut futures) = unsafe {
+            async_scoped::TokioScope::scope_and_collect(move |scope| {
+                scope.spawn_blocking(move || nix::unistd::fchownat(dir_fd, path, uid, gid, flags));
+                ()
+            })
+            .await
+        };
+        let future = futures.pop().expect("no future returned");
+        future.expect("future failed to join")?;
         Ok(())
     }
 
@@ -2025,17 +2186,24 @@ impl Client {
         uid: Option<Uid>,
         gid: Option<Gid>,
     ) -> io::Result<()> {
-        let path = path.as_ref().to_owned();
-        tokio::task::spawn_blocking(move || unsafe {
-            nix::unistd::fchownat(
-                BorrowedFd::borrow_raw(libc::AT_FDCWD),
-                &path,
-                uid,
-                gid,
-                AtFlags::AT_SYMLINK_FOLLOW,
-            )
-        })
-        .await??;
+        let path = path.as_ref();
+        let (_, mut futures) = unsafe {
+            async_scoped::TokioScope::scope_and_collect(move |scope| {
+                scope.spawn_blocking(move || {
+                    nix::unistd::fchownat(
+                        BorrowedFd::borrow_raw(libc::AT_FDCWD),
+                        path,
+                        uid,
+                        gid,
+                        AtFlags::AT_SYMLINK_FOLLOW,
+                    )
+                });
+                ()
+            })
+            .await
+        };
+        let future = futures.pop().expect("no future returned");
+        future.expect("future failed to join")?;
         Ok(())
     }
 
@@ -2046,17 +2214,24 @@ impl Client {
         uid: Option<Uid>,
         gid: Option<Gid>,
     ) -> io::Result<()> {
-        let path = path.as_ref().to_owned();
-        tokio::task::spawn_blocking(move || unsafe {
-            nix::unistd::fchownat(
-                BorrowedFd::borrow_raw(libc::AT_FDCWD),
-                &path,
-                uid,
-                gid,
-                AtFlags::AT_SYMLINK_NOFOLLOW,
-            )
-        })
-        .await??;
+        let path = path.as_ref();
+        let (_, mut futures) = unsafe {
+            async_scoped::TokioScope::scope_and_collect(move |scope| {
+                scope.spawn_blocking(move || {
+                    nix::unistd::fchownat(
+                        BorrowedFd::borrow_raw(libc::AT_FDCWD),
+                        path,
+                        uid,
+                        gid,
+                        AtFlags::AT_SYMLINK_NOFOLLOW,
+                    )
+                });
+                ()
+            })
+            .await
+        };
+        let future = futures.pop().expect("no future returned");
+        future.expect("future failed to join")?;
         Ok(())
     }
 
@@ -2078,39 +2253,45 @@ impl Client {
         atime: Option<TimeSpec>,
         mtime: Option<TimeSpec>,
     ) -> io::Result<()> {
-        let raw_fd = fd.as_file_descriptor().as_raw_fd();
+        let fd = fd.as_file_descriptor();
         let _atime = atime.unwrap_or(TimeSpec::UTIME_OMIT);
         let _mtime = mtime.unwrap_or(TimeSpec::UTIME_OMIT);
-        tokio::task::spawn_blocking(move || {
-            nix::sys::stat::futimens(unsafe { BorrowedFd::borrow_raw(raw_fd) }, &_atime, &_mtime)
-        })
-        .await??;
+        let (_, mut futures) = unsafe {
+            async_scoped::TokioScope::scope_and_collect(move |scope| {
+                scope.spawn_blocking(move || nix::sys::stat::futimens(fd, &_atime, &_mtime));
+                ()
+            })
+            .await
+        };
+        let future = futures.pop().expect("no future returned");
+        future.expect("future failed to join")?;
         Ok(())
     }
 
     /// Set file times of a file or directory using a path relative to a directory fd, which is equivalent to `utimensat(2)`.
     pub async fn utimens_at(
         &self,
-        fd: &(impl UringTarget + ?Sized),
+        dir_fd: &(impl UringTarget + ?Sized),
         path: impl AsRef<Path>,
         atime: Option<TimeSpec>,
         mtime: Option<TimeSpec>,
         flags: UtimensatFlags,
     ) -> io::Result<()> {
-        let path = path.as_ref().to_owned();
+        let path = path.as_ref();
         let _atime = atime.unwrap_or(TimeSpec::UTIME_OMIT);
         let _mtime = mtime.unwrap_or(TimeSpec::UTIME_OMIT);
-        let raw_fd = fd.as_file_descriptor().as_raw_fd();
-        tokio::task::spawn_blocking(move || unsafe {
-            nix::sys::stat::utimensat(
-                BorrowedFd::borrow_raw(raw_fd),
-                &path,
-                &_atime,
-                &_mtime,
-                flags,
-            )
-        })
-        .await??;
+        let dir_fd = dir_fd.as_file_descriptor();
+        let (_, mut futures) = unsafe {
+            async_scoped::TokioScope::scope_and_collect(move |scope| {
+                scope.spawn_blocking(move || {
+                    nix::sys::stat::utimensat(dir_fd, path, &_atime, &_mtime, flags)
+                });
+                ()
+            })
+            .await
+        };
+        let future = futures.pop().expect("no future returned");
+        future.expect("future failed to join")?;
         Ok(())
     }
 
@@ -2121,11 +2302,20 @@ impl Client {
 
     /// Read a symbolic link. This is equivalent to `readlink(2)`.
     pub async fn read_link(&self, path: impl AsRef<Path>) -> io::Result<PathBuf> {
-        let path = path.as_ref().to_owned();
-        let output = tokio::task::spawn_blocking(move || unsafe {
-            nix::fcntl::readlinkat(BorrowedFd::borrow_raw(libc::AT_FDCWD), &path)
-        })
-        .await??;
+        let path = path.as_ref();
+        let (_, mut futures) = unsafe {
+            async_scoped::TokioScope::scope_and_collect(move |scope| {
+                scope.spawn_blocking(move || -> io::Result<OsString> {
+                    let output =
+                        nix::fcntl::readlinkat(BorrowedFd::borrow_raw(libc::AT_FDCWD), path)?;
+                    Ok(output)
+                });
+                ()
+            })
+            .await
+        };
+        let future = futures.pop().expect("no future returned");
+        let output = future.expect("future failed to join")?;
         Ok(PathBuf::from(output))
     }
 
@@ -2135,22 +2325,38 @@ impl Client {
         dir_fd: &(impl UringTarget + ?Sized),
         path: impl AsRef<Path>,
     ) -> io::Result<PathBuf> {
-        let path = path.as_ref().to_owned();
-        let raw_fd = dir_fd.as_file_descriptor().as_raw_fd();
-        let output = tokio::task::spawn_blocking(move || unsafe {
-            nix::fcntl::readlinkat(BorrowedFd::borrow_raw(raw_fd), &path)
-        })
-        .await??;
+        let path = path.as_ref();
+        let dir_fd = dir_fd.as_file_descriptor();
+        let (_, mut futures) = unsafe {
+            async_scoped::TokioScope::scope_and_collect(move |scope| {
+                scope.spawn_blocking(move || -> io::Result<OsString> {
+                    let output = nix::fcntl::readlinkat(dir_fd, path)?;
+                    Ok(output)
+                });
+                ()
+            })
+            .await
+        };
+        let future = futures.pop().expect("no future returned");
+        let output = future.expect("future failed to join")?;
         Ok(PathBuf::from(output))
     }
 
     /// Read a symbolic link at a file descriptor opened with [`OFlag::O_PATH`] and [`OFlag::O_NOFOLLOW`].
     pub async fn read_link_file(&self, fd: &(impl UringTarget + ?Sized)) -> io::Result<PathBuf> {
-        let raw_fd = fd.as_file_descriptor().as_raw_fd();
-        let output = tokio::task::spawn_blocking(move || unsafe {
-            nix::fcntl::readlinkat(BorrowedFd::borrow_raw(raw_fd), Path::new(""))
-        })
-        .await??;
+        let fd = fd.as_file_descriptor();
+        let (_, mut futures) = unsafe {
+            async_scoped::TokioScope::scope_and_collect(move |scope| {
+                scope.spawn_blocking(move || -> io::Result<OsString> {
+                    let output = nix::fcntl::readlinkat(fd, Path::new(""))?;
+                    Ok(output)
+                });
+                ()
+            })
+            .await
+        };
+        let future = futures.pop().expect("no future returned");
+        let output = future.expect("future failed to join")?;
         Ok(PathBuf::from(output))
     }
 
@@ -2162,19 +2368,27 @@ impl Client {
         kind: MknodType,
         permissions: Permissions,
     ) -> io::Result<()> {
-        let path = path.as_ref().to_owned();
-        let raw_fd = dir_fd.as_file_descriptor().as_raw_fd();
-        tokio::task::spawn_blocking(move || unsafe {
-            let (kind, device) = kind.to_sflag_and_device();
-            nix::sys::stat::mknodat(
-                BorrowedFd::borrow_raw(raw_fd),
-                &path,
-                kind,
-                Mode::from_bits_retain(permissions.mode()),
-                device.into(),
-            )
-        })
-        .await??;
+        let path = path.as_ref();
+        let dir_fd = dir_fd.as_file_descriptor();
+        let (_, mut futures) = unsafe {
+            async_scoped::TokioScope::scope_and_collect(move |scope| {
+                scope.spawn_blocking(move || -> io::Result<()> {
+                    let (kind, device) = kind.to_sflag_and_device();
+                    nix::sys::stat::mknodat(
+                        dir_fd,
+                        path,
+                        kind,
+                        Mode::from_bits_retain(permissions.mode()),
+                        device.into(),
+                    )?;
+                    Ok(())
+                });
+                ()
+            })
+            .await
+        };
+        let future = futures.pop().expect("no future returned");
+        future.expect("future failed to join")?;
         Ok(())
     }
 
