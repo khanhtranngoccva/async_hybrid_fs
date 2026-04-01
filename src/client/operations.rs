@@ -1833,7 +1833,7 @@ impl Client {
             Err(e) => return Err(e),
         }
         match path.parent() {
-            Some(p) => self.create_dir_all(p).await?,
+            Some(p) => Box::pin(self.create_dir_all(p)).await?,
             None => {
                 return Err(io::Error::new(
                     io::ErrorKind::Other,
@@ -1866,7 +1866,7 @@ impl Client {
             Err(e) => return Err(e),
         }
         match path.parent() {
-            Some(p) => self.create_dir_all_with_permissions(p, permissions).await?,
+            Some(p) => Box::pin(self.create_dir_all_with_permissions(p, permissions)).await?,
             None => {
                 return Err(io::Error::new(
                     io::ErrorKind::Other,
