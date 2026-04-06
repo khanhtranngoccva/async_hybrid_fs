@@ -44,7 +44,6 @@ pub struct ClientUring {
     uring_cthread: JoinHandle<()>,
     registered_files: Arc<DashSet<u32>>,
     next_file_slot: Arc<AtomicU32>,
-    pending: Arc<DashMap<u64, Command>>,
     identity: Arc<()>,
 }
 
@@ -197,7 +196,6 @@ impl Client {
                 probe: probe,
                 uring_sthread: sthread,
                 uring_cthread: cthread,
-                pending,
                 registered_files: Arc::new(DashSet::new()),
                 identity: Arc::new(()),
                 next_file_slot: Arc::new(AtomicU32::new(0)),

@@ -145,3 +145,50 @@ where
         runtime::execute_future_from_sync(self._cancel());
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{io::pipe, os::fd::AsFd};
+
+    use crate::{
+        HybridRead, PendingIo, client::pending_io::fallback::TokioScopedPendingIo, default_client,
+    };
+    use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn should_not_run_processor_code_if_canceled() {
+        if !default_client().is_uring_available_and_active() {
+            println!("uring is not available, skipping test");
+        }
+        let (tx, rx) = oneshot::channel::<()>();
+        let (pipe_read, _pipe_write) = pipe().expect("should be able to create a pipe");
+        let mut buf = [0; 64];
+        let mut pipe_read_fd = pipe_read.as_fd();
+        let chained_io = pipe_read_fd.hybrid_read(&mut buf).map(|_| {
+            let _ = tx.send(());
+        });
+        assert!(
+            chained_io.cancel().await.is_none(),
+            "pipe operation should be cancellable because the writer has not sent anything"
+        );
+        rx.await.expect_err(
+            "should not be able to receive a message because the processor code should not run",
+        );
+    }
+
+    #[tokio::test]
+    async fn should_run_processor_code_on_drop() {
+        let (tx, rx) = oneshot::channel::<String>();
+        let raw_io = PendingIo::new(TokioScopedPendingIo::new(|| "test"));
+        let chained = raw_io.map(|s| tx.send(s.to_uppercase()));
+        drop(chained);
+        assert_eq!(rx.await.unwrap(), "TEST");
+    }
+
+    #[tokio::test]
+    async fn should_run_processor_code_on_uncancelables() {
+        let raw_io = PendingIo::new(TokioScopedPendingIo::new(|| "test"));
+        let chained = raw_io.map(|s| s.to_uppercase());
+        assert_eq!(chained.cancel().await, Some("TEST".to_string()));
+    }
+}

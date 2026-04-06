@@ -1,5 +1,5 @@
 {
     "rust-analyzer.cargo.features": [
-        // "pending-io-futures"
+        "pending-io-futures"
     ]
 }   

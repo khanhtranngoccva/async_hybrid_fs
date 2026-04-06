@@ -11,7 +11,7 @@ use std::{
 /// A raw target object that can be used by the io_uring client, which represents either a borrowed file descriptor or a borrowed fixed entry.
 ///
 /// A user may obtain a mutable Target object by calling the unsafe [`Client::as_target`](crate::Client::as_target) method on an immutable UringTarget object, which allows bypassing mutable checks to avoid certain overhead.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub enum Target {
     Fd(RawFd),
     Fixed {
@@ -51,6 +51,7 @@ impl UringTarget for Target {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct ReadRequest {
     pub(crate) target: Target,
     pub(crate) buf_ptr: *mut u8,
@@ -62,6 +63,7 @@ pub(crate) struct ReadRequest {
 unsafe impl Send for ReadRequest {}
 unsafe impl Sync for ReadRequest {}
 
+#[derive(Debug)]
 pub(crate) struct ReadvRequest {
     pub(crate) target: Target,
     pub(crate) io_slices: *const iovec,
@@ -86,6 +88,7 @@ impl Deref for IovecArray {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct WriteRequest {
     pub(crate) target: Target,
     pub(crate) buf_ptr: *const u8,
@@ -97,6 +100,7 @@ pub(crate) struct WriteRequest {
 unsafe impl Send for WriteRequest {}
 unsafe impl Sync for WriteRequest {}
 
+#[derive(Debug)]
 pub(crate) struct WritevRequest {
     pub(crate) target: Target,
     pub(crate) io_slices: *const iovec,
@@ -108,17 +112,20 @@ pub(crate) struct WritevRequest {
 unsafe impl Send for WritevRequest {}
 unsafe impl Sync for WritevRequest {}
 
+#[derive(Debug)]
 pub(crate) struct SyncRequest {
     pub(crate) target: Target,
     pub(crate) datasync: bool,
 }
 
+#[derive(Debug)]
 pub(crate) struct StatxRequest {
     pub(crate) target: Target,
     /// Caller-allocated buffer for statx result. We use libc::statx for the actual storage, cast to types::statx* for the opcode.
     pub(crate) statx_buf: Box<MaybeUninit<libc::statx>>,
 }
 
+#[derive(Debug)]
 pub(crate) struct FallocateRequest {
     pub(crate) target: Target,
     pub(crate) offset: u64,
@@ -126,6 +133,7 @@ pub(crate) struct FallocateRequest {
     pub(crate) mode: i32,
 }
 
+#[derive(Debug)]
 pub(crate) struct FadviseRequest {
     pub(crate) target: Target,
     pub(crate) offset: u64,
@@ -133,11 +141,13 @@ pub(crate) struct FadviseRequest {
     pub(crate) advice: i32,
 }
 
+#[derive(Debug)]
 pub(crate) struct FtruncateRequest {
     pub(crate) target: Target,
     pub(crate) len: u64,
 }
 
+#[derive(Debug)]
 pub(crate) struct OpenAtRequest {
     /// Directory fd for relative paths, or AT_FDCWD for current directory.
     pub(crate) dir_fd: RawFd,
@@ -147,6 +157,7 @@ pub(crate) struct OpenAtRequest {
     pub(crate) mode: u32,
 }
 
+#[derive(Debug)]
 pub(crate) struct StatxPathRequest {
     /// Directory fd for relative paths, or AT_FDCWD for current directory.
     pub(crate) dir_fd: RawFd,
@@ -156,10 +167,12 @@ pub(crate) struct StatxPathRequest {
     pub(crate) statx_buf: Box<MaybeUninit<libc::statx>>,
 }
 
+#[derive(Debug)]
 pub(crate) struct CloseRequest {
     pub(crate) fd: RawFd,
 }
 
+#[derive(Debug)]
 pub(crate) struct RenameAtRequest {
     pub(crate) old_dir_fd: RawFd,
     pub(crate) old_path: CString,
@@ -168,24 +181,28 @@ pub(crate) struct RenameAtRequest {
     pub(crate) flags: u32,
 }
 
+#[derive(Debug)]
 pub(crate) struct UnlinkAtRequest {
     pub(crate) dir_fd: RawFd,
     pub(crate) path: CString,
     pub(crate) flags: i32,
 }
 
+#[derive(Debug)]
 pub(crate) struct MkdirAtRequest {
     pub(crate) dir_fd: RawFd,
     pub(crate) path: CString,
     pub(crate) mode: u32,
 }
 
+#[derive(Debug)]
 pub(crate) struct SymlinkAtRequest {
     pub(crate) new_dir_fd: RawFd,
     pub(crate) target: CString,
     pub(crate) link_path: CString,
 }
 
+#[derive(Debug)]
 pub(crate) struct LinkAtRequest {
     pub(crate) old_dir_fd: RawFd,
     pub(crate) old_path: CString,
@@ -194,6 +211,7 @@ pub(crate) struct LinkAtRequest {
     pub(crate) flags: i32,
 }
 
+#[derive(Debug)]
 pub(crate) struct CancelRequest {
     pub(crate) id: u64,
 }

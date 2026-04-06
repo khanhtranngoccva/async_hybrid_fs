@@ -14,11 +14,13 @@
 //!     - Both file types are automatically unregistered when they are dropped, and a [`RegisteredFile`] can be upgraded to an [`OwnedRegisteredFile`] to allow the file to be stored independently.
 //! - Pending I/O objects returned from primitive operations ([`PendingIoObject`], e.g. [`Client::write_from`]) is designed to be memory-safe, cancellation-safe and atomic:
 //!     - The APIs takes full advantage of Rust's borrow checker.
-//!     - The io_uring system offers a cancellation mechanism for operations that are in progress, but cancellation might fail because an operation has progressed too far, and waiting for completion is required. Calling the [`PendingIo::cancel`] method  handles pitfalls by invoking the cancellation mechanism and waiting for completion and returning the result if necessary.
+//!     - The io_uring system offers a cancellation mechanism for operations that are in progress, but cancellation might fail because an operation has progressed too far, and waiting for completion is required. Calling the [`PendingIo::cancel`] method handles pitfalls by invoking the cancellation mechanism and waiting for completion and returning the result if necessary.
 //!     - While [`uring_file`] used await points when receiving from completion channels, which may result in use-after-free errors if its pending futures are dropped mid-operation, this library implements low-level futures which invoke [`PendingIo::cancel`] on drop or wait for completion, depending on low-level API capabilities.
 //!     - When multiplexing using macros like [`tokio::select`] with a cancellation token or a timeout timer, futures may be implicitly dropped. If pending I/O object could be polled directly, it may lead to missed completions, which may lead to subtle bugs where states are out of sync with the underlying file descriptor. To counteract that, the [`PendingIo::completion`] method returns a trivially droppable future that can be multiplexed with these futures without triggering the cancellation mechanism.
-//!     - // TODO: add a synchronous finally() method to allow running `FnOnce` code that has to run after the operation is completed, regardless of whether the pending I/O operation is dropped early.
-//!         - This may be useful for structures where there is a user-mode offset field that requires atomic synchronization with the kernel-mode seek position.
+//!     - The [`PendingIo::map`] method allows running `FnOnce` code that has to run after the operation is completed, regardless of whether the pending I/O operation is dropped early or not.
+//!         - This is useful for structures where there is a user-mode offset field that requires atomic synchronization with the kernel-mode seek position.
+//!     - [`PendingIo`] objects do not implement [`Future`] by default.
+//!         - If you wish to await the I/O operation directly, you can use the crate feature `pending-io-futures`.
 //!
 //! # Requirements
 //! - Tokio runtime with at least the `rt` feature enabled. This is because this library uses Tokio's blocking executor for fallback implementations when `io_uring` is not available or supported for the operation.
@@ -35,6 +37,7 @@ pub mod iobuf;
 pub mod metadata;
 mod runtime;
 
+use crate::client::pending_io::fixed_value::FixedValuePendingIo;
 use nix::fcntl::AT_FDCWD;
 use nix::fcntl::RenameFlags;
 use nix::sys::time::TimeSpec;
@@ -43,6 +46,8 @@ use nix::unistd::UnlinkatFlags;
 use nix::unistd::{Gid, Uid};
 use std::io::IoSlice;
 use std::io::IoSliceMut;
+use std::io::PipeReader;
+use std::io::PipeWriter;
 use std::io::SeekFrom;
 use std::io::{self};
 use std::os::fd::AsFd;
@@ -54,9 +59,10 @@ use std::path::Path;
 use std::path::PathBuf;
 use tokio::fs::File;
 
-use crate::client::pending_io::fixed_value::FixedValuePendingIo;
+pub use crate::metadata::DeviceNumber;
+pub use crate::metadata::FileType;
 pub use crate::metadata::Metadata;
-use crate::metadata::MknodType;
+pub use crate::metadata::MknodType;
 pub use crate::metadata::Permissions;
 pub use client::Client;
 pub use client::ClientBuildError;
@@ -70,6 +76,8 @@ pub use client::UringTarget;
 pub use client::pending_io::PendingIo;
 pub use default::default_client;
 pub use fs::OpenOptions;
+pub use iobuf::IoBuf;
+pub use iobuf::IoBufMut;
 
 #[async_trait::async_trait]
 pub trait HybridRead: UringTarget + Sync + Send {
@@ -775,6 +783,8 @@ hybrid_impl!(std::fs::File);
 hybrid_impl!(tokio::fs::File);
 hybrid_impl!(BorrowedFd<'_>);
 hybrid_impl!(OwnedFd);
+hybrid_impl!(PipeReader);
+hybrid_impl!(PipeWriter);
 hybrid_impl!(RegisteredFile<'_>);
 hybrid_impl!(OwnedRegisteredFile);
 hybrid_impl!(Target);
@@ -806,7 +816,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_hybrid_create_and_read() {
+    async fn test_hybrid_create_and_read_write() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let mut file = OpenOptions::new()
             .write(true)

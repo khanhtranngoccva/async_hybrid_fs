@@ -2016,11 +2016,6 @@ impl Client {
         // Cannot use await here because we may not drop a processing cancel operation.
         rx.recv().expect("uring completion channel dropped")?;
         // Remove the operation from the pending map.
-        self.uring
-            .as_ref()
-            .expect("uring not supported, callers must ensure uring support first")
-            .pending
-            .remove(&id);
         Ok(())
     }
 }

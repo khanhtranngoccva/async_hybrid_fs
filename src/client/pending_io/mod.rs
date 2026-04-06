@@ -16,9 +16,7 @@ pub(crate) trait PendingIoImpl<T>: Unpin + Send {
 /// Wrapper for user-friendly methods for cancellable pending I/O operations.
 /// Upon return from respective code, these futures are guaranteed to be running in the background, and should cancel I/O operations properly upon being dropped.
 ///
-/// To prevent misuse, there is no convenience method to directly await objects implementing this trait by default - it is recommended to use the [`Self::completion`] method instead.
-///
-/// If you wish to await the I/O operation directly, you can use the crate feature `pending-future`.
+/// To prevent misuse, pending I/O objects do not implement [`Future`] by default - it is recommended to use the [`Self::completion`] method instead. If you wish to await the I/O operation directly, you can use the crate feature `pending-io-futures`. These convenience futures should not be multiplexed with other futures to avoid missed operations.
 pub struct PendingIo<'lifetime, T>
 where
     T: Send,

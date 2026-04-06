@@ -9,6 +9,7 @@ use io_uring::{opcode, squeue::Entry, types};
 use std::{io, os::fd::OwnedFd};
 use tokio::sync::oneshot as oneshot_async;
 
+#[derive(Debug)]
 pub(crate) enum Command {
     Read {
         req: ReadRequest,
