@@ -1,18 +1,25 @@
 use super::command::Command;
 use crate::{
-    Target,
+    PendingIo, Target,
     borrowed_buf::BorrowedBuf,
     client::{
         Client, URING_LEN_MAX, UringTarget,
         completion::{ReadResult, ReadvResult, WriteResult, WritevResult},
-        requests::{
-            CloseRequest, FadviseRequest, FallocateRequest, FtruncateRequest, IovecArray,
-            LinkAtRequest, MkdirAtRequest, OpenAtRequest, ReadRequest, ReadvRequest,
-            RenameAtRequest, StatxPathRequest, StatxRequest, SymlinkAtRequest, SyncRequest,
-            UnlinkAtRequest, WriteRequest, WritevRequest,
+        pending_io::{
+            fallback::TokioScopedPendingIo,
+            fixed_value::FixedValuePendingIo,
+            uring::{
+                close::UringClose, fadvise::UringFadvise, fallocate::UringFallocate,
+                ftruncate::UringFtruncate, link_at::UringLinkAt, mkdir_at::UringMkdirAt,
+                open_at::UringOpenAt, read_into::UringReadIntoAt,
+                read_into_vectored::UringReadIntoVectoredAt, rename_at::UringRenameAt,
+                statx::UringStatx, statx_path::UringStatxPath, symlink_at::UringSymlinkAt,
+                sync::UringSync, unlink_at::UringUnlinkAt, write_from::UringWriteFromAt,
+                write_from_vectored::UringWriteFromVectoredAt,
+            },
         },
+        requests::CancelRequest,
     },
-    flags::MetadataAtFlags,
     helpers,
     iobuf::{IoBuf, IoBufMut},
     metadata::{Metadata, MknodType, Permissions},
@@ -28,8 +35,7 @@ use nix::{
     unistd::{FchownatFlags, Gid, LinkatFlags, Uid, UnlinkatFlags},
 };
 use std::{
-    cmp,
-    ffi::OsString,
+    cmp::{self, min},
     io::{self, IoSlice, IoSliceMut, SeekFrom},
     mem::MaybeUninit,
     os::fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd},
@@ -37,9 +43,10 @@ use std::{
     sync::atomic::Ordering,
     u32, u64,
 };
-use tokio::sync::oneshot;
 
 impl Client {
+    const AT_FDCWD: BorrowedFd<'static> = unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) };
+
     fn is_uring_operation_supported(&self, code: u8) -> bool {
         let uring = match self.uring.as_ref() {
             Some(uring) => uring,
@@ -65,7 +72,7 @@ impl Client {
         }
     }
 
-    fn send(&self, command: Command) {
+    pub(crate) fn send(&self, command: Command) {
         self.uring
             .as_ref()
             .expect("uring not supported, callers must ensure uring support first")
@@ -79,9 +86,17 @@ impl Client {
         &self,
         file: &mut (impl UringTarget + ?Sized),
     ) -> Option<usize> {
-        let size = self.metadata(&file.as_file_descriptor()).await.ok()?.size();
+        let size = self
+            .metadata(&file.as_file_descriptor())
+            .completion()
+            .expect("no completion future returned")
+            .await
+            .ok()?
+            .size();
         let pos = self
             .seek(&mut file.as_file_descriptor(), SeekFrom::Current(0))
+            .completion()
+            .expect("no completion future returned")
             .await
             .ok()?;
         // Don't worry about `usize` overflow because reading will fail regardless
@@ -94,238 +109,201 @@ impl Client {
     /// The buffer is returned along with the number of bytes read. This allows buffer reuse and supports custom allocators (e.g., aligned buffers for O_DIRECT).
     ///
     /// Note that the read data may reside in the spare capacity of the buffer if the specified buffer's capacity is greater than its reported length, so it might be necessary to use a [`Vec::set_len()`] call to force the buffer to resize. It is usually safer to use the [`Self::read_at`] method insteaed.
-    pub async fn read_into_at<B: IoBufMut>(
-        &self,
-        file: &(impl UringTarget + ?Sized),
+    pub fn read_into_at<'a, B: IoBufMut + 'a>(
+        &'a self,
+        file: &'a (impl UringTarget + Sync + ?Sized),
         mut buf: B,
         offset: impl TryInto<u64>,
-    ) -> io::Result<ReadResult<B>> {
-        let ptr = buf.as_mut_ptr();
-        let cap = buf.capacity();
-        let offset: u64 = offset
-            .try_into()
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "offset exceeds i64::MAX"))?;
+    ) -> PendingIo<'a, io::Result<ReadResult<B>>> {
+        let offset: u64 = match offset.try_into() {
+            Ok(offset) => offset,
+            Err(_) => {
+                return PendingIo::new(FixedValuePendingIo::new(Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "offset exceeds u64::MAX",
+                ))));
+            }
+        };
         // Need to cast to off_t
         if offset > i64::MAX as u64 {
-            return Err(io::Error::new(
+            return PendingIo::new(FixedValuePendingIo::new(Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "offset exceeds i64::MAX",
-            ));
+            ))));
         }
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Read::CODE)
         {
-            let uring = self.uring.as_ref().expect(
-                "should be able to resolve uring because is_uring_operation_supported() is true",
-            );
-            let target = unsafe { file.as_target(&uring.identity) };
-            let (tx, rx) = oneshot::channel();
-            self.send(Command::Read {
-                req: ReadRequest {
-                    target,
-                    buf_ptr: ptr,
-                    // u32::MAX
-                    buf_len: cap.try_into().unwrap_or(u32::MAX),
-                    offset,
-                },
-                res: tx,
-            });
-            let bytes_read = rx.await.expect("uring completion channel dropped")?;
-            Ok(ReadResult {
-                buf,
-                bytes_read: bytes_read as usize,
-            })
+            PendingIo::new(UringReadIntoAt::new(self, file, buf, offset))
         } else {
-            let slice = unsafe { std::slice::from_raw_parts_mut(ptr, cap) };
-            let file_descriptor = file.as_file_descriptor();
-            let (_, mut futures) = unsafe {
-                async_scoped::TokioScope::scope_and_collect(move |scope| {
-                    scope.spawn_blocking(move || {
-                        nix::sys::uio::pread(file_descriptor, slice, offset as i64)
-                    });
-                    ()
-                })
-                .await
-            };
-            let future = futures.pop().expect("no future returned");
-            let bytes_read = future.expect("future failed to join")?;
-            Ok(ReadResult { buf, bytes_read })
+            PendingIo::new(TokioScopedPendingIo::new(
+                move || -> io::Result<ReadResult<B>> {
+                    let bytes_read = nix::sys::uio::pread(
+                        file.as_file_descriptor(),
+                        unsafe { buf.as_mut_slice_with_uninit().assume_init_mut() },
+                        offset as i64,
+                    )?;
+                    unsafe {
+                        buf.set_len(bytes_read);
+                    }
+                    Ok(ReadResult { buf, bytes_read })
+                },
+            ))
         }
     }
 
     /// Standard-library compatible method for reading from a file at the specified offset using a zero-copy buffer.
-    pub async fn read_at<'buf>(
-        &self,
-        file: &(impl UringTarget + ?Sized),
-        buf: &'buf mut [u8],
+    pub fn read_at<'a>(
+        &'a self,
+        file: &'a (impl UringTarget + Sync + ?Sized),
+        buf: &'a mut [u8],
         offset: impl TryInto<u64>,
-    ) -> io::Result<usize> {
-        <u32>::try_from(buf.len())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "len exceeds u32::MAX"))?;
-        self.read_into_at(file, buf, offset)
-            .await
-            .map(|result| result.bytes_read)
+    ) -> PendingIo<'a, io::Result<usize>> {
+        match <u32>::try_from(buf.len()) {
+            Ok(_) => self
+                .read_into_at(file, buf, offset)
+                .map(|result| result.map(|result| result.bytes_read)),
+            Err(_) => {
+                return PendingIo::new(FixedValuePendingIo::new(Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "len exceeds u32::MAX",
+                ))));
+            }
+        }
     }
 
     /// Read into multiple user-provided buffers at the specified offset. This is the primitive read operation that accepts any buffer type implementing [`IoBufMut`].
     ///
     /// The buffer is returned along with the number of bytes read. This allows buffer reuse and supports custom allocators (e.g., aligned buffers for O_DIRECT).
-    pub async fn read_into_vectored_at<B: IoBufMut>(
-        &self,
-        file: &(impl UringTarget + ?Sized),
+    pub fn read_into_vectored_at<'a, B: IoBufMut + 'a>(
+        &'a self,
+        file: &'a (impl UringTarget + Sync + ?Sized),
         mut bufs: Vec<B>,
         offset: impl TryInto<u64>,
-    ) -> io::Result<ReadvResult<B>> {
-        let offset: u64 = offset
-            .try_into()
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "offset exceeds u64::MAX"))?;
+    ) -> PendingIo<'a, io::Result<ReadvResult<B>>> {
+        let offset: u64 = match offset.try_into() {
+            Ok(offset) => offset,
+            Err(_) => {
+                return PendingIo::new(FixedValuePendingIo::new(Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "offset exceeds u64::MAX",
+                ))));
+            }
+        };
         // Need to cast to off_t
         if offset > i64::MAX as u64 {
-            return Err(io::Error::new(
+            return PendingIo::new(FixedValuePendingIo::new(Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "offset exceeds i64::MAX",
-            ));
+            ))));
         }
-        let io_slices_len: u32 = bufs.len().try_into().map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "count of buffers exceeds u32::MAX",
-            )
-        })?;
+        let _io_slices_len: u32 = match bufs.len().try_into() {
+            Ok(len) => len,
+            Err(_) => {
+                return PendingIo::new(FixedValuePendingIo::new(Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "count of buffers exceeds u32::MAX",
+                ))));
+            }
+        };
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Readv::CODE)
         {
-            let uring = self.uring.as_ref().expect(
-                "should be able to resolve uring because is_uring_operation_supported() is true",
-            );
-            let target = unsafe { file.as_target(&uring.identity) };
-            let (tx, rx) = oneshot::channel();
-            let iovec_buffers = IovecArray(
-                bufs.iter_mut()
-                    .map(|buf| libc::iovec {
-                        iov_base: buf.as_mut_ptr() as *mut libc::c_void,
-                        iov_len: buf.capacity().into(),
-                    })
-                    .collect::<Vec<_>>(),
-            );
-            self.send(Command::Readv {
-                req: ReadvRequest {
-                    target,
-                    io_slices: iovec_buffers.as_ptr(),
-                    io_slices_len,
-                    offset,
-                },
-                res: tx,
-            });
-            let bytes_read = rx.await.expect("uring completion channel dropped")?;
-            Ok(ReadvResult {
-                bufs,
-                bytes_read: bytes_read as usize,
-            })
+            PendingIo::new(UringReadIntoVectoredAt::new(self, file, bufs, offset))
         } else {
-            let mut transmuted = bufs
-                .iter_mut()
-                .map(|buf| {
-                    IoSliceMut::new(unsafe {
-                        std::slice::from_raw_parts_mut(buf.as_mut_ptr(), buf.capacity())
+            PendingIo::new(TokioScopedPendingIo::new(
+                move || -> io::Result<ReadvResult<B>> {
+                    let bytes_read = nix::sys::uio::preadv(
+                        file.as_file_descriptor(),
+                        &mut unsafe {
+                            bufs.iter_mut()
+                                .map(|buf| {
+                                    IoSliceMut::new(
+                                        buf.as_mut_slice_with_uninit().assume_init_mut(),
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                        },
+                        offset as i64,
+                    )?;
+                    let mut cur_bytes_read = bytes_read as usize;
+                    for buf in bufs.iter_mut() {
+                        let bytes_read_into_target = min(buf.capacity(), cur_bytes_read);
+                        unsafe {
+                            buf.set_len(bytes_read_into_target);
+                        }
+                        cur_bytes_read -= bytes_read_into_target;
+                    }
+                    Ok(ReadvResult {
+                        bufs,
+                        bytes_read: bytes_read as usize,
                     })
-                })
-                .collect::<Vec<_>>();
-            let file_descriptor = file.as_file_descriptor();
-            let (_, mut futures) = unsafe {
-                async_scoped::TokioScope::scope_and_collect(move |scope| {
-                    scope.spawn_blocking(move || {
-                        nix::sys::uio::preadv(file_descriptor, &mut transmuted, offset as i64)
-                    });
-                    ()
-                })
-                .await
-            };
-            let future = futures.pop().expect("no future returned");
-            let bytes_read = future.expect("future failed to join")?;
-            Ok(ReadvResult {
-                bufs,
-                bytes_read: bytes_read as usize,
-            })
+                },
+            ))
         }
     }
 
     /// Read into multiple user-provided buffers at the internal seek cursor and advance the seek position. This is the primitive read operation that accepts any buffer type implementing [`IoBufMut`].
     ///
     /// The buffer is returned along with the number of bytes read. This allows buffer reuse and supports custom allocators (e.g., aligned buffers for O_DIRECT).
-    pub async fn read_into_vectored<B: IoBufMut>(
-        &self,
-        file: &mut (impl UringTarget + ?Sized),
+    pub fn read_into_vectored<'a, B: IoBufMut + 'a>(
+        &'a self,
+        file: &'a mut (impl UringTarget + Sync + ?Sized),
         mut bufs: Vec<B>,
-    ) -> io::Result<ReadvResult<B>> {
-        let io_slices_len: u32 = bufs.len().try_into().map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "count of buffers exceeds u32::MAX",
-            )
-        })?;
+    ) -> PendingIo<'a, io::Result<ReadvResult<B>>> {
+        let _io_slices_len: u32 = match bufs.len().try_into() {
+            Ok(len) => len,
+            Err(_) => {
+                return PendingIo::new(FixedValuePendingIo::new(Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "count of buffers exceeds u32::MAX",
+                ))));
+            }
+        };
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Readv::CODE)
         {
-            let uring = self.uring.as_ref().expect(
-                "should be able to resolve uring because is_uring_operation_supported() is true",
-            );
-            let target = unsafe { file.as_target(&uring.identity) };
-            let (tx, rx) = oneshot::channel();
-            let iovec_buffers = IovecArray(
-                bufs.iter_mut()
-                    .map(|buf| libc::iovec {
-                        iov_base: buf.as_mut_ptr() as *mut libc::c_void,
-                        iov_len: buf.capacity().into(),
-                    })
-                    .collect::<Vec<_>>(),
-            );
-            self.send(Command::Readv {
-                req: ReadvRequest {
-                    target,
-                    io_slices: iovec_buffers.as_ptr(),
-                    io_slices_len,
-                    offset: (-1i64) as u64,
-                },
-                res: tx,
-            });
-            let bytes_read = rx.await.expect("uring completion channel dropped")?;
-            Ok(ReadvResult {
+            PendingIo::new(UringReadIntoVectoredAt::new(
+                self,
+                file,
                 bufs,
-                bytes_read: bytes_read as usize,
-            })
+                (-1i64) as u64,
+            ))
         } else {
-            let file_descriptor = file.as_file_descriptor();
-            let mut transmuted = bufs
-                .iter_mut()
-                .map(|buf| {
-                    IoSliceMut::new(unsafe {
-                        std::slice::from_raw_parts_mut(buf.as_mut_ptr(), buf.capacity())
+            PendingIo::new(TokioScopedPendingIo::new(
+                || -> io::Result<ReadvResult<B>> {
+                    let bytes_read = nix::sys::uio::readv(
+                        file.as_file_descriptor(),
+                        &mut bufs
+                            .iter_mut()
+                            .map(|buf| {
+                                IoSliceMut::new(unsafe {
+                                    buf.as_mut_slice_with_uninit().assume_init_mut()
+                                })
+                            })
+                            .collect::<Vec<_>>(),
+                    )?;
+                    let mut cur_bytes_read = bytes_read as usize;
+                    for buf in bufs.iter_mut() {
+                        let bytes_read_into_target = min(buf.capacity(), cur_bytes_read);
+                        unsafe {
+                            buf.set_len(bytes_read_into_target);
+                        }
+                        cur_bytes_read -= bytes_read_into_target;
+                    }
+                    Ok(ReadvResult {
+                        bufs,
+                        bytes_read: bytes_read as usize,
                     })
-                })
-                .collect::<Vec<_>>();
-            let (_, mut futures) = unsafe {
-                async_scoped::TokioScope::scope_and_collect(move |scope| {
-                    scope.spawn_blocking(move || {
-                        nix::sys::uio::readv(file_descriptor, &mut transmuted)
-                    });
-                    ()
-                })
-                .await
-            };
-            let future = futures.pop().expect("no future returned");
-            let bytes_read = future.expect("future failed to join")?;
-            Ok(ReadvResult {
-                bufs,
-                bytes_read: bytes_read as usize,
-            })
+                },
+            ))
         }
     }
 
     /// Standard-library compatible method for reading from a file at the specified offset using a zero-copy buffer, ensuring that the entire buffer is filled.
     pub async fn read_exact_at<'buf>(
         &self,
-        file: &(impl UringTarget + ?Sized),
+        file: &(impl UringTarget + Sync + ?Sized),
         mut buf: &'buf mut [u8],
         offset: impl TryInto<u64>,
     ) -> io::Result<()> {
@@ -333,7 +311,12 @@ impl Client {
             .try_into()
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "offset exceeds u64::MAX"))?;
         while !buf.is_empty() {
-            match self.read_at(file, buf, offset).await {
+            let res = self
+                .read_at(file, buf, offset)
+                .completion()
+                .expect("no completion future returned")
+                .await;
+            match res {
                 Ok(0) => break,
                 Ok(n) => {
                     let tmp = buf;
@@ -357,117 +340,80 @@ impl Client {
     /// Read into a user-provided buffer using the file's internal seek cursor. This is the primitive read operation that accepts any buffertype implementing [`IoBufMut`].
     ///
     /// The buffer is returned along with the number of bytes read. This allows buffer reuse and supports custom allocators (e.g., aligned buffers for O_DIRECT).
-    pub async fn read_into<B: IoBufMut>(
-        &self,
-        file: &mut (impl UringTarget + ?Sized),
+    pub fn read_into<'a, B: IoBufMut + 'a>(
+        &'a self,
+        file: &'a mut (impl UringTarget + Sync + Send + ?Sized),
         mut buf: B,
-    ) -> io::Result<ReadResult<B>> {
-        let ptr = buf.as_mut_ptr();
-        let cap = buf.capacity();
+    ) -> PendingIo<'a, io::Result<ReadResult<B>>> {
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Read::CODE)
         {
-            let uring = self.uring.as_ref().expect(
-                "should be able to resolve uring because is_uring_operation_supported() is true",
-            );
-            let target = unsafe { file.as_target(&uring.identity) };
-            let (tx, rx) = oneshot::channel();
-            self.send(Command::Read {
-                req: ReadRequest {
-                    target,
-                    buf_ptr: ptr,
-                    // u32::MAX
-                    buf_len: cap.try_into().unwrap_or(u32::MAX),
-                    // -1 is the offset for seek-based read calls
-                    offset: (-1i64) as u64,
-                },
-                res: tx,
-            });
-            let bytes_read = rx.await.expect("uring completion channel dropped")?;
-            Ok(ReadResult {
-                buf,
-                bytes_read: bytes_read as usize,
-            })
+            PendingIo::new(UringReadIntoAt::new(self, file, buf, (-1i64) as u64))
         } else {
-            let slice = unsafe { std::slice::from_raw_parts_mut(ptr, cap) };
-            let file_descriptor = file.as_file_descriptor();
-            let (_, mut futures) = unsafe {
-                async_scoped::TokioScope::scope_and_collect(move |scope| {
-                    scope.spawn_blocking(move || nix::unistd::read(file_descriptor, slice));
-                    ()
-                })
-                .await
-            };
-            let future = futures.pop().expect("no future returned");
-            let bytes_read = future.expect("future failed to join")?;
-            Ok(ReadResult { buf, bytes_read })
+            PendingIo::new(TokioScopedPendingIo::new(
+                move || -> io::Result<ReadResult<B>> {
+                    let bytes_read = nix::unistd::read(file.as_file_descriptor(), unsafe {
+                        buf.as_mut_slice_with_uninit().assume_init_mut()
+                    })?;
+                    unsafe {
+                        buf.set_len(bytes_read);
+                    }
+                    Ok(ReadResult { buf, bytes_read })
+                },
+            ))
         }
     }
 
     /// Standard library compatible method for reading from a file using a zero-copy buffer and the file's internal seek cursor.
-    pub async fn read<'buf>(
-        &self,
-        file: &mut (impl UringTarget + ?Sized),
-        buf: &'buf mut [u8],
-    ) -> io::Result<usize> {
-        <u32>::try_from(buf.len())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "len exceeds u32::MAX"))?;
-        self.read_into(file, buf)
-            .await
-            .map(|result| result.bytes_read)
+    pub fn read<'a>(
+        &'a self,
+        file: &'a mut (impl UringTarget + Sync + Send + ?Sized),
+        buf: &'a mut [u8],
+    ) -> PendingIo<'a, io::Result<usize>> {
+        match <u32>::try_from(buf.len()) {
+            Ok(_) => self
+                .read_into(file, buf)
+                .map(|result| result.map(|result| result.bytes_read)),
+            Err(_) => PendingIo::new(FixedValuePendingIo::new(Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "len exceeds u32::MAX",
+            )))),
+        }
     }
 
     /// Standard library compatible method for reading from a file into a vector of buffers.
-    pub async fn read_vectored<'buf>(
-        &self,
-        file: &mut (impl UringTarget + ?Sized),
-        bufs: &'buf mut [IoSliceMut<'_>],
-    ) -> io::Result<usize> {
-        let total_len = bufs.iter().map(|b| b.len()).sum::<usize>();
-        <u32>::try_from(total_len).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "total length exceeds u32::MAX")
-        })?;
-        let into_form = bufs
+    pub fn read_vectored<'a>(
+        &'a self,
+        file: &'a mut (impl UringTarget + Sync + Send + ?Sized),
+        bufs: &'a mut [IoSliceMut<'a>],
+    ) -> PendingIo<'a, io::Result<usize>> {
+        let transformed: Vec<_> = bufs
             .iter_mut()
-            .map(|buf| {
-                IoSliceMut::<'static>::new(unsafe {
-                    std::slice::from_raw_parts_mut(buf.as_mut_ptr(), buf.capacity())
-                })
-            })
-            .collect::<Vec<_>>();
-        self.read_into_vectored(file, into_form)
-            .await
-            .map(|result| result.bytes_read)
+            .map(|buf| IoSliceMut::new(unsafe { buf.as_mut_slice_with_uninit().assume_init_mut() }))
+            .collect();
+        self.read_into_vectored(file, transformed)
+            .map(|result| result.map(|result| result.bytes_read))
     }
 
     /// Standard library compatible method for reading from a file into a vector of buffers at a specified offset.
-    pub async fn read_vectored_at<'buf>(
-        &self,
-        file: &(impl UringTarget + ?Sized),
-        bufs: &'buf mut [IoSliceMut<'_>],
+    pub fn read_vectored_at<'a>(
+        &'a self,
+        file: &'a (impl UringTarget + Sync + ?Sized),
+        bufs: &'a mut [IoSliceMut<'a>],
         offset: impl TryInto<u64>,
-    ) -> io::Result<usize> {
-        let total_len = bufs.iter().map(|b| b.len()).sum::<usize>();
-        <u32>::try_from(total_len).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "total length exceeds u32::MAX")
-        })?;
-        let into_form = bufs
+    ) -> PendingIo<'a, io::Result<usize>> {
+        let transformed: Vec<_> = bufs
             .iter_mut()
-            .map(|buf| {
-                IoSliceMut::<'static>::new(unsafe {
-                    std::slice::from_raw_parts_mut(buf.as_mut_ptr(), buf.capacity())
-                })
-            })
-            .collect::<Vec<_>>();
-        self.read_into_vectored_at(file, into_form, offset)
-            .await
-            .map(|result| result.bytes_read)
+            .map(|buf| IoSliceMut::new(unsafe { buf.as_mut_slice_with_uninit().assume_init_mut() }))
+            .collect();
+        self.read_into_vectored_at(file, transformed, offset)
+            .map(|result| result.map(|result| result.bytes_read))
     }
 
     /// Standard library compatible method for reading from a file into a vector.
     pub async fn read_to_end<'buf>(
         &self,
-        file: &mut (impl UringTarget + ?Sized),
+        file: &mut (impl UringTarget + Sync + Send + ?Sized),
         buf: &'buf mut Vec<u8>,
     ) -> io::Result<usize> {
         const DEFAULT_BUF_SIZE: usize = 8 * 1024;
@@ -492,13 +438,18 @@ impl Client {
 
         async fn small_probe_read(
             instance: &Client,
-            file: &mut (impl UringTarget + ?Sized),
+            file: &mut (impl UringTarget + Sync + Send + ?Sized),
             buf: &mut Vec<u8>,
         ) -> io::Result<usize> {
             let mut probe = [0u8; PROBE_SIZE];
 
             loop {
-                match instance.read(file, &mut probe).await {
+                let res = instance
+                    .read(file, &mut probe)
+                    .completion()
+                    .expect("no completion future returned")
+                    .await;
+                match res {
                     Ok(n) => {
                         // there is no way to recover from allocation failure here
                         // because the data has already been read.
@@ -555,10 +506,12 @@ impl Client {
             let mut cursor = read_buf.unfilled();
 
             let result = loop {
-                match self
+                let res = self
                     .read(file, cursor.reborrow().ensure_init().init_mut())
-                    .await
-                {
+                    .completion()
+                    .expect("no completion future returned")
+                    .await;
+                match res {
                     Ok(n) => {
                         cursor.advance(n);
                         break Ok(n);
@@ -620,7 +573,7 @@ impl Client {
     /// Standard library compatible method for reading from a file into a string.
     pub async fn read_to_string<'buf>(
         &self,
-        file: &mut (impl UringTarget + ?Sized),
+        file: &mut (impl UringTarget + Sync + Send + ?Sized),
         str: &'buf mut String,
     ) -> io::Result<usize> {
         unsafe { helpers::append_to_string(str, async |b| self.read_to_end(file, b).await) }.await
@@ -629,11 +582,16 @@ impl Client {
     /// Standard library compatible method for reading exactly the number of bytes required to fill the buffer.
     pub async fn read_exact<'buf>(
         &self,
-        file: &mut (impl UringTarget + ?Sized),
+        file: &mut (impl UringTarget + Sync + Send + ?Sized),
         mut buf: &'buf mut [u8],
     ) -> io::Result<()> {
         while !buf.is_empty() {
-            match self.read(file, buf).await {
+            let res = self
+                .read(file, buf)
+                .completion()
+                .expect("no completion future returned")
+                .await;
+            match res {
                 Ok(0) => break,
                 Ok(n) => {
                     buf = &mut buf[n..];
@@ -655,186 +613,148 @@ impl Client {
     /// Write a buffer to a file at the specified offset. Accepts any buffer type implementing [`IoBuf`].
     ///
     /// The buffer is returned along with the number of bytes written. This allows buffer reuse and supports custom allocators.
-    pub async fn write_from_at<B: IoBuf>(
-        &self,
-        file: &(impl UringTarget + ?Sized),
+    pub fn write_from_at<'a, B: IoBuf + 'a>(
+        &'a self,
+        file: &'a (impl UringTarget + Sync + ?Sized),
         buf: B,
         offset: impl TryInto<u64>,
-    ) -> io::Result<WriteResult<B>> {
-        let ptr = buf.as_ptr();
-        let len = buf.len();
-        let offset: u64 = offset
-            .try_into()
-            .map_err(|_| io::Error::other("offset exceeds u64::MAX"))?;
+    ) -> PendingIo<'a, io::Result<WriteResult<B>>> {
+        let offset: u64 = match offset.try_into() {
+            Ok(offset) => offset,
+            Err(_) => {
+                return PendingIo::new(FixedValuePendingIo::new(Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "offset exceeds u64::MAX",
+                ))));
+            }
+        };
         // Need to cast to off_t. This also prevents setting offset at -1,
         // which is reserved for seek-based write calls.
         if offset > i64::MAX as u64 {
-            return Err(io::Error::new(
+            return PendingIo::new(FixedValuePendingIo::new(Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "offset exceeds i64::MAX",
-            ));
+            ))));
         }
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Write::CODE)
         {
-            let uring = self.uring.as_ref().expect(
-                "should be able to resolve uring because is_uring_operation_supported() is true",
-            );
-            let target = unsafe { file.as_target(&uring.identity) };
-            let (tx, rx) = oneshot::channel();
-            self.send(Command::Write {
-                req: WriteRequest {
-                    target,
-                    buf_ptr: ptr,
-                    buf_len: len.try_into().unwrap(),
-                    offset,
-                },
-                res: tx,
-            });
-            let bytes_written = rx.await.expect("uring completion channel dropped")?;
-            Ok(WriteResult {
-                buf,
-                bytes_written: bytes_written as usize,
-            })
+            PendingIo::new(UringWriteFromAt::new(self, file, buf, offset))
         } else {
-            let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
-            let file_descriptor = file.as_file_descriptor();
-            let (_, mut futures) = unsafe {
-                async_scoped::TokioScope::scope_and_collect(move |scope| {
-                    scope.spawn_blocking(move || {
-                        nix::sys::uio::pwrite(file_descriptor, slice, offset as i64)
-                    });
-                    ()
-                })
-                .await
-            };
-            let future = futures.pop().expect("no future returned");
-            let bytes_written = future.expect("future failed to join")?;
-            Ok(WriteResult { buf, bytes_written })
+            PendingIo::new(TokioScopedPendingIo::new(
+                move || -> io::Result<WriteResult<B>> {
+                    let res = nix::sys::uio::pwrite(
+                        file.as_file_descriptor(),
+                        &buf.as_slice(),
+                        offset as i64,
+                    )?;
+                    Ok(WriteResult {
+                        bytes_written: res,
+                        buf,
+                    })
+                },
+            ))
         }
     }
 
     /// Write multiple buffers to a file at the specified offset. Accepts any buffer type implementing [`IoBuf`].
     ///
     /// The buffer is returned along with the number of bytes written. This allows buffer reuse and supports custom allocators.
-    pub async fn write_from_vectored_at<B: IoBuf>(
-        &self,
-        file: &(impl UringTarget + ?Sized),
+    pub fn write_from_vectored_at<'a, B: IoBuf + 'a>(
+        &'a self,
+        file: &'a (impl UringTarget + Sync + ?Sized),
         mut bufs: Vec<B>,
         offset: impl TryInto<u64>,
-    ) -> io::Result<WritevResult<B>> {
-        let offset: u64 = offset
-            .try_into()
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "offset exceeds u64::MAX"))?;
+    ) -> PendingIo<'a, io::Result<WritevResult<B>>> {
+        let offset: u64 = match offset.try_into() {
+            Ok(offset) => offset,
+            Err(_) => {
+                return PendingIo::new(FixedValuePendingIo::new(Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "offset exceeds u64::MAX",
+                ))));
+            }
+        };
         // Need to cast to off_t
         if offset > i64::MAX as u64 {
-            return Err(io::Error::new(
+            return PendingIo::new(FixedValuePendingIo::new(Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "offset exceeds i64::MAX",
-            ));
+            ))));
         }
-        let io_slices_len: u32 = bufs
-            .len()
-            .try_into()
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "len exceeds u32::MAX"))?;
+        let _io_slices_len: u32 = match bufs.len().try_into() {
+            Ok(len) => len,
+            Err(_) => {
+                return PendingIo::new(FixedValuePendingIo::new(Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "count of I/O slices exceeds u32::MAX",
+                ))));
+            }
+        };
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Writev::CODE)
         {
-            let uring = self.uring.as_ref().expect(
-                "should be able to resolve uring because is_uring_operation_supported() is true",
-            );
-            let target = unsafe { file.as_target(&uring.identity) };
-            let (tx, rx) = oneshot::channel();
-            let iovec_buffers = IovecArray(
-                bufs.iter_mut()
-                    .map(|buf| libc::iovec {
-                        iov_base: buf.as_ptr() as *mut libc::c_void,
-                        iov_len: buf.len().into(),
-                    })
-                    .collect::<Vec<_>>(),
-            );
-            self.send(Command::Writev {
-                req: WritevRequest {
-                    target,
-                    io_slices: iovec_buffers.as_ptr(),
-                    io_slices_len,
-                    offset,
-                },
-                res: tx,
-            });
-            let bytes_written = rx.await.expect("uring completion channel dropped")?;
-            Ok(WritevResult {
-                bufs,
-                bytes_written: bytes_written as usize,
-            })
+            PendingIo::new(UringWriteFromVectoredAt::new(self, file, bufs, offset))
         } else {
-            let slice = bufs
-                .iter_mut()
-                .map(|buf| unsafe {
-                    IoSlice::new(std::slice::from_raw_parts(buf.as_ptr(), buf.len()))
-                })
-                .collect::<Vec<_>>();
-            let file_descriptor = file.as_file_descriptor();
-            let (_, mut futures) = unsafe {
-                async_scoped::TokioScope::scope_and_collect(move |scope| {
-                    scope.spawn_blocking(move || {
-                        nix::sys::uio::pwritev(file_descriptor, &slice, offset as i64)
-                    });
-                    ()
-                })
-                .await
-            };
-            let future = futures.pop().expect("no future returned");
-            let bytes_written = future.expect("future failed to join")?;
-            Ok(WritevResult {
-                bufs,
-                bytes_written,
-            })
+            PendingIo::new(TokioScopedPendingIo::new(
+                move || -> io::Result<WritevResult<B>> {
+                    let slice = bufs
+                        .iter_mut()
+                        .map(|buf| IoSlice::new(buf.as_slice()))
+                        .collect::<Vec<_>>();
+                    let bytes_written =
+                        nix::sys::uio::pwritev(file.as_file_descriptor(), &slice, offset as i64)?;
+                    Ok(WritevResult {
+                        bufs,
+                        bytes_written,
+                    })
+                },
+            ))
         }
     }
 
     /// Standard library compatible method for writing to a file using a zero-copy buffer and an offset.
-    pub async fn write_at<'buf>(
-        &self,
-        file: &(impl UringTarget + ?Sized),
-        buf: &'buf [u8],
+    pub fn write_at<'a>(
+        &'a self,
+        file: &'a (impl UringTarget + Sync + ?Sized),
+        buf: &'a [u8],
         offset: impl TryInto<u64>,
-    ) -> io::Result<usize> {
-        <u32>::try_from(buf.len())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "len exceeds u32::MAX"))?;
+    ) -> PendingIo<'a, io::Result<usize>> {
+        match <u32>::try_from(buf.len()) {
+            Ok(_) => {}
+            Err(_) => {
+                return PendingIo::new(FixedValuePendingIo::new(Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "len exceeds u32::MAX",
+                ))));
+            }
+        }
         self.write_from_at(file, buf, offset)
-            .await
-            .map(|result| result.bytes_written)
+            .map(|result| match result {
+                Ok(result) => Ok(result.bytes_written),
+                Err(e) => return Err(e),
+            })
     }
 
     /// Standard library compatible method for writing multiple buffers to a file at the specified offset.
-    pub async fn write_vectored_at<'buf>(
-        &self,
-        file: &(impl UringTarget + ?Sized),
-        bufs: &'buf [IoSlice<'_>],
+    pub fn write_vectored_at<'a>(
+        &'a self,
+        file: &'a (impl UringTarget + Sync + ?Sized),
+        bufs: &'a [IoSlice<'a>],
         offset: impl TryInto<u64>,
-    ) -> io::Result<usize> {
-        let total_len = bufs.iter().map(|b| b.len()).sum::<usize>();
-        <u32>::try_from(total_len).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "total length exceeds u32::MAX")
-        })?;
-        let into_form = bufs
+    ) -> PendingIo<'a, io::Result<usize>> {
+        let transformed = bufs
             .iter()
-            .map(|buf| {
-                IoSlice::<'static>::new(unsafe {
-                    std::slice::from_raw_parts(buf.as_ptr(), buf.len())
-                })
-            })
+            .map(|buf| IoSlice::new(buf.as_slice()))
             .collect::<Vec<_>>();
-        self.write_from_vectored_at(file, into_form, offset)
-            .await
-            .map(|result| result.bytes_written)
+        self.write_from_vectored_at(file, transformed, offset)
+            .map(|result| result.map(|result| result.bytes_written))
     }
 
     /// Standard library compatible method for writing an entire buffer to a file using a zero-copy buffer and an offset.
     pub async fn write_all_at<'buf>(
         &self,
-        file: &(impl UringTarget + ?Sized),
+        file: &(impl UringTarget + Sync + ?Sized),
         mut buf: &'buf [u8],
         offset: impl TryInto<u64>,
     ) -> io::Result<()> {
@@ -842,7 +762,12 @@ impl Client {
             .try_into()
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "offset exceeds u64::MAX"))?;
         while !buf.is_empty() {
-            match self.write_at(file, buf, offset).await {
+            let res = self
+                .write_at(file, buf, offset)
+                .completion()
+                .expect("no completion future returned")
+                .await;
+            match res {
                 Ok(0) => {
                     return Err(io::Error::new(
                         io::ErrorKind::WriteZero,
@@ -863,161 +788,106 @@ impl Client {
     /// Write a buffer to a file using the file's internal seek cursor. Accepts any buffer type implementing [`IoBuf`].
     ///
     /// The buffer is returned along with the number of bytes written. This allows buffer reuse and supports custom allocators.
-    pub async fn write_from<B: IoBuf>(
-        &self,
-        file: &mut (impl UringTarget + ?Sized),
+    pub fn write_from<'a, B: IoBuf + 'a>(
+        &'a self,
+        file: &'a mut (impl UringTarget + Sync + Send + ?Sized),
         buf: B,
-    ) -> io::Result<WriteResult<B>> {
-        let ptr = buf.as_ptr();
-        let len = buf.len();
+    ) -> PendingIo<'a, io::Result<WriteResult<B>>> {
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Write::CODE)
         {
-            let uring = self.uring.as_ref().expect(
-                "should be able to resolve uring because is_uring_operation_supported() is true",
-            );
-            let target = unsafe { file.as_target(&uring.identity) };
-            let (tx, rx) = oneshot::channel();
-            self.send(Command::Write {
-                req: WriteRequest {
-                    target,
-                    buf_ptr: ptr,
-                    buf_len: len.try_into().unwrap(),
-                    offset: (-1i64) as u64,
-                },
-                res: tx,
-            });
-            let bytes_written = rx.await.expect("uring completion channel dropped")?;
-            Ok(WriteResult {
-                buf,
-                bytes_written: bytes_written as usize,
-            })
+            PendingIo::new(UringWriteFromAt::new(self, file, buf, (-1i64) as u64))
         } else {
-            let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
-            let file_descriptor = file.as_file_descriptor();
-            let (_, mut futures) = unsafe {
-                async_scoped::TokioScope::scope_and_collect(move |scope| {
-                    scope.spawn_blocking(move || nix::unistd::write(file_descriptor, slice));
-                    ()
-                })
-                .await
-            };
-            let future = futures.pop().expect("no future returned");
-            let bytes_written = future.expect("future failed to join")?;
-            Ok(WriteResult { buf, bytes_written })
+            PendingIo::new(TokioScopedPendingIo::new(
+                move || -> io::Result<WriteResult<B>> {
+                    let bytes_written =
+                        nix::unistd::write(file.as_file_descriptor(), &buf.as_slice())?;
+                    Ok(WriteResult { buf, bytes_written })
+                },
+            ))
         }
     }
 
     /// Write multiple buffers to a file using the file's internal seek cursor. Accepts any buffer type implementing [`IoBuf`].
     ///
     /// The buffers are returned along with the number of bytes written. This allows buffer reuse and supports custom allocators.
-    pub async fn write_from_vectored<B: IoBuf>(
-        &self,
-        file: &mut (impl UringTarget + ?Sized),
+    pub fn write_from_vectored<'a, B: IoBuf + 'a>(
+        &'a self,
+        file: &'a mut (impl UringTarget + Sync + Send + ?Sized),
         bufs: Vec<B>,
-    ) -> io::Result<WritevResult<B>> {
-        let io_slices_len: u32 = bufs.len().try_into().map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "count of buffers exceeds u32::MAX",
-            )
-        })?;
+    ) -> PendingIo<'a, io::Result<WritevResult<B>>> {
+        let _io_slices_len: u32 = match bufs.len().try_into() {
+            Ok(len) => len,
+            Err(_) => {
+                return PendingIo::new(FixedValuePendingIo::new(Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "count of buffers exceeds u32::MAX",
+                ))));
+            }
+        };
         if self.is_uring_available_and_active()
-            && self.is_uring_operation_supported(opcode::Write::CODE)
+            && self.is_uring_operation_supported(opcode::Writev::CODE)
         {
-            let uring = self.uring.as_ref().expect(
-                "should be able to resolve uring because is_uring_operation_supported() is true",
-            );
-            let target = unsafe { file.as_target(&uring.identity) };
-            let (tx, rx) = oneshot::channel();
-            let transmuted = IovecArray(
-                bufs.iter()
-                    .map(|buf| libc::iovec {
-                        iov_base: buf.as_ptr() as *mut libc::c_void,
-                        iov_len: buf.len() as usize,
-                    })
-                    .collect::<Vec<_>>(),
-            );
-            self.send(Command::Writev {
-                req: WritevRequest {
-                    target,
-                    io_slices: transmuted.as_ptr(),
-                    io_slices_len,
-                    offset: (-1i64) as u64,
-                },
-                res: tx,
-            });
-            let bytes_written = rx.await.expect("uring completion channel dropped")?;
-            Ok(WritevResult {
+            PendingIo::new(UringWriteFromVectoredAt::new(
+                self,
+                file,
                 bufs,
-                bytes_written: bytes_written as usize,
-            })
+                (-1i64) as u64,
+            ))
         } else {
-            let slices = bufs
-                .iter()
-                .map(|buf| unsafe {
-                    IoSlice::<'static>::new(std::slice::from_raw_parts(buf.as_ptr(), buf.len()))
-                })
-                .collect::<Vec<_>>();
-            let file_descriptor = file.as_file_descriptor();
-            let (_, mut futures) = unsafe {
-                async_scoped::TokioScope::scope_and_collect(move |scope| {
-                    scope.spawn_blocking(move || nix::sys::uio::writev(file_descriptor, &slices));
-                    ()
-                })
-                .await
-            };
-            let future = futures.pop().expect("no future returned");
-            let bytes_written = future.expect("future failed to join")?;
-            Ok(WritevResult {
-                bufs,
-                bytes_written,
-            })
+            PendingIo::new(TokioScopedPendingIo::new(
+                move || -> io::Result<WritevResult<B>> {
+                    let slices = bufs
+                        .iter()
+                        .map(|buf| IoSlice::new(buf.as_slice()))
+                        .collect::<Vec<_>>();
+                    let bytes_written = nix::sys::uio::writev(file.as_file_descriptor(), &slices)?;
+                    Ok(WritevResult {
+                        bufs,
+                        bytes_written,
+                    })
+                },
+            ))
         }
     }
 
-    /// Standard-library compatible method for writing to a file using a zero-copy buffer and the file's internal seek cursor.
-    pub async fn write<'buf>(
-        &self,
-        file: &mut (impl UringTarget + ?Sized),
-        buf: &'buf [u8],
-    ) -> io::Result<usize> {
+    /// Standard library compatible method for writing a single buffer to a file.
+    pub fn write<'a>(
+        &'a self,
+        file: &'a mut (impl UringTarget + Sync + Send + ?Sized),
+        buf: &'a [u8],
+    ) -> PendingIo<'a, io::Result<usize>> {
         self.write_from(file, buf)
-            .await
-            .map(|result| result.bytes_written)
+            .map(|result| result.map(|result| result.bytes_written))
     }
 
     /// Standard library compatible method for writing multiple buffers to a file.
-    pub async fn write_vectored<'buf>(
-        &self,
-        file: &mut (impl UringTarget + ?Sized),
-        bufs: &'buf [IoSlice<'_>],
-    ) -> io::Result<usize> {
-        let total_len = bufs.iter().map(|b| b.len()).sum::<usize>();
-        <u32>::try_from(total_len).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "total length exceeds u32::MAX")
-        })?;
-        let into_form = bufs
+    pub fn write_vectored<'a>(
+        &'a self,
+        file: &'a mut (impl UringTarget + Sync + Send + ?Sized),
+        bufs: &'a [IoSlice<'a>],
+    ) -> PendingIo<'a, io::Result<usize>> {
+        let transformed = bufs
             .iter()
-            .map(|buf| {
-                IoSlice::<'static>::new(unsafe {
-                    std::slice::from_raw_parts(buf.as_ptr(), buf.len())
-                })
-            })
+            .map(|buf| IoSlice::new(buf.as_slice()))
             .collect::<Vec<_>>();
-        self.write_from_vectored(file, into_form)
-            .await
-            .map(|result| result.bytes_written)
+        self.write_from_vectored(file, transformed)
+            .map(|result| result.map(|result| result.bytes_written))
     }
 
     /// Standard-library compatible method for writing everything in a slice to a file.
-    pub async fn write_all<'buf>(
-        &self,
-        file: &mut (impl UringTarget + ?Sized),
-        mut buf: &'buf [u8],
+    pub async fn write_all<'a>(
+        &'a self,
+        file: &'a mut (impl UringTarget + Sync + Send + ?Sized),
+        mut buf: &'a [u8],
     ) -> io::Result<()> {
         while !buf.is_empty() {
-            match self.write(file, buf).await {
+            let res = self
+                .write(file, buf)
+                .completion()
+                .expect("no completion future returned")
+                .await;
+            match res {
                 Ok(0) => {
                     return Err(io::Error::new(
                         io::ErrorKind::WriteZero,
@@ -1025,7 +895,7 @@ impl Client {
                     ));
                 }
                 Ok(n) => buf = &buf[n..],
-                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) => return Err(e),
             }
         }
@@ -1035,420 +905,327 @@ impl Client {
     /// Standard library compatible method for writing a formatted string to a file.
     pub async fn write_fmt(
         &self,
-        file: &mut (impl UringTarget + ?Sized),
+        file: &mut (impl UringTarget + Sync + Send + ?Sized),
         args: fmt::Arguments<'_>,
     ) -> io::Result<()> {
         self.write_all(file, args.to_string().as_bytes()).await
     }
 
     /// Standard library compatible method for flushing the file.
-    pub async fn flush(&self, _file: &mut (impl UringTarget + ?Sized)) -> io::Result<()> {
-        Ok(())
+    pub fn flush<'a>(
+        &'a self,
+        _file: &'a mut (impl UringTarget + Send + ?Sized),
+    ) -> PendingIo<'a, io::Result<()>> {
+        PendingIo::new(FixedValuePendingIo::new(Ok(())))
     }
 
     /// A more low-level flexible method for seeking to a specific offset in the file, which uses the [`nix`] crate.
     /// This is useful if SEEK_HOLE or SEEK_END is needed.
-    pub async fn seek_ll(
-        &self,
-        file: &mut (impl UringTarget + ?Sized),
+    pub fn seek_ll<'a>(
+        &'a self,
+        file: &'a mut (impl UringTarget + Send + ?Sized),
         whence: nix::unistd::Whence,
         offset: impl TryInto<i64>,
-    ) -> io::Result<u64> {
-        let offset: i64 = offset
-            .try_into()
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "offset exceeds i64::MAX"))?;
-        let file_descriptor = file.as_file_descriptor();
-        let (_, mut futures) = unsafe {
-            async_scoped::TokioScope::scope_and_collect(move |scope| {
-                scope.spawn_blocking(move || nix::unistd::lseek(file_descriptor, offset, whence));
-                ()
-            })
-            .await
+    ) -> PendingIo<'a, io::Result<u64>> {
+        let offset: i64 = match offset.try_into() {
+            Ok(offset) => offset,
+            Err(_) => {
+                return PendingIo::new(FixedValuePendingIo::new(Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "offset exceeds i64::MAX",
+                ))));
+            }
         };
-        let future = futures.pop().expect("no future returned");
-        let new_offset = future.expect("future failed to join")?;
-        Ok(new_offset as u64)
+        PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<u64> {
+            Ok(nix::unistd::lseek(file.as_file_descriptor(), offset, whence)? as u64)
+        }))
     }
 
     /// Standard library compatible method for seeking to a specific offset in the file.
-    pub async fn seek(
-        &self,
-        file: &mut (impl UringTarget + ?Sized),
+    pub fn seek<'a>(
+        &'a self,
+        file: &'a mut (impl UringTarget + Send + ?Sized),
         seek: SeekFrom,
-    ) -> io::Result<u64> {
+    ) -> PendingIo<'a, io::Result<u64>> {
         let (whence, offset) = match seek {
             SeekFrom::Start(offset) => (
                 nix::unistd::Whence::SeekSet,
-                <i64>::try_from(offset).map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "offset exceeds i64::MAX")
-                })?,
+                match offset.try_into() {
+                    Ok(offset) => offset,
+                    Err(_) => {
+                        return PendingIo::new(FixedValuePendingIo::new(Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "offset exceeds i64::MAX",
+                        ))));
+                    }
+                },
             ),
-            SeekFrom::End(offset) => (nix::unistd::Whence::SeekEnd, offset as i64),
-            SeekFrom::Current(offset) => (nix::unistd::Whence::SeekCur, offset as i64),
+            SeekFrom::End(offset) => (nix::unistd::Whence::SeekEnd, offset),
+            SeekFrom::Current(offset) => (nix::unistd::Whence::SeekCur, offset),
         };
-        // io_uring does not have a method to seek the file, fallback to spawn_blocking
-        let file_descriptor = file.as_file_descriptor();
-        let (_, mut futures) = unsafe {
-            async_scoped::TokioScope::scope_and_collect(move |scope| {
-                scope.spawn_blocking(move || nix::unistd::lseek(file_descriptor, offset, whence));
-                ()
-            })
-            .await
-        };
-        let future = futures.pop().expect("no future returned");
-        let new_offset = future.expect("future failed to join")?;
-        Ok(new_offset as u64)
+        self.seek_ll(file, whence, offset)
     }
 
     /// Synchronize file data and metadata to disk (fsync). This ensures that all data and metadata modifications are flushed to the underlying storage device. Even when using direct I/O, this is necessary to ensure the device itself has flushed any internal caches.
     ///
     /// **Note on ordering**: io_uring does not guarantee ordering between operations. If you need to ensure writes complete before fsync, you should await the write first, then call fsync.
-    pub async fn sync_all(&self, file: &(impl UringTarget + ?Sized)) -> io::Result<()> {
+    pub fn sync_all<'a>(
+        &'a self,
+        file: &'a (impl UringTarget + Sync + ?Sized),
+    ) -> PendingIo<'a, io::Result<()>> {
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Fsync::CODE)
         {
-            let uring = self.uring.as_ref().expect(
-                "should be able to resolve uring because is_uring_operation_supported() is true",
-            );
-            let target = unsafe { file.as_target(&uring.identity) };
-            let (tx, rx) = oneshot::channel();
-            self.send(Command::Sync {
-                req: SyncRequest {
-                    target,
-                    datasync: false,
-                },
-                res: tx,
-            });
-            rx.await.expect("uring completion channel dropped")
+            PendingIo::new(UringSync::new(self, file, false))
         } else {
-            let file_descriptor = file.as_file_descriptor();
-            let (_, mut futures) = unsafe {
-                async_scoped::TokioScope::scope_and_collect(move |scope| {
-                    scope.spawn_blocking(move || nix::unistd::fsync(file_descriptor));
-                    ()
-                })
-                .await
-            };
-            let future = futures.pop().expect("no future returned");
-            future.expect("future failed to join")?;
-            Ok(())
+            PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
+                nix::unistd::fsync(file.as_file_descriptor())?;
+                Ok(())
+            }))
         }
     }
 
     /// Synchronize file data to disk (fdatasync). This ensures that only data modifications are flushed to the underlying storage device. This is useful for ensuring that data is written but not metadata.
-    pub async fn sync_data(&self, file: &(impl UringTarget + ?Sized)) -> io::Result<()> {
+    pub fn sync_data<'a>(
+        &'a self,
+        file: &'a (impl UringTarget + Sync + ?Sized),
+    ) -> PendingIo<'a, io::Result<()>> {
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Fsync::CODE)
         {
-            let uring = self.uring.as_ref().expect(
-                "should be able to resolve uring because is_uring_operation_supported() is true",
-            );
-            let target = unsafe { file.as_target(&uring.identity) };
-            let (tx, rx) = oneshot::channel();
-            self.send(Command::Sync {
-                req: SyncRequest {
-                    target,
-                    datasync: true,
-                },
-                res: tx,
-            });
-            rx.await.expect("uring completion channel dropped")
+            PendingIo::new(UringSync::new(self, file, false))
         } else {
-            let file_descriptor = file.as_file_descriptor();
-            let (_, mut futures) = unsafe {
-                async_scoped::TokioScope::scope_and_collect(move |scope| {
-                    scope.spawn_blocking(move || nix::unistd::fdatasync(file_descriptor));
-                    ()
-                })
-                .await
-            };
-            let future = futures.pop().expect("no future returned");
-            future.expect("future failed to join")?;
-            Ok(())
+            PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
+                nix::unistd::fsync(file.as_file_descriptor())?;
+                Ok(())
+            }))
         }
     }
 
     /// Standard library compatible method for getting metadata of an open file handle (statx). This is the io_uring equivalent of the low-level [`libc::statx()`] or [`std::fs::File::metadata`] functions.
-    pub async fn metadata(&self, file: &(impl UringTarget + ?Sized)) -> io::Result<Metadata> {
+    pub fn metadata<'a>(
+        &'a self,
+        file: &'a (impl UringTarget + Sync + ?Sized),
+    ) -> PendingIo<'a, io::Result<Metadata>> {
         let mut statx_buf = Box::new(MaybeUninit::<libc::statx>::uninit());
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Statx::CODE)
         {
-            let uring = self.uring.as_ref().expect(
-                "should be able to resolve uring because is_uring_operation_supported() is true",
-            );
-            let target = unsafe { file.as_target(&uring.identity) };
-            let (tx, rx) = oneshot::channel();
-            self.send(Command::Statx {
-                req: StatxRequest {
-                    target,
-                    statx_buf: statx_buf,
-                },
-                res: tx,
-            });
-            rx.await.expect("uring completion channel dropped")
+            PendingIo::new(UringStatx::new(self, file))
         } else {
-            let fd = file.as_file_descriptor();
-            let (_, mut futures) = unsafe {
-                async_scoped::TokioScope::scope_and_collect(move |scope| {
-                    scope.spawn_blocking(move || -> Result<Metadata, io::Error> {
-                        helpers::syscall_cvt(libc::statx(
-                            fd.as_raw_fd(),
+            PendingIo::new(TokioScopedPendingIo::new(
+                move || -> io::Result<Metadata> {
+                    helpers::syscall_cvt(unsafe {
+                        libc::statx(
+                            file.as_file_descriptor().as_raw_fd(),
                             c"".as_ptr(),
                             libc::AT_EMPTY_PATH,
                             libc::STATX_BASIC_STATS,
                             statx_buf.as_mut_ptr(),
-                        ))?;
-                        let statx = (*statx_buf).assume_init();
-                        Ok(Metadata(statx))
-                    });
-                    ()
-                })
-                .await
-            };
-            let future = futures.pop().expect("no future returned");
-            let metadata = future.expect("future failed to join")?;
-            Ok(metadata)
+                        )
+                    })?;
+                    Ok(Metadata(unsafe { (*statx_buf).assume_init() }))
+                },
+            ))
         }
     }
 
     /// Retrieves metadata from a file with the path relative to the specified directory file descriptor.
-    pub async fn statx_at(
-        &self,
-        fd: &(impl UringTarget + ?Sized),
+    pub fn statx_at<'a>(
+        &'a self,
+        fd: &'a (impl UringTarget + Sync + ?Sized),
         path: impl AsRef<Path>,
-        flags: MetadataAtFlags,
-    ) -> io::Result<Metadata> {
+        flags: AtFlags,
+    ) -> PendingIo<'a, io::Result<Metadata>> {
         let mut statx_buf = Box::new(MaybeUninit::<libc::statx>::uninit());
-        let path_cstr = helpers::path_to_cstring(path.as_ref())?;
+        let path_cstr = match helpers::path_to_cstring(path.as_ref()) {
+            Ok(path_cstr) => path_cstr,
+            Err(e) => {
+                return PendingIo::new(FixedValuePendingIo::new(Err(e)));
+            }
+        };
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Statx::CODE)
         {
-            let (tx, rx) = oneshot::channel();
-            self.send(Command::StatxPath {
-                req: StatxPathRequest {
-                    dir_fd: fd.as_file_descriptor().as_raw_fd(),
-                    flags: flags.bits(),
-                    path: path_cstr,
-                    statx_buf: statx_buf,
-                },
-                res: tx,
-            });
-            let metadata = rx.await.expect("uring completion channel dropped")?;
-            Ok(metadata)
+            PendingIo::new(UringStatxPath::new(self, fd, path_cstr, flags))
         } else {
-            let fd = fd.as_file_descriptor();
-            let (_, mut futures) = unsafe {
-                async_scoped::TokioScope::scope_and_collect(move |scope| {
-                    scope.spawn_blocking(move || -> Result<Metadata, io::Error> {
-                        helpers::syscall_cvt(libc::statx(
-                            fd.as_raw_fd(),
+            PendingIo::new(TokioScopedPendingIo::new(
+                move || -> io::Result<Metadata> {
+                    helpers::syscall_cvt(unsafe {
+                        libc::statx(
+                            fd.as_file_descriptor().as_raw_fd(),
                             path_cstr.as_ptr(),
                             flags.bits(),
                             libc::STATX_BASIC_STATS,
                             statx_buf.as_mut_ptr(),
-                        ))?;
-                        let statx = (*statx_buf).assume_init();
-                        Ok(Metadata(statx))
-                    });
-                    ()
-                })
-                .await
-            };
-            let future = futures.pop().expect("no future returned");
-            let metadata = future.expect("future failed to join")?;
-            Ok(metadata)
+                        )
+                    })?;
+                    Ok(Metadata(unsafe { (*statx_buf).assume_init() }))
+                },
+            ))
         }
     }
 
     /// Standard library compatible method for getting metadata of a file path after following all symlinks, equivalent to [`std::fs::metadata`].
-    pub async fn metadata_path(&self, path: impl AsRef<Path>) -> io::Result<Metadata> {
-        self.statx_at(
-            &unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) },
-            path,
-            MetadataAtFlags::AT_EMPTY_PATH,
-        )
-        .await
+    pub fn metadata_path<'a>(
+        &'a self,
+        path: impl AsRef<Path>,
+    ) -> PendingIo<'a, io::Result<Metadata>> {
+        self.statx_at(&Self::AT_FDCWD, path, AtFlags::AT_EMPTY_PATH)
     }
 
     /// Standard library compatible method for getting metadata of a file path without following any symlinks, equivalent to [`std::fs::symlink_metadata`].
-    pub async fn symlink_metadata_path(&self, path: impl AsRef<Path>) -> io::Result<Metadata> {
+    pub fn symlink_metadata_path<'a>(
+        &'a self,
+        path: impl AsRef<Path>,
+    ) -> PendingIo<'a, io::Result<Metadata>> {
         self.statx_at(
-            &unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) },
+            &Self::AT_FDCWD,
             path,
-            MetadataAtFlags::AT_SYMLINK_NOFOLLOW | MetadataAtFlags::AT_EMPTY_PATH,
+            AtFlags::AT_SYMLINK_NOFOLLOW | AtFlags::AT_EMPTY_PATH,
         )
-        .await
     }
 
     /// Pre-allocate or deallocate space for a file (fallocate). This can be used to pre-allocate space to avoid fragmentation, punch holes in sparse files, or zero-fill regions. Use `libc::FALLOC_FL_*` constants for mode flags.
-    pub async fn fallocate(
-        &self,
-        file: &(impl UringTarget + ?Sized),
+    pub fn fallocate<'a>(
+        &'a self,
+        file: &'a (impl UringTarget + Sync + ?Sized),
         mode: FallocateFlags,
         offset: impl TryInto<u64>,
         len: impl TryInto<u64>,
-    ) -> io::Result<()> {
-        let offset: u64 = offset
-            .try_into()
-            .map_err(|_| io::Error::other("offset exceeds u64::MAX"))?;
+    ) -> PendingIo<'a, io::Result<()>> {
+        let offset: u64 = match offset.try_into() {
+            Ok(offset) => offset,
+            Err(_) => {
+                return PendingIo::new(FixedValuePendingIo::new(Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "offset exceeds u64::MAX",
+                ))));
+            }
+        };
+        let len: u64 = match len.try_into() {
+            Ok(len) => len,
+            Err(_) => {
+                return PendingIo::new(FixedValuePendingIo::new(Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "len exceeds u64::MAX",
+                ))));
+            }
+        };
         if offset > i64::MAX as u64 {
-            return Err(io::Error::new(
+            return PendingIo::new(FixedValuePendingIo::new(Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "offset exceeds i64::MAX",
-            ));
+            ))));
         }
-        let len: u64 = len
-            .try_into()
-            .map_err(|_| io::Error::other("len exceeds u64::MAX"))?;
         if len > i64::MAX as u64 {
-            return Err(io::Error::new(
+            return PendingIo::new(FixedValuePendingIo::new(Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "len exceeds i64::MAX",
-            ));
+            ))));
         }
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Fallocate::CODE)
         {
-            let uring = self.uring.as_ref().expect(
-                "should be able to resolve uring because is_uring_operation_supported() is true",
-            );
-            let target = unsafe { file.as_target(&uring.identity) };
-            let (tx, rx) = oneshot::channel();
-            self.send(Command::Fallocate {
-                req: FallocateRequest {
-                    target,
-                    offset,
-                    len,
-                    mode: mode.bits(),
-                },
-                res: tx,
-            });
-            rx.await.expect("uring completion channel dropped")
+            PendingIo::new(UringFallocate::new(self, file, mode, offset, len))
         } else {
-            let file_descriptor = file.as_file_descriptor();
-            let (_, mut futures) = unsafe {
-                async_scoped::TokioScope::scope_and_collect(move |scope| {
-                    scope.spawn_blocking(move || {
-                        nix::fcntl::fallocate(
-                            file_descriptor,
-                            nix::fcntl::FallocateFlags::from_bits_retain(mode.bits()),
-                            offset as i64,
-                            len as i64,
-                        )
-                    });
-                    ()
-                })
-                .await
-            };
-            let future = futures.pop().expect("no future returned");
-            future.expect("future failed to join")?;
-            Ok(())
+            PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
+                nix::fcntl::fallocate(
+                    file.as_file_descriptor(),
+                    nix::fcntl::FallocateFlags::from_bits_retain(mode.bits()),
+                    offset as i64,
+                    len as i64,
+                )?;
+                Ok(())
+            }))
         }
     }
 
     /// Advise the kernel about expected file access patterns (fadvise). This is a hint to the kernel about how you intend to access a file region. The kernel may use this to optimize readahead, caching, etc. Use `libc::POSIX_FADV_*` constants for advice values.
-    pub async fn fadvise(
-        &self,
-        file: &(impl UringTarget + ?Sized),
+    pub fn fadvise<'a>(
+        &'a self,
+        file: &'a (impl UringTarget + Sync + ?Sized),
         offset: impl TryInto<u64>,
-        len: impl TryInto<i64>,
+        len: impl TryInto<u64>,
         advice: PosixFadviseAdvice,
-    ) -> io::Result<()> {
-        let offset: u64 = offset
-            .try_into()
-            .map_err(|_| io::Error::other("offset exceeds u64::MAX"))?;
-        let len: i64 = len
-            .try_into()
-            .map_err(|_| io::Error::other("len exceeds i64::MAX"))?;
+    ) -> PendingIo<'a, io::Result<()>> {
+        let offset: u64 = match offset.try_into() {
+            Ok(offset) => offset,
+            Err(_) => {
+                return PendingIo::new(FixedValuePendingIo::new(Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "offset exceeds u64::MAX",
+                ))));
+            }
+        };
+        let len: u64 = match len.try_into() {
+            Ok(len) => len,
+            Err(_) => {
+                return PendingIo::new(FixedValuePendingIo::new(Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "len exceeds u64::MAX",
+                ))));
+            }
+        };
         if offset > i64::MAX as u64 {
-            return Err(io::Error::new(
+            return PendingIo::new(FixedValuePendingIo::new(Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "offset exceeds i64::MAX",
-            ));
+            ))));
+        }
+        if len > i64::MAX as u64 {
+            return PendingIo::new(FixedValuePendingIo::new(Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "len exceeds i64::MAX",
+            ))));
         }
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Fadvise::CODE)
         {
-            let uring = self.uring.as_ref().expect(
-                "should be able to resolve uring because is_uring_operation_supported() is true",
-            );
-            let target = unsafe { file.as_target(&uring.identity) };
-            let (tx, rx) = oneshot::channel();
-            self.send(Command::Fadvise {
-                req: FadviseRequest {
-                    target,
-                    offset,
-                    len,
-                    advice: advice as i32,
-                },
-                res: tx,
-            });
-            rx.await.expect("uring completion channel dropped")
+            PendingIo::new(UringFadvise::new(self, file, advice, offset, len as i64))
         } else {
-            let file_descriptor = file.as_file_descriptor();
-            let (_, mut futures) = unsafe {
-                async_scoped::TokioScope::scope_and_collect(move |scope| {
-                    scope.spawn_blocking(move || {
-                        nix::fcntl::posix_fadvise(
-                            file_descriptor,
-                            offset as i64,
-                            len as i64,
-                            advice.into(),
-                        )
-                    });
-                    ()
-                })
-                .await
-            };
-            let future = futures.pop().expect("no future returned");
-            future.expect("future failed to join")?;
-            Ok(())
+            PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
+                nix::fcntl::posix_fadvise(
+                    file.as_file_descriptor(),
+                    offset as i64,
+                    len as i64,
+                    advice.into(),
+                )?;
+                Ok(())
+            }))
         }
     }
 
     /// Truncate a file to a specified length (ftruncate). If the file is larger than the specified length, the extra data is lost. If the file is smaller, it is extended and the extended part reads as zeros.
-    pub async fn ftruncate(
-        &self,
-        file: &(impl UringTarget + ?Sized),
+    pub fn ftruncate<'a>(
+        &'a self,
+        file: &'a (impl UringTarget + Sync + ?Sized),
         len: impl TryInto<u64>,
-    ) -> io::Result<()> {
-        let len: u64 = len
-            .try_into()
-            .map_err(|_| io::Error::other("len exceeds u64::MAX"))?;
+    ) -> PendingIo<'a, io::Result<()>> {
+        let len: u64 = match len.try_into() {
+            Ok(len) => len,
+            Err(_) => {
+                return PendingIo::new(FixedValuePendingIo::new(Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "len exceeds u64::MAX",
+                ))));
+            }
+        };
         if len > i64::MAX as u64 {
-            return Err(io::Error::new(
+            return PendingIo::new(FixedValuePendingIo::new(Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "len exceeds i64::MAX",
-            ));
+            ))));
         }
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Ftruncate::CODE)
         {
-            let uring = self.uring.as_ref().expect(
-                "should be able to resolve uring because is_uring_operation_supported() is true",
-            );
-            let target = unsafe { file.as_target(&uring.identity) };
-            let (tx, rx) = oneshot::channel();
-            self.send(Command::Ftruncate {
-                req: FtruncateRequest { target, len },
-                res: tx,
-            });
-            rx.await.expect("uring completion channel dropped")
+            PendingIo::new(UringFtruncate::new(self, file, len))
         } else {
-            let file_descriptor = file.as_file_descriptor();
-            let (_, mut futures) = unsafe {
-                async_scoped::TokioScope::scope_and_collect(move |scope| {
-                    scope.spawn_blocking(move || {
-                        nix::unistd::ftruncate(file_descriptor, len as i64)
-                    });
-                    ()
-                })
-                .await
-            };
-            let future = futures.pop().expect("no future returned");
-            future.expect("future failed to join")?;
-            Ok(())
+            PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
+                nix::unistd::ftruncate(file.as_file_descriptor(), len as i64)?;
+                Ok(())
+            }))
         }
     }
 
@@ -1463,48 +1240,39 @@ impl Client {
     ///
     /// # Notes
     /// - This low-level function does not provide the `O_CLOEXEC` flag by default. This may cause file descriptor leaks, so it is recommended to use [`Self::open_at`].
-    pub async fn open_at_ll(
-        &self,
-        dir_fd: &(impl UringTarget + ?Sized),
+    pub fn open_at_ll<'a>(
+        &'a self,
+        dir_fd: &'a (impl UringTarget + Sync + ?Sized),
         path: impl AsRef<Path>,
         flags: OFlag,
         permissions: Permissions,
-    ) -> io::Result<OwnedFd> {
+    ) -> PendingIo<'a, io::Result<OwnedFd>> {
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::OpenAt::CODE)
         {
-            let path = helpers::path_to_cstring(path.as_ref())?;
-            let (tx, rx) = oneshot::channel();
-            self.send(Command::OpenAt {
-                req: OpenAtRequest {
-                    dir_fd: dir_fd.as_file_descriptor().as_raw_fd(),
-                    path,
-                    flags: flags.bits(),
-                    mode: permissions.mode(),
-                },
-                res: tx,
-            });
-            rx.await.expect("uring completion channel dropped")
-        } else {
-            let file_descriptor = dir_fd.as_file_descriptor();
-            let path = path.as_ref();
-            let (_, mut futures) = unsafe {
-                async_scoped::TokioScope::scope_and_collect(move |scope| {
-                    scope.spawn_blocking(move || {
-                        nix::fcntl::openat(
-                            file_descriptor,
-                            path,
-                            OFlag::from_bits_retain(flags.bits()),
-                            Mode::from_bits_retain(permissions.mode()),
-                        )
-                    });
-                    ()
-                })
-                .await
+            let path = match helpers::path_to_cstring(path.as_ref()) {
+                Ok(path) => path,
+                Err(e) => {
+                    return PendingIo::new(FixedValuePendingIo::new(Err(e)));
+                }
             };
-            let future = futures.pop().expect("no future returned");
-            let fd = future.expect("future failed to join")?;
-            Ok(fd)
+            PendingIo::new(UringOpenAt::new(
+                self,
+                dir_fd,
+                path,
+                flags,
+                Mode::from_bits_retain(permissions.mode()),
+            ))
+        } else {
+            let path_owned = path.as_ref().to_owned();
+            PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<OwnedFd> {
+                Ok(nix::fcntl::openat(
+                    dir_fd.as_file_descriptor(),
+                    &path_owned,
+                    OFlag::from_bits_retain(flags.bits()),
+                    Mode::from_bits_retain(permissions.mode()),
+                )?)
+            }))
         }
     }
 
@@ -1522,81 +1290,65 @@ impl Client {
     ///
     /// # Notes
     /// - This low-level function does not provide the `O_CLOEXEC` flag by default. This may cause file descriptor leaks, so it is recommended to use [`Self::open_path`].
-    pub async fn open_path_ll(
-        &self,
+    pub fn open_path_ll<'a>(
+        &'a self,
         path: impl AsRef<Path>,
         flags: OFlag,
         permissions: Permissions,
-    ) -> io::Result<OwnedFd> {
-        self.open_at_ll(
-            &unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) },
-            path,
-            flags,
-            permissions,
-        )
-        .await
+    ) -> PendingIo<'a, io::Result<OwnedFd>> {
+        self.open_at_ll(&Self::AT_FDCWD, path, flags, permissions)
     }
 
     /// Open a file relative to a directory fd similar to [`Self::open_at_ll`], but with [`O_CLOEXEC`](libc::O_CLOEXEC) flag.
-    pub async fn open_at(
-        &self,
-        dir_fd: &(impl UringTarget + ?Sized),
+    pub fn open_at<'a>(
+        &'a self,
+        dir_fd: &'a (impl UringTarget + Sync + ?Sized),
         path: impl AsRef<Path>,
         flags: OFlag,
         permissions: Permissions,
-    ) -> io::Result<OwnedFd> {
+    ) -> PendingIo<'a, io::Result<OwnedFd>> {
         self.open_at_ll(dir_fd, path, flags | OFlag::O_CLOEXEC, permissions)
-            .await
     }
 
     /// Open a file using path syntax similar to [`Self::open_at_ll`]. This provides a convenient interface close to the standard library's [`std::fs::OpenOptions`] object, which includes the [`O_CLOEXEC`](libc::O_CLOEXEC) flag to prevent fd leaks.
-    pub async fn open_path(
-        &self,
+    pub fn open_path<'a>(
+        &'a self,
         path: impl AsRef<Path>,
         flags: OFlag,
         permissions: Permissions,
-    ) -> io::Result<OwnedFd> {
-        self.open_at_ll(
-            &unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) },
-            path,
-            flags | OFlag::O_CLOEXEC,
-            permissions,
-        )
-        .await
+    ) -> PendingIo<'a, io::Result<OwnedFd>> {
+        self.open_at_ll(&Self::AT_FDCWD, path, flags | OFlag::O_CLOEXEC, permissions)
     }
 
     /// Standard library compatible method for opening a file, equivalent to [`std::fs::File::open`] (read-only open API),
     /// which also includes the `O_CLOEXEC` flag to provide parity with the library.
-    pub async fn open(&self, path: impl AsRef<Path>) -> io::Result<OwnedFd> {
+    pub fn open<'a>(&'a self, path: impl AsRef<Path>) -> PendingIo<'a, io::Result<OwnedFd>> {
         self.open_at_ll(
-            &unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) },
+            &Self::AT_FDCWD,
             path,
             OFlag::O_RDONLY | OFlag::O_CLOEXEC,
             Permissions::from_mode(0o666),
         )
-        .await
     }
 
     /// Standard library compatible method for creating a file or truncate an already existing file, equivalent to [`std::fs::File::create`], which also includes the [`O_CLOEXEC`](libc::O_CLOEXEC) flag to provide parity with the library.
-    pub async fn create(&self, path: impl AsRef<Path>) -> io::Result<OwnedFd> {
+    pub fn create<'a>(&'a self, path: impl AsRef<Path>) -> PendingIo<'a, io::Result<OwnedFd>> {
         self.open_at_ll(
-            &unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) },
+            &Self::AT_FDCWD,
             path,
             OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_TRUNC | OFlag::O_CLOEXEC,
             Permissions::from_mode(0o666),
         )
-        .await
     }
 
     /// Standard library compatible method for creating a file and failing if the file already exists, equivalent to [`std::fs::File::create_new`], which also includes the [`O_CLOEXEC`](libc::O_CLOEXEC) flag to provide parity with the library.
-    pub async fn create_new(&self, path: impl AsRef<Path>) -> io::Result<OwnedFd> {
+    pub fn create_new<'a>(&'a self, path: impl AsRef<Path>) -> PendingIo<'a, io::Result<OwnedFd>> {
         self.open_at_ll(
-            &unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) },
+            &Self::AT_FDCWD,
             path,
             OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_CLOEXEC,
             Permissions::from_mode(0o666),
         )
-        .await
     }
 
     /// Close a file descriptor asynchronously. This is the io_uring equivalent of `close(2)`
@@ -1605,217 +1357,175 @@ impl Client {
     /// - Handle close errors (which are silently ignored by `OwnedFd::drop`)
     /// - Batch close operations with other io_uring operations
     /// - Avoid blocking the async runtime on close
-    pub async fn close(&self, fd: impl IntoRawFd) -> io::Result<()> {
-        let raw_fd = fd.into_raw_fd();
-        let (tx, rx) = oneshot::channel();
+    pub fn close<'a>(
+        &'a self,
+        fd: impl IntoRawFd + Sized + Send + 'a,
+    ) -> PendingIo<'a, io::Result<()>> {
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Close::CODE)
         {
-            self.send(Command::Close {
-                req: CloseRequest { fd: raw_fd },
-                res: tx,
-            });
-            rx.await.expect("uring completion channel dropped")
+            PendingIo::new(UringClose::new(self, fd))
         } else {
+            let raw_fd = fd.into_raw_fd();
             let owned_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
-            tokio::task::spawn_blocking(move || nix::unistd::close(owned_fd)).await??;
-            Ok(())
+            PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
+                nix::unistd::close(owned_fd)?;
+                Ok(())
+            }))
         }
     }
 
     /// Rename a file relative to directory fds. This is the io_uring equivalent of `renameat2(2)`.
     ///
     /// Flags can include [`RenameFlags`](nix::fcntl::RenameFlags) constants.
-    pub async fn rename_at(
-        &self,
-        old_dir_fd: &(impl UringTarget + ?Sized),
+    pub fn rename_at<'a>(
+        &'a self,
+        old_dir_fd: &'a (impl UringTarget + Sync + ?Sized),
         old_path: impl AsRef<Path>,
-        new_dir_fd: &(impl UringTarget + ?Sized),
+        new_dir_fd: &'a (impl UringTarget + Sync + ?Sized),
         new_path: impl AsRef<Path>,
         flags: RenameFlags,
-    ) -> io::Result<()> {
+    ) -> PendingIo<'a, io::Result<()>> {
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::RenameAt::CODE)
         {
-            let old_path = helpers::path_to_cstring(old_path.as_ref())?;
-            let new_path = helpers::path_to_cstring(new_path.as_ref())?;
-            let (tx, rx) = oneshot::channel();
-            self.send(Command::RenameAt {
-                req: RenameAtRequest {
-                    old_dir_fd: old_dir_fd.as_file_descriptor().as_raw_fd(),
-                    old_path,
-                    new_dir_fd: new_dir_fd.as_file_descriptor().as_raw_fd(),
-                    new_path,
-                    flags: flags.bits(),
-                },
-                res: tx,
-            });
-            rx.await.expect("uring completion channel dropped")
-        } else {
-            let old_dir_fd = old_dir_fd.as_file_descriptor();
-            let new_dir_fd = new_dir_fd.as_file_descriptor();
-            let old_path = old_path.as_ref();
-            let new_path = new_path.as_ref();
-            let (_, mut futures) = unsafe {
-                async_scoped::TokioScope::scope_and_collect(move |scope| {
-                    scope.spawn_blocking(move || {
-                        nix::fcntl::renameat2(old_dir_fd, old_path, new_dir_fd, new_path, flags)
-                    });
-                    ()
-                })
-                .await
+            let old_path = match helpers::path_to_cstring(old_path.as_ref()) {
+                Ok(old_path) => old_path,
+                Err(e) => {
+                    return PendingIo::new(FixedValuePendingIo::new(Err(e)));
+                }
             };
-            let future = futures.pop().expect("no future returned");
-            future.expect("future failed to join")?;
-            Ok(())
+            let new_path = match helpers::path_to_cstring(new_path.as_ref()) {
+                Ok(new_path) => new_path,
+                Err(e) => {
+                    return PendingIo::new(FixedValuePendingIo::new(Err(e)));
+                }
+            };
+            PendingIo::new(UringRenameAt::new(
+                self, old_dir_fd, old_path, new_dir_fd, new_path, flags,
+            ))
+        } else {
+            let old_path_owned = old_path.as_ref().to_owned();
+            let new_path_owned = new_path.as_ref().to_owned();
+            PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
+                nix::fcntl::renameat2(
+                    &old_dir_fd.as_file_descriptor(),
+                    &old_path_owned,
+                    &new_dir_fd.as_file_descriptor(),
+                    &new_path_owned,
+                    flags,
+                )?;
+                Ok(())
+            }))
         }
     }
 
     /// Rename a file asynchronously. This is the io_uring equivalent of `rename(2)`.
-    pub async fn rename(
-        &self,
+    pub fn rename<'a>(
+        &'a self,
         old_path: impl AsRef<Path>,
         new_path: impl AsRef<Path>,
-    ) -> io::Result<()> {
+    ) -> PendingIo<'a, io::Result<()>> {
         self.rename_at(
-            &unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) },
+            &Self::AT_FDCWD,
             old_path,
-            &unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) },
+            &Self::AT_FDCWD,
             new_path,
             RenameFlags::empty(),
         )
-        .await
     }
 
     /// Delete a file or directory relative to a directory fd. This is the io_uring equivalent of `unlinkat(2)`.
     ///
     /// Use [`UnlinkatFlags::RemoveDir`](nix::unistd::UnlinkatFlags::RemoveDir) flag to remove directories.
-    pub async fn unlink_at(
-        &self,
-        dir_fd: &(impl UringTarget + ?Sized),
+    pub fn unlink_at<'a>(
+        &'a self,
+        dir_fd: &'a (impl UringTarget + Sync + ?Sized),
         path: impl AsRef<Path>,
         flags: UnlinkatFlags,
-    ) -> io::Result<()> {
+    ) -> PendingIo<'a, io::Result<()>> {
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::UnlinkAt::CODE)
         {
-            let path = helpers::path_to_cstring(path.as_ref())?;
-            let (tx, rx) = oneshot::channel();
-            self.send(Command::UnlinkAt {
-                req: UnlinkAtRequest {
-                    dir_fd: dir_fd.as_file_descriptor().as_raw_fd(),
-                    path,
-                    flags: match flags {
-                        UnlinkatFlags::RemoveDir => libc::AT_REMOVEDIR,
-                        UnlinkatFlags::NoRemoveDir => 0,
-                    },
-                },
-                res: tx,
-            });
-            rx.await.expect("uring completion channel dropped")
-        } else {
-            let dir_fd = dir_fd.as_file_descriptor();
-            let path = path.as_ref();
-            let (_, mut futures) = unsafe {
-                async_scoped::TokioScope::scope_and_collect(move |scope| {
-                    scope.spawn_blocking(move || nix::unistd::unlinkat(dir_fd, path, flags));
-                    ()
-                })
-                .await
+            let path = match helpers::path_to_cstring(path.as_ref()) {
+                Ok(path) => path,
+                Err(e) => {
+                    return PendingIo::new(FixedValuePendingIo::new(Err(e)));
+                }
             };
-            let future = futures.pop().expect("no future returned");
-            future.expect("future failed to join")?;
-            Ok(())
+            PendingIo::new(UringUnlinkAt::new(self, dir_fd, path, flags))
+        } else {
+            let path_owned = path.as_ref().to_owned();
+            PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
+                nix::unistd::unlinkat(&dir_fd.as_file_descriptor(), &path_owned, flags)?;
+                Ok(())
+            }))
         }
     }
 
     /// Delete a file or empty directory. This is the io_uring equivalent of `unlink(2)`.
-    pub async fn unlink(&self, path: impl AsRef<Path>) -> io::Result<()> {
-        self.unlink_at(
-            &unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) },
-            path,
-            UnlinkatFlags::NoRemoveDir,
-        )
-        .await
+    pub fn unlink<'a>(&'a self, path: impl AsRef<Path>) -> PendingIo<'a, io::Result<()>> {
+        self.unlink_at(&Self::AT_FDCWD, path, UnlinkatFlags::NoRemoveDir)
     }
 
     /// Delete a directory. This is the io_uring equivalent of `rmdir(2)`.
-    pub async fn rmdir(&self, path: impl AsRef<Path>) -> io::Result<()> {
-        self.unlink_at(
-            &unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) },
-            path,
-            UnlinkatFlags::RemoveDir,
-        )
-        .await
+    pub fn rmdir<'a>(&'a self, path: impl AsRef<Path>) -> PendingIo<'a, io::Result<()>> {
+        self.unlink_at(&Self::AT_FDCWD, path, UnlinkatFlags::RemoveDir)
     }
 
     /// Delete a directory. Alias for [`Self::rmdir`].
     #[inline]
-    pub async fn remove_dir(&self, path: impl AsRef<Path>) -> io::Result<()> {
-        self.rmdir(path).await
+    pub fn remove_dir<'a>(&'a self, path: impl AsRef<Path>) -> PendingIo<'a, io::Result<()>> {
+        self.rmdir(path)
     }
 
     /// Create a directory relative to a directory fd. This is the io_uring equivalent of `mkdirat(2)`.
-    pub async fn mkdir_at(
-        &self,
-        dir_fd: &(impl UringTarget + ?Sized),
+    pub fn mkdir_at<'a>(
+        &'a self,
+        dir_fd: &'a (impl UringTarget + Sync + ?Sized),
         path: impl AsRef<Path>,
         permissions: Permissions,
-    ) -> io::Result<()> {
+    ) -> PendingIo<'a, io::Result<()>> {
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::MkDirAt::CODE)
         {
-            let path = helpers::path_to_cstring(path.as_ref())?;
-            let (tx, rx) = oneshot::channel();
-            self.send(Command::MkdirAt {
-                req: MkdirAtRequest {
-                    dir_fd: dir_fd.as_file_descriptor().as_raw_fd(),
-                    path,
-                    mode: permissions.mode(),
-                },
-                res: tx,
-            });
-            rx.await.expect("uring completion channel dropped")
-        } else {
-            let dir_fd = dir_fd.as_file_descriptor();
-            let path = path.as_ref();
-            let (_, mut futures) = unsafe {
-                async_scoped::TokioScope::scope_and_collect(move |scope| {
-                    scope.spawn_blocking(move || {
-                        nix::sys::stat::mkdirat(
-                            dir_fd,
-                            path,
-                            Mode::from_bits_retain(permissions.mode()),
-                        )
-                    });
-                    ()
-                })
-                .await
+            let path = match helpers::path_to_cstring(path.as_ref()) {
+                Ok(path) => path,
+                Err(e) => {
+                    return PendingIo::new(FixedValuePendingIo::new(Err(e)));
+                }
             };
-            let future = futures.pop().expect("no future returned");
-            future.expect("future failed to join")?;
-            Ok(())
+            PendingIo::new(UringMkdirAt::new(
+                self,
+                dir_fd,
+                path,
+                Mode::from_bits_retain(permissions.mode()),
+            ))
+        } else {
+            let path_owned = path.as_ref().to_owned();
+            PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
+                nix::sys::stat::mkdirat(
+                    &dir_fd.as_file_descriptor(),
+                    &path_owned,
+                    Mode::from_bits_retain(permissions.mode()),
+                )?;
+                Ok(())
+            }))
         }
     }
 
     /// Create a directory using path syntax. This is the io_uring equivalent of `mkdir(2)`.
-    pub async fn mkdir(&self, path: impl AsRef<Path>, permissions: Permissions) -> io::Result<()> {
-        self.mkdir_at(
-            &unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) },
-            path,
-            permissions,
-        )
-        .await
+    pub fn mkdir<'a>(
+        &'a self,
+        path: impl AsRef<Path>,
+        permissions: Permissions,
+    ) -> PendingIo<'a, io::Result<()>> {
+        self.mkdir_at(&Self::AT_FDCWD, path, permissions)
     }
 
     /// Standard library compatible method for creating a directory, equivalent to [`std::fs::create_dir`].
-    pub async fn create_dir(&self, path: impl AsRef<Path>) -> io::Result<()> {
-        self.mkdir_at(
-            &unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) },
-            path,
-            Permissions::from_mode(0o777),
-        )
-        .await
+    pub fn create_dir<'a>(&'a self, path: impl AsRef<Path>) -> PendingIo<'a, io::Result<()>> {
+        self.mkdir_at(&Self::AT_FDCWD, path, Permissions::from_mode(0o777))
     }
 
     /// Standard library compatible method for ensuring that a directory exists by creating it and all missing parent directories,
@@ -1826,7 +1536,12 @@ impl Client {
             return Ok(());
         }
 
-        match self.create_dir(path).await {
+        match self
+            .create_dir(path)
+            .completion()
+            .expect("no completion")
+            .await
+        {
             Ok(()) => return Ok(()),
             Err(ref e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(_) if path.is_dir() => return Ok(()),
@@ -1841,7 +1556,12 @@ impl Client {
                 ));
             }
         }
-        match self.create_dir(path).await {
+        match self
+            .create_dir(path)
+            .completion()
+            .expect("no completion")
+            .await
+        {
             Ok(()) => Ok(()),
             Err(_) if path.is_dir() => Ok(()),
             Err(e) => Err(e),
@@ -1859,7 +1579,12 @@ impl Client {
             return Ok(());
         }
 
-        match self.mkdir(path, permissions).await {
+        match self
+            .mkdir(path, permissions)
+            .completion()
+            .expect("no completion")
+            .await
+        {
             Ok(()) => return Ok(()),
             Err(ref e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(_) if path.is_dir() => return Ok(()),
@@ -1874,7 +1599,12 @@ impl Client {
                 ));
             }
         }
-        match self.mkdir(path, permissions).await {
+        match self
+            .mkdir(path, permissions)
+            .completion()
+            .expect("no completion")
+            .await
+        {
             Ok(()) => Ok(()),
             Err(_) if path.is_dir() => Ok(()),
             Err(e) => Err(e),
@@ -1882,113 +1612,101 @@ impl Client {
     }
 
     /// Create a symbolic link relative to a directory fd. This is the io_uring equivalent of `symlinkat(2)`.
-    pub async fn symlink_at(
-        &self,
+    pub fn symlink_at<'a>(
+        &'a self,
         target: impl AsRef<Path>,
-        new_dir_fd: &(impl UringTarget + ?Sized),
+        new_dir_fd: &'a (impl UringTarget + Sync + ?Sized),
         link_path: impl AsRef<Path>,
-    ) -> io::Result<()> {
+    ) -> PendingIo<'a, io::Result<()>> {
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::SymlinkAt::CODE)
         {
-            let target = helpers::path_to_cstring(target.as_ref())?;
-            let link_path = helpers::path_to_cstring(link_path.as_ref())?;
-            let (tx, rx) = oneshot::channel();
-            self.send(Command::SymlinkAt {
-                req: SymlinkAtRequest {
-                    target,
-                    new_dir_fd: new_dir_fd.as_file_descriptor().as_raw_fd(),
-                    link_path,
-                },
-                res: tx,
-            });
-            rx.await.expect("uring completion channel dropped")
-        } else {
-            let target = target.as_ref();
-            let new_dir_fd = new_dir_fd.as_file_descriptor();
-            let link_path = link_path.as_ref();
-            let (_, mut futures) = unsafe {
-                async_scoped::TokioScope::scope_and_collect(move |scope| {
-                    scope.spawn_blocking(move || {
-                        nix::unistd::symlinkat(target, new_dir_fd, link_path)
-                    });
-                    ()
-                })
-                .await
+            let target = match helpers::path_to_cstring(target.as_ref()) {
+                Ok(target) => target,
+                Err(e) => {
+                    return PendingIo::new(FixedValuePendingIo::new(Err(e)));
+                }
             };
-            let future = futures.pop().expect("no future returned");
-            future.expect("future failed to join")?;
-            Ok(())
+            let link_path = match helpers::path_to_cstring(link_path.as_ref()) {
+                Ok(link_path) => link_path,
+                Err(e) => {
+                    return PendingIo::new(FixedValuePendingIo::new(Err(e)));
+                }
+            };
+            PendingIo::new(UringSymlinkAt::new(self, new_dir_fd, target, link_path))
+        } else {
+            let target_owned = target.as_ref().to_owned();
+            let link_path_owned = link_path.as_ref().to_owned();
+            PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
+                nix::unistd::symlinkat(
+                    &target_owned,
+                    new_dir_fd.as_file_descriptor(),
+                    &link_path_owned,
+                )?;
+                Ok(())
+            }))
         }
     }
 
     /// Standard library compatible method for creating a symbolic link, equivalent to [`std::os::unix::fs::symlink`] or `symlink(2)`.
-    pub async fn symlink(
-        &self,
+    pub fn symlink<'a>(
+        &'a self,
         target: impl AsRef<Path>,
         link_path: impl AsRef<Path>,
-    ) -> io::Result<()> {
-        self.symlink_at(
-            target,
-            &unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) },
-            link_path,
-        )
-        .await
+    ) -> PendingIo<'a, io::Result<()>> {
+        self.symlink_at(target, &Self::AT_FDCWD, link_path)
     }
 
     /// Create a hard link to the location relative to the target directory at a location relative to the specified directory fd. This is the io_uring equivalent of `linkat(2)`.
-    pub async fn hard_link_at(
-        &self,
-        old_dir_fd: &(impl UringTarget + ?Sized),
+    pub fn hard_link_at<'a>(
+        &'a self,
+        old_dir_fd: &'a (impl UringTarget + Sync + ?Sized),
         old_path: impl AsRef<Path>,
-        new_dir_fd: &(impl UringTarget + ?Sized),
+        new_dir_fd: &'a (impl UringTarget + Sync + ?Sized),
         new_path: impl AsRef<Path>,
         flags: LinkatFlags,
-    ) -> io::Result<()> {
+    ) -> PendingIo<'a, io::Result<()>> {
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::LinkAt::CODE)
         {
-            let old_path = helpers::path_to_cstring(old_path.as_ref())?;
-            let new_path = helpers::path_to_cstring(new_path.as_ref())?;
-            let (tx, rx) = oneshot::channel();
-            self.send(Command::LinkAt {
-                req: LinkAtRequest {
-                    old_dir_fd: old_dir_fd.as_file_descriptor().as_raw_fd(),
-                    old_path,
-                    new_dir_fd: new_dir_fd.as_file_descriptor().as_raw_fd(),
-                    new_path,
-                    flags: flags.bits(),
-                },
-                res: tx,
-            });
-            rx.await.expect("uring completion channel dropped")
-        } else {
-            let old_dir_fd = old_dir_fd.as_file_descriptor();
-            let new_dir_fd = new_dir_fd.as_file_descriptor();
-            let old_path = old_path.as_ref();
-            let new_path = new_path.as_ref();
-            let (_, mut futures) = unsafe {
-                async_scoped::TokioScope::scope_and_collect(move |scope| {
-                    scope.spawn_blocking(move || {
-                        nix::unistd::linkat(old_dir_fd, old_path, new_dir_fd, new_path, flags)
-                    });
-                    ()
-                })
-                .await
+            let old_path = match helpers::path_to_cstring(old_path.as_ref()) {
+                Ok(old_path) => old_path,
+                Err(e) => {
+                    return PendingIo::new(FixedValuePendingIo::new(Err(e)));
+                }
             };
-            let future = futures.pop().expect("no future returned");
-            future.expect("future failed to join")?;
-            Ok(())
+            let new_path = match helpers::path_to_cstring(new_path.as_ref()) {
+                Ok(new_path) => new_path,
+                Err(e) => {
+                    return PendingIo::new(FixedValuePendingIo::new(Err(e)));
+                }
+            };
+            PendingIo::new(UringLinkAt::new(
+                self, old_dir_fd, old_path, new_dir_fd, new_path, flags,
+            ))
+        } else {
+            let old_path_owned = old_path.as_ref().to_owned();
+            let new_path_owned = new_path.as_ref().to_owned();
+            PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
+                nix::unistd::linkat(
+                    old_dir_fd.as_file_descriptor(),
+                    &old_path_owned,
+                    new_dir_fd.as_file_descriptor(),
+                    &new_path_owned,
+                    flags,
+                )?;
+                Ok(())
+            }))
         }
     }
 
     /// Create a hard link to the open file handle at a location relative to the specified directory fd.
-    pub async fn hard_link_file_at(
-        &self,
-        file: &(impl UringTarget + ?Sized),
-        new_dir_fd: &(impl UringTarget + ?Sized),
+    pub fn hard_link_file_at<'a>(
+        &'a self,
+        file: &'a (impl UringTarget + Sync + ?Sized),
+        new_dir_fd: &'a (impl UringTarget + Sync + ?Sized),
         new_path: impl AsRef<Path>,
-    ) -> io::Result<()> {
+    ) -> PendingIo<'a, io::Result<()>> {
         self.hard_link_at(
             file,
             Path::new(""),
@@ -1997,414 +1715,312 @@ impl Client {
             // Points to the target file.
             LinkatFlags::AT_EMPTY_PATH,
         )
-        .await
     }
 
     /// Create a hard link to the open file handle at the specified path.
-    pub async fn hard_link_file(
-        &self,
-        file: &(impl UringTarget + ?Sized),
+    pub fn hard_link_file<'a>(
+        &'a self,
+        file: &'a (impl UringTarget + Sync + ?Sized),
         new_path: impl AsRef<Path>,
-    ) -> io::Result<()> {
+    ) -> PendingIo<'a, io::Result<()>> {
         self.hard_link_at(
             file,
             Path::new(""),
-            &unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) },
+            &Self::AT_FDCWD,
             new_path,
             LinkatFlags::empty(),
         )
-        .await
     }
 
     /// Standard library compatible method for creating a hard link using path syntax. This is the io_uring equivalent of `link(2)`.
-    pub async fn hard_link(
-        &self,
+    pub fn hard_link<'a>(
+        &'a self,
         old_path: impl AsRef<Path>,
         new_path: impl AsRef<Path>,
-    ) -> io::Result<()> {
+    ) -> PendingIo<'a, io::Result<()>> {
         self.hard_link_at(
-            &unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) },
+            &Self::AT_FDCWD,
             old_path,
-            &unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) },
+            &Self::AT_FDCWD,
             new_path,
             LinkatFlags::empty(),
         )
-        .await
     }
 
     /// Alias for [`Self::fchmod`].
     #[inline]
-    pub async fn set_permissions(
-        &self,
-        fd: &(impl UringTarget + ?Sized),
+    pub fn set_permissions<'a>(
+        &'a self,
+        fd: &'a (impl UringTarget + Sync + ?Sized),
         permissions: Permissions,
-    ) -> io::Result<()> {
-        self.fchmod(fd, permissions).await
+    ) -> PendingIo<'a, io::Result<()>> {
+        self.fchmod(fd, permissions)
     }
 
     /// Set the permissions of an open handle to a file or directory, which is equivalent to [`std::fs::File::set_permissions`] or `fchmod(2)`.
-    pub async fn fchmod(
-        &self,
-        fd: &(impl UringTarget + ?Sized),
+    pub fn fchmod<'a>(
+        &'a self,
+        fd: &'a (impl UringTarget + Sync + ?Sized),
         permissions: Permissions,
-    ) -> io::Result<()> {
-        let raw_fd = fd.as_file_descriptor();
-        let (_, mut futures) = unsafe {
-            async_scoped::TokioScope::scope_and_collect(move |scope| {
-                scope.spawn_blocking(move || {
-                    nix::sys::stat::fchmod(raw_fd, Mode::from_bits_retain(permissions.mode()))
-                });
-                ()
-            })
-            .await
-        };
-        let future = futures.pop().expect("no future returned");
-        future.expect("future failed to join")?;
-        Ok(())
+    ) -> PendingIo<'a, io::Result<()>> {
+        PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
+            nix::sys::stat::fchmod(
+                fd.as_file_descriptor(),
+                Mode::from_bits_retain(permissions.mode()),
+            )?;
+            Ok(())
+        }))
     }
 
     /// Set the permissions of a file or directory relative to a directory fd, which is equivalent to `fchmodat(2)`.
-    pub async fn fchmod_at(
-        &self,
-        fd: &(impl UringTarget + ?Sized),
+    pub fn fchmod_at<'a>(
+        &'a self,
+        fd: &'a (impl UringTarget + Sync + ?Sized),
         path: impl AsRef<Path>,
         permissions: Permissions,
         flags: FchmodatFlags,
-    ) -> io::Result<()> {
-        let path = path.as_ref();
-        let dir_fd = fd.as_file_descriptor();
-        let (_, mut futures) = unsafe {
-            async_scoped::TokioScope::scope_and_collect(move |scope| {
-                scope.spawn_blocking(move || {
-                    nix::sys::stat::fchmodat(
-                        dir_fd,
-                        path,
-                        Mode::from_bits_retain(permissions.mode()),
-                        flags,
-                    )
-                });
-                ()
-            })
-            .await
-        };
-        let future = futures.pop().expect("no future returned");
-        future.expect("future failed to join")?;
-        Ok(())
+    ) -> PendingIo<'a, io::Result<()>> {
+        let path = path.as_ref().to_owned();
+        PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
+            nix::sys::stat::fchmodat(
+                fd.as_file_descriptor(),
+                &path,
+                Mode::from_bits_retain(permissions.mode()),
+                flags,
+            )?;
+            Ok(())
+        }))
     }
 
     /// Set the permissions of a file or directory using path syntax, equivalent to `chmod(2)`.
-    pub async fn chmod(&self, path: impl AsRef<Path>, permissions: Permissions) -> io::Result<()> {
-        let path = path.as_ref();
-        let (_, mut futures) = unsafe {
-            async_scoped::TokioScope::scope_and_collect(move |scope| {
-                scope.spawn_blocking(move || {
-                    nix::sys::stat::fchmodat(
-                        BorrowedFd::borrow_raw(libc::AT_FDCWD),
-                        path,
-                        Mode::from_bits_retain(permissions.mode()),
-                        FchmodatFlags::FollowSymlink,
-                    )
-                });
-                ()
-            })
-            .await
-        };
-        let future = futures.pop().expect("no future returned");
-        future.expect("future failed to join")?;
-        Ok(())
+    pub fn chmod<'a>(
+        &'a self,
+        path: impl AsRef<Path>,
+        permissions: Permissions,
+    ) -> PendingIo<'a, io::Result<()>> {
+        self.fchmod_at(
+            &Self::AT_FDCWD,
+            path,
+            permissions,
+            FchmodatFlags::FollowSymlink,
+        )
     }
 
     /// Set the permissions of a file or directory using path syntax, but can target a symlink.
-    pub async fn lchmod(&self, path: impl AsRef<Path>, permissions: Permissions) -> io::Result<()> {
-        let path = path.as_ref();
-        let (_, mut futures) = unsafe {
-            async_scoped::TokioScope::scope_and_collect(move |scope| {
-                scope.spawn_blocking(move || {
-                    nix::sys::stat::fchmodat(
-                        BorrowedFd::borrow_raw(libc::AT_FDCWD),
-                        path,
-                        Mode::from_bits_retain(permissions.mode()),
-                        FchmodatFlags::NoFollowSymlink,
-                    )
-                });
-                ()
-            })
-            .await
-        };
-        let future = futures.pop().expect("no future returned");
-        future.expect("future failed to join")?;
-        Ok(())
+    pub fn lchmod<'a>(
+        &'a self,
+        path: impl AsRef<Path>,
+        permissions: Permissions,
+    ) -> PendingIo<'a, io::Result<()>> {
+        self.fchmod_at(
+            &Self::AT_FDCWD,
+            path,
+            permissions,
+            FchmodatFlags::NoFollowSymlink,
+        )
     }
 
     /// Set the user and/or group ownership of an open handle to a file or directory, which is equivalent to `fchown(2)`.
-    pub async fn fchown(
-        &self,
-        fd: &(impl UringTarget + ?Sized),
+    pub fn fchown<'a>(
+        &'a self,
+        fd: &'a (impl UringTarget + Sync + ?Sized),
         uid: Option<Uid>,
         gid: Option<Gid>,
-    ) -> io::Result<()> {
-        let raw_fd = fd.as_file_descriptor();
-        let (_, mut futures) = unsafe {
-            async_scoped::TokioScope::scope_and_collect(move |scope| {
-                scope.spawn_blocking(move || nix::unistd::fchown(raw_fd, uid, gid));
-                ()
-            })
-            .await
-        };
-        let future = futures.pop().expect("no future returned");
-        future.expect("future failed to join")?;
-        Ok(())
+    ) -> PendingIo<'a, io::Result<()>> {
+        PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
+            nix::unistd::fchown(fd.as_file_descriptor(), uid, gid)?;
+            Ok(())
+        }))
     }
 
     /// Set the user and/or group ownership of a file or directory relative to a directory fd, which is equivalent to `fchownat(2)`.
-    pub async fn fchown_at(
-        &self,
-        fd: &(impl UringTarget + ?Sized),
+    pub fn fchown_at<'a>(
+        &'a self,
+        fd: &'a (impl UringTarget + Sync + ?Sized),
         path: impl AsRef<Path>,
         uid: Option<Uid>,
         gid: Option<Gid>,
         flags: FchownatFlags,
-    ) -> io::Result<()> {
-        let path = path.as_ref();
-        let dir_fd = fd.as_file_descriptor();
-        let (_, mut futures) = unsafe {
-            async_scoped::TokioScope::scope_and_collect(move |scope| {
-                scope.spawn_blocking(move || nix::unistd::fchownat(dir_fd, path, uid, gid, flags));
-                ()
-            })
-            .await
-        };
-        let future = futures.pop().expect("no future returned");
-        future.expect("future failed to join")?;
-        Ok(())
+    ) -> PendingIo<'a, io::Result<()>> {
+        let path = path.as_ref().to_owned();
+        PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
+            nix::unistd::fchownat(fd.as_file_descriptor(), &path, uid, gid, flags)?;
+            Ok(())
+        }))
     }
 
     /// Set the user and/or group ownership of a file or directory using path syntax, which is equivalent to `chown(2)`.
-    pub async fn chown(
-        &self,
+    pub fn chown<'a>(
+        &'a self,
         path: impl AsRef<Path>,
         uid: Option<Uid>,
         gid: Option<Gid>,
-    ) -> io::Result<()> {
-        let path = path.as_ref();
-        let (_, mut futures) = unsafe {
-            async_scoped::TokioScope::scope_and_collect(move |scope| {
-                scope.spawn_blocking(move || {
-                    nix::unistd::fchownat(
-                        BorrowedFd::borrow_raw(libc::AT_FDCWD),
-                        path,
-                        uid,
-                        gid,
-                        AtFlags::AT_SYMLINK_FOLLOW,
-                    )
-                });
-                ()
-            })
-            .await
-        };
-        let future = futures.pop().expect("no future returned");
-        future.expect("future failed to join")?;
-        Ok(())
+    ) -> PendingIo<'a, io::Result<()>> {
+        self.fchown_at(
+            &Self::AT_FDCWD,
+            path,
+            uid,
+            gid,
+            FchownatFlags::AT_SYMLINK_FOLLOW,
+        )
     }
 
     /// Set the user and/ or group ownership of a file or directory using path syntax, but can target a symlink.
-    pub async fn lchown(
-        &self,
+    pub fn lchown<'a>(
+        &'a self,
         path: impl AsRef<Path>,
         uid: Option<Uid>,
         gid: Option<Gid>,
-    ) -> io::Result<()> {
-        let path = path.as_ref();
-        let (_, mut futures) = unsafe {
-            async_scoped::TokioScope::scope_and_collect(move |scope| {
-                scope.spawn_blocking(move || {
-                    nix::unistd::fchownat(
-                        BorrowedFd::borrow_raw(libc::AT_FDCWD),
-                        path,
-                        uid,
-                        gid,
-                        AtFlags::AT_SYMLINK_NOFOLLOW,
-                    )
-                });
-                ()
-            })
-            .await
-        };
-        let future = futures.pop().expect("no future returned");
-        future.expect("future failed to join")?;
-        Ok(())
+    ) -> PendingIo<'a, io::Result<()>> {
+        self.fchown_at(
+            &Self::AT_FDCWD,
+            path,
+            uid,
+            gid,
+            FchownatFlags::AT_SYMLINK_NOFOLLOW,
+        )
     }
 
     /// Alias for [`Self::futimens`].
     #[inline]
-    pub async fn set_times(
-        &self,
-        fd: &(impl UringTarget + ?Sized),
+    pub fn set_times<'a>(
+        &'a self,
+        fd: &'a (impl UringTarget + Sync + ?Sized),
         atime: Option<TimeSpec>,
         mtime: Option<TimeSpec>,
-    ) -> io::Result<()> {
-        self.futimens(fd, atime, mtime).await
+    ) -> PendingIo<'a, io::Result<()>> {
+        self.futimens(fd, atime, mtime)
     }
 
     /// Set file times of an open handle to a file or directory, which is equivalent to [`std::fs::File::set_times`] or `futimens(2)`.
-    pub async fn futimens(
-        &self,
-        fd: &(impl UringTarget + ?Sized),
+    pub fn futimens<'a>(
+        &'a self,
+        fd: &'a (impl UringTarget + Sync + ?Sized),
         atime: Option<TimeSpec>,
         mtime: Option<TimeSpec>,
-    ) -> io::Result<()> {
-        let fd = fd.as_file_descriptor();
-        let _atime = atime.unwrap_or(TimeSpec::UTIME_OMIT);
-        let _mtime = mtime.unwrap_or(TimeSpec::UTIME_OMIT);
-        let (_, mut futures) = unsafe {
-            async_scoped::TokioScope::scope_and_collect(move |scope| {
-                scope.spawn_blocking(move || nix::sys::stat::futimens(fd, &_atime, &_mtime));
-                ()
-            })
-            .await
-        };
-        let future = futures.pop().expect("no future returned");
-        future.expect("future failed to join")?;
-        Ok(())
+    ) -> PendingIo<'a, io::Result<()>> {
+        PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
+            nix::sys::stat::futimens(
+                fd.as_file_descriptor(),
+                &atime.unwrap_or(TimeSpec::UTIME_OMIT),
+                &mtime.unwrap_or(TimeSpec::UTIME_OMIT),
+            )?;
+            Ok(())
+        }))
     }
 
     /// Set file times of a file or directory using a path relative to a directory fd, which is equivalent to `utimensat(2)`.
-    pub async fn utimens_at(
-        &self,
-        dir_fd: &(impl UringTarget + ?Sized),
+    pub fn utimens_at<'a>(
+        &'a self,
+        dir_fd: &'a (impl UringTarget + Sync + ?Sized),
         path: impl AsRef<Path>,
         atime: Option<TimeSpec>,
         mtime: Option<TimeSpec>,
         flags: UtimensatFlags,
-    ) -> io::Result<()> {
-        let path = path.as_ref();
-        let _atime = atime.unwrap_or(TimeSpec::UTIME_OMIT);
-        let _mtime = mtime.unwrap_or(TimeSpec::UTIME_OMIT);
-        let dir_fd = dir_fd.as_file_descriptor();
-        let (_, mut futures) = unsafe {
-            async_scoped::TokioScope::scope_and_collect(move |scope| {
-                scope.spawn_blocking(move || {
-                    nix::sys::stat::utimensat(dir_fd, path, &_atime, &_mtime, flags)
-                });
-                ()
-            })
-            .await
-        };
-        let future = futures.pop().expect("no future returned");
-        future.expect("future failed to join")?;
-        Ok(())
+    ) -> PendingIo<'a, io::Result<()>> {
+        let path = path.as_ref().to_owned();
+        PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
+            nix::sys::stat::utimensat(
+                dir_fd.as_file_descriptor(),
+                &path,
+                &atime.unwrap_or(TimeSpec::UTIME_OMIT),
+                &mtime.unwrap_or(TimeSpec::UTIME_OMIT),
+                flags,
+            )?;
+            Ok(())
+        }))
     }
 
     /// Canonicalize a path. This is equivalent to `realpath(3)`.
-    pub async fn canonicalize(&self, path: impl AsRef<Path>) -> io::Result<PathBuf> {
-        tokio::fs::canonicalize(path).await
+    pub fn canonicalize<'a>(
+        &'a self,
+        path: impl AsRef<Path>,
+    ) -> PendingIo<'a, io::Result<PathBuf>> {
+        let path = path.as_ref().to_owned();
+        PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<PathBuf> {
+            std::fs::canonicalize(&path)
+        }))
     }
 
     /// Read a symbolic link. This is equivalent to `readlink(2)`.
-    pub async fn read_link(&self, path: impl AsRef<Path>) -> io::Result<PathBuf> {
-        let path = path.as_ref();
-        let (_, mut futures) = unsafe {
-            async_scoped::TokioScope::scope_and_collect(move |scope| {
-                scope.spawn_blocking(move || -> io::Result<OsString> {
-                    let output =
-                        nix::fcntl::readlinkat(BorrowedFd::borrow_raw(libc::AT_FDCWD), path)?;
-                    Ok(output)
-                });
-                ()
-            })
-            .await
-        };
-        let future = futures.pop().expect("no future returned");
-        let output = future.expect("future failed to join")?;
-        Ok(PathBuf::from(output))
+    pub fn read_link<'a>(&'a self, path: impl AsRef<Path>) -> PendingIo<'a, io::Result<PathBuf>> {
+        self.read_link_at(&Self::AT_FDCWD, path)
     }
 
     /// Read a symbolic link at a relative path to a directory fd, which is equivalent to `readlinkat(2)`.
-    pub async fn read_link_at(
-        &self,
-        dir_fd: &(impl UringTarget + ?Sized),
+    pub fn read_link_at<'a>(
+        &'a self,
+        dir_fd: &'a (impl UringTarget + Sync + ?Sized),
         path: impl AsRef<Path>,
-    ) -> io::Result<PathBuf> {
-        let path = path.as_ref();
-        let dir_fd = dir_fd.as_file_descriptor();
-        let (_, mut futures) = unsafe {
-            async_scoped::TokioScope::scope_and_collect(move |scope| {
-                scope.spawn_blocking(move || -> io::Result<OsString> {
-                    let output = nix::fcntl::readlinkat(dir_fd, path)?;
-                    Ok(output)
-                });
-                ()
-            })
-            .await
-        };
-        let future = futures.pop().expect("no future returned");
-        let output = future.expect("future failed to join")?;
-        Ok(PathBuf::from(output))
+    ) -> PendingIo<'a, io::Result<PathBuf>> {
+        let path = path.as_ref().to_owned();
+        PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<PathBuf> {
+            Ok(PathBuf::from(nix::fcntl::readlinkat(
+                dir_fd.as_file_descriptor(),
+                &path,
+            )?))
+        }))
     }
 
     /// Read a symbolic link at a file descriptor opened with [`OFlag::O_PATH`] and [`OFlag::O_NOFOLLOW`].
-    pub async fn read_link_file(&self, fd: &(impl UringTarget + ?Sized)) -> io::Result<PathBuf> {
-        let fd = fd.as_file_descriptor();
-        let (_, mut futures) = unsafe {
-            async_scoped::TokioScope::scope_and_collect(move |scope| {
-                scope.spawn_blocking(move || -> io::Result<OsString> {
-                    let output = nix::fcntl::readlinkat(fd, Path::new(""))?;
-                    Ok(output)
-                });
-                ()
-            })
-            .await
-        };
-        let future = futures.pop().expect("no future returned");
-        let output = future.expect("future failed to join")?;
-        Ok(PathBuf::from(output))
+    pub fn read_link_file<'a>(
+        &'a self,
+        fd: &'a (impl UringTarget + Sync + ?Sized),
+    ) -> PendingIo<'a, io::Result<PathBuf>> {
+        self.read_link_at(fd, Path::new(""))
     }
 
     /// Create a device node at a relative path to a directory fd, which is equivalent to `mknodat(2)`.
-    pub async fn mknod_at(
-        &self,
-        dir_fd: &(impl UringTarget + ?Sized),
+    pub fn mknod_at<'a>(
+        &'a self,
+        dir_fd: &'a (impl UringTarget + Sync + ?Sized),
         path: impl AsRef<Path>,
         kind: MknodType,
         permissions: Permissions,
-    ) -> io::Result<()> {
-        let path = path.as_ref();
-        let dir_fd = dir_fd.as_file_descriptor();
-        let (_, mut futures) = unsafe {
-            async_scoped::TokioScope::scope_and_collect(move |scope| {
-                scope.spawn_blocking(move || -> io::Result<()> {
-                    let (kind, device) = kind.to_sflag_and_device();
-                    nix::sys::stat::mknodat(
-                        dir_fd,
-                        path,
-                        kind,
-                        Mode::from_bits_retain(permissions.mode()),
-                        device.into(),
-                    )?;
-                    Ok(())
-                });
-                ()
-            })
-            .await
-        };
-        let future = futures.pop().expect("no future returned");
-        future.expect("future failed to join")?;
-        Ok(())
+    ) -> PendingIo<'a, io::Result<()>> {
+        let path_owned = path.as_ref().to_owned();
+        PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
+            let (kind, device) = kind.to_sflag_and_device();
+            nix::sys::stat::mknodat(
+                dir_fd.as_file_descriptor(),
+                &path_owned,
+                kind,
+                Mode::from_bits_retain(permissions.mode()),
+                device.into(),
+            )?;
+            Ok(())
+        }))
     }
 
     /// Create a device node using path syntax, which is equivalent to `mknod(2)`.
-    pub async fn mknod(
-        &self,
+    pub fn mknod<'a>(
+        &'a self,
         path: impl AsRef<Path>,
         kind: MknodType,
         permissions: Permissions,
-    ) -> io::Result<()> {
-        self.mknod_at(
-            &unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) },
-            path,
-            kind,
-            permissions,
-        )
-        .await
+    ) -> PendingIo<'a, io::Result<()>> {
+        self.mknod_at(&Self::AT_FDCWD, path, kind, permissions)
+    }
+
+    /// Cancel a pending io_uring operation.
+    pub(crate) fn cancel_uring(&self, id: u64) -> io::Result<()> {
+        let (tx, rx) = oneshot::channel();
+        assert!(
+            self.is_uring_operation_supported(opcode::AsyncCancel::CODE),
+            "async cancel is not supported"
+        );
+        self.send(Command::Cancel {
+            req: CancelRequest { id },
+            res: tx,
+        });
+        // Cannot use await here because we may not drop a processing cancel operation.
+        rx.recv().expect("uring completion channel dropped")?;
+        // Remove the operation from the pending map.
+        self.uring
+            .as_ref()
+            .expect("uring not supported, callers must ensure uring support first")
+            .pending
+            .remove(&id);
+        Ok(())
     }
 }

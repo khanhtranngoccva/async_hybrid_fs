@@ -79,12 +79,6 @@ pub(crate) struct IovecArray(pub(crate) Vec<iovec>);
 unsafe impl Send for IovecArray {}
 unsafe impl Sync for IovecArray {}
 
-impl IovecArray {
-    pub(crate) fn as_ptr(&self) -> *const iovec {
-        self.0.as_ptr()
-    }
-}
-
 impl Deref for IovecArray {
     type Target = [iovec];
     fn deref(&self) -> &Self::Target {
@@ -198,4 +192,8 @@ pub(crate) struct LinkAtRequest {
     pub(crate) new_dir_fd: RawFd,
     pub(crate) new_path: CString,
     pub(crate) flags: i32,
+}
+
+pub(crate) struct CancelRequest {
+    pub(crate) id: u64,
 }

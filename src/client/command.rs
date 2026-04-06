@@ -4,78 +4,99 @@ use super::requests::{
     StatxRequest, SymlinkAtRequest, SyncRequest, Target, UnlinkAtRequest, WriteRequest,
     WritevRequest,
 };
-use crate::metadata::Metadata;
+use crate::{client::requests::CancelRequest, metadata::Metadata};
 use io_uring::{opcode, squeue::Entry, types};
 use std::{io, os::fd::OwnedFd};
-use tokio::sync::oneshot;
+use tokio::sync::oneshot as oneshot_async;
 
 pub(crate) enum Command {
     Read {
         req: ReadRequest,
-        res: oneshot::Sender<io::Result<u32>>,
+        ack: Option<oneshot::Sender<u64>>,
+        res: oneshot_async::Sender<io::Result<u32>>,
     },
     Readv {
         req: ReadvRequest,
-        res: oneshot::Sender<io::Result<u32>>,
+        ack: Option<oneshot::Sender<u64>>,
+        res: oneshot_async::Sender<io::Result<u32>>,
     },
     Write {
         req: WriteRequest,
-        res: oneshot::Sender<io::Result<u32>>,
+        ack: Option<oneshot::Sender<u64>>,
+        res: oneshot_async::Sender<io::Result<u32>>,
     },
     Writev {
         req: WritevRequest,
-        res: oneshot::Sender<io::Result<u32>>,
+        ack: Option<oneshot::Sender<u64>>,
+        res: oneshot_async::Sender<io::Result<u32>>,
     },
     Sync {
         req: SyncRequest,
-        res: oneshot::Sender<io::Result<()>>,
+        ack: Option<oneshot::Sender<u64>>,
+        res: oneshot_async::Sender<io::Result<()>>,
     },
     Statx {
         req: StatxRequest,
-        res: oneshot::Sender<io::Result<Metadata>>,
+        ack: Option<oneshot::Sender<u64>>,
+        res: oneshot_async::Sender<io::Result<Metadata>>,
     },
     Fallocate {
         req: FallocateRequest,
-        res: oneshot::Sender<io::Result<()>>,
+        ack: Option<oneshot::Sender<u64>>,
+        res: oneshot_async::Sender<io::Result<()>>,
     },
     Fadvise {
         req: FadviseRequest,
-        res: oneshot::Sender<io::Result<()>>,
+        ack: Option<oneshot::Sender<u64>>,
+        res: oneshot_async::Sender<io::Result<()>>,
     },
     Ftruncate {
         req: FtruncateRequest,
-        res: oneshot::Sender<io::Result<()>>,
+        ack: Option<oneshot::Sender<u64>>,
+        res: oneshot_async::Sender<io::Result<()>>,
     },
     OpenAt {
         req: OpenAtRequest,
-        res: oneshot::Sender<io::Result<OwnedFd>>,
+        ack: Option<oneshot::Sender<u64>>,
+        res: oneshot_async::Sender<io::Result<OwnedFd>>,
     },
     StatxPath {
         req: StatxPathRequest,
-        res: oneshot::Sender<io::Result<Metadata>>,
+        ack: Option<oneshot::Sender<u64>>,
+        res: oneshot_async::Sender<io::Result<Metadata>>,
     },
     Close {
         req: CloseRequest,
-        res: oneshot::Sender<io::Result<()>>,
+        res: oneshot_async::Sender<io::Result<()>>,
     },
     RenameAt {
         req: RenameAtRequest,
-        res: oneshot::Sender<io::Result<()>>,
+        ack: Option<oneshot::Sender<u64>>,
+        res: oneshot_async::Sender<io::Result<()>>,
     },
     UnlinkAt {
         req: UnlinkAtRequest,
-        res: oneshot::Sender<io::Result<()>>,
+        ack: Option<oneshot::Sender<u64>>,
+        res: oneshot_async::Sender<io::Result<()>>,
     },
     MkdirAt {
         req: MkdirAtRequest,
-        res: oneshot::Sender<io::Result<()>>,
+        ack: Option<oneshot::Sender<u64>>,
+        res: oneshot_async::Sender<io::Result<()>>,
     },
     SymlinkAt {
         req: SymlinkAtRequest,
-        res: oneshot::Sender<io::Result<()>>,
+        ack: Option<oneshot::Sender<u64>>,
+        res: oneshot_async::Sender<io::Result<()>>,
     },
     LinkAt {
         req: LinkAtRequest,
+        ack: Option<oneshot::Sender<u64>>,
+        res: oneshot_async::Sender<io::Result<()>>,
+    },
+    Cancel {
+        req: CancelRequest,
+        // Cancel requests are synchronous to avoid the risk of it being dropped which may cause UB
         res: oneshot::Sender<io::Result<()>>,
     },
 }
@@ -113,7 +134,7 @@ macro_rules! build_op_fd_only {
 }
 
 #[inline]
-pub fn build_io_uring_entry(command: &Command, id: u64) -> Entry {
+pub(crate) fn build_io_uring_entry(command: &Command, id: u64) -> Entry {
     match &command {
         Command::Read { req, .. } => {
             build_op!(req.target, |fd| opcode::Read::new(
@@ -258,5 +279,30 @@ pub fn build_io_uring_entry(command: &Command, id: u64) -> Entry {
         .flags(req.flags)
         .build()
         .user_data(id),
+        Command::Cancel { req, .. } => opcode::AsyncCancel::new(req.id).build().user_data(id),
+    }
+}
+
+#[inline]
+pub(crate) fn take_command_ack(command: &mut Command) -> Option<oneshot::Sender<u64>> {
+    match command {
+        Command::Read { ack, .. } => ack.take(),
+        Command::Readv { ack, .. } => ack.take(),
+        Command::Write { ack, .. } => ack.take(),
+        Command::Writev { ack, .. } => ack.take(),
+        Command::Sync { ack, .. } => ack.take(),
+        Command::Statx { ack, .. } => ack.take(),
+        Command::Fallocate { ack, .. } => ack.take(),
+        Command::Fadvise { ack, .. } => ack.take(),
+        Command::Ftruncate { ack, .. } => ack.take(),
+        Command::OpenAt { ack, .. } => ack.take(),
+        Command::StatxPath { ack, .. } => ack.take(),
+        Command::Close { .. } => None,
+        Command::RenameAt { ack, .. } => ack.take(),
+        Command::UnlinkAt { ack, .. } => ack.take(),
+        Command::MkdirAt { ack, .. } => ack.take(),
+        Command::SymlinkAt { ack, .. } => ack.take(),
+        Command::LinkAt { ack, .. } => ack.take(),
+        Command::Cancel { .. } => None,
     }
 }

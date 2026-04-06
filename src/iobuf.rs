@@ -18,6 +18,7 @@
 
 use std::{
     io::{IoSlice, IoSliceMut},
+    mem::MaybeUninit,
     ops::{Deref, DerefMut},
 };
 
@@ -37,6 +38,10 @@ pub unsafe trait IoBuf: Send {
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
+    /// Returns a slice of the buffer with its original lifetime.
+    fn as_slice<'a>(&'a self) -> &'a [u8] {
+        unsafe { std::slice::from_raw_parts(self.as_ptr(), self.len()) }
+    }
 }
 
 /// A buffer that can be used for io_uring read operations.
@@ -51,6 +56,17 @@ pub unsafe trait IoBufMut: Send {
     fn as_mut_ptr(&mut self) -> *mut u8;
     /// Returns the buffer's total capacity (maximum bytes that can be read into it).
     fn capacity(&self) -> usize;
+    /// Returns a slice of the buffer including the uninitialized part. This can be cast back to a raw slice.
+    fn as_mut_slice_with_uninit<'a>(&'a mut self) -> &'a mut [MaybeUninit<u8>] {
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                self.as_mut_ptr() as *mut MaybeUninit<u8>,
+                self.capacity(),
+            )
+        }
+    }
+    /// Sets the length of the buffer. If the reported capacity is more than the length of the original buffer, underlying algorithms will try to fill with bytes past the original length, so this method must be implemented.
+    unsafe fn set_len(&mut self, len: usize);
 }
 
 // Implementations for Vec<u8>
@@ -71,6 +87,10 @@ unsafe impl IoBufMut for Vec<u8> {
 
     fn capacity(&self) -> usize {
         Vec::capacity(self)
+    }
+
+    unsafe fn set_len(&mut self, len: usize) {
+        unsafe { Vec::set_len(self, len) };
     }
 }
 
@@ -94,6 +114,10 @@ unsafe impl IoBufMut for Box<[u8]> {
         // Box<[u8]> has fixed size, capacity == len
         <[u8]>::len(self)
     }
+
+    unsafe fn set_len(&mut self, _len: usize) {
+        // Box<[u8]> has fixed size, capacity == len. Therefore, we do not need to do anything.
+    }
 }
 
 // Implementations for slices (allowing parity with std-like I/O APIs). These slices satisfy IoBuf and IoBufMut
@@ -116,6 +140,10 @@ unsafe impl IoBufMut for &mut [u8] {
     fn capacity(&self) -> usize {
         <[u8]>::len(self)
     }
+
+    unsafe fn set_len(&mut self, _len: usize) {
+        // &mut [u8] has fixed size, capacity == len. Therefore, we do not need to do anything.
+    }
 }
 
 unsafe impl<'buf> IoBuf for IoSlice<'buf> {
@@ -135,5 +163,9 @@ unsafe impl<'buf> IoBufMut for IoSliceMut<'buf> {
 
     fn capacity(&self) -> usize {
         self.deref().len()
+    }
+
+    unsafe fn set_len(&mut self, _len: usize) {
+        // IoSliceMut has fixed size, capacity == len. Therefore, we do not need to do anything.
     }
 }

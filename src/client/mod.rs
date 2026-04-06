@@ -1,6 +1,8 @@
 mod command;
 mod completion;
 mod operations;
+mod pending;
+pub(crate) mod pending_io;
 mod register;
 mod requests;
 
@@ -42,6 +44,7 @@ pub struct ClientUring {
     uring_cthread: JoinHandle<()>,
     registered_files: Arc<DashSet<u32>>,
     next_file_slot: Arc<AtomicU32>,
+    pending: Arc<DashMap<u64, Command>>,
     identity: Arc<()>,
 }
 
@@ -194,6 +197,7 @@ impl Client {
                 probe: probe,
                 uring_sthread: sthread,
                 uring_cthread: cthread,
+                pending,
                 registered_files: Arc::new(DashSet::new()),
                 identity: Arc::new(()),
                 next_file_slot: Arc::new(AtomicU32::new(0)),
@@ -220,6 +224,7 @@ fn submission_thread(
             self.done.store(true, Ordering::SeqCst);
         }
     }
+
     let _deferred_done = DeferredDone { done: done.clone() };
 
     // SAFETY: We ensure that the submission queue is only accessed from this single thread. The completion queue is accessed from a separate thread.
@@ -237,16 +242,17 @@ fn submission_thread(
         // - The buffer is shared between the kernel and userspace.
         // - There are atomic head and tail indices that allow them to be shared mutably between kernel and userspace safely.
         // - The Rust library we're using abstracts over this by caching the head and tail as local values. Once we've made our inserts, we update the atomic tail and then tell the kernel to consume some of the queue. When we update the atomic tail, we also check the atomic head and update our local cached value; some entries may have been consumed by the kernel in some other thread since we last checked and we may actually have more free space than we thought.
-        while let Some(command) = queue.pop_front() {
-            let io_uring_entry = 'entry_build: loop {
+        while let Some(mut command) = queue.pop_front() {
+            let (io_uring_entry, ack, id) = 'entry_build: loop {
                 let id = next_id;
                 next_id = next_id.wrapping_add(1);
 
                 let io_uring_entry = command::build_io_uring_entry(&command, id);
                 match pending.entry(id) {
                     dashmap::Entry::Vacant(pending_guard) => {
+                        let ack = command::take_command_ack(&mut command);
                         pending_guard.insert(command);
-                        break 'entry_build io_uring_entry;
+                        break 'entry_build (io_uring_entry, ack, id);
                     }
                     dashmap::Entry::Occupied(_) => {
                         continue 'entry_build;
@@ -265,6 +271,9 @@ fn submission_thread(
             submission.sync();
             // This is still necessary even with sqpoll, as our kernel thread may have gone to sleep.
             ring.submit().unwrap();
+            if let Some(ack) = ack {
+                ack.send(id).unwrap();
+            }
         }
     }
 }
@@ -282,6 +291,7 @@ fn completion_thread(
                 break;
             }
         }
+        // FIXME: This is a blocking call and we need to be able to interrupt this (use IORING_ENTER_EXT_ARG)
         let Some(e) = completion.next() else {
             ring.submitter()
                 .submit_and_wait(1)

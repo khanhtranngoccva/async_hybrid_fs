@@ -58,7 +58,7 @@ pub(crate) fn handle_completion(cmd: Command, result: i32) {
         Command::Sync { res, .. } => {
             let _ = res.send(result.map(|_| ()));
         }
-        Command::Statx { req, res } => {
+        Command::Statx { req, res, .. } => {
             let outcome = result.map(|_| {
                 // SAFETY: The kernel has initialized the statx buffer
                 let statx = unsafe { (*req.statx_buf).assume_init() };
@@ -82,7 +82,7 @@ pub(crate) fn handle_completion(cmd: Command, result: i32) {
             });
             let _ = res.send(outcome);
         }
-        Command::StatxPath { req, res } => {
+        Command::StatxPath { req, res, .. } => {
             let outcome = result.map(|_| {
                 // SAFETY: The kernel has initialized the statx buffer
                 let statx = unsafe { (*req.statx_buf).assume_init() };
@@ -106,6 +106,9 @@ pub(crate) fn handle_completion(cmd: Command, result: i32) {
             let _ = res.send(result.map(|_| ()));
         }
         Command::LinkAt { res, .. } => {
+            let _ = res.send(result.map(|_| ()));
+        }
+        Command::Cancel { res, .. } => {
             let _ = res.send(result.map(|_| ()));
         }
     }
