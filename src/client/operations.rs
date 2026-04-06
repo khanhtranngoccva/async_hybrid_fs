@@ -27,7 +27,7 @@ use crate::{
 use core::fmt;
 use io_uring::opcode;
 use nix::{
-    fcntl::{AtFlags, FallocateFlags, OFlag, PosixFadviseAdvice, RenameFlags},
+    fcntl::{AtFlags, FallocateFlags, FcntlArg, FdFlag, OFlag, PosixFadviseAdvice, RenameFlags},
     sys::{
         stat::{FchmodatFlags, Mode, UtimensatFlags},
         time::TimeSpec,
@@ -2000,6 +2000,102 @@ impl Client {
         permissions: Permissions,
     ) -> PendingIo<'a, io::Result<()>> {
         self.mknod_at(&Self::AT_FDCWD, path, kind, permissions)
+    }
+
+    /// Perform a `fcntl` syscall on a file descriptor, which is equivalent to `fcntl(2)`.
+    pub fn fcntl<'a>(
+        &'a self,
+        fd: &'a (impl UringTarget + Sync + ?Sized),
+        cmd: FcntlArg<'a>,
+    ) -> PendingIo<'a, io::Result<i32>> {
+        PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<i32> {
+            let res = nix::fcntl::fcntl(fd.as_file_descriptor(), cmd)?;
+            Ok(res)
+        }))
+    }
+
+    /// Set the status flags of a file descriptor, which is equivalent to `F_SETFL(2)`.
+    pub fn set_status_flags<'a>(
+        &'a self,
+        fd: &'a mut (impl UringTarget + Sync + Send + ?Sized),
+        flags: OFlag,
+    ) -> PendingIo<'a, io::Result<()>> {
+        self.fcntl(fd, FcntlArg::F_SETFL(flags))
+            .map(|r| r.map(|_| ()))
+    }
+
+    /// Get the status flags of a file descriptor, which is equivalent to `F_GETFL(2)`.
+    pub fn get_status_flags<'a>(
+        &'a self,
+        fd: &'a (impl UringTarget + Sync + ?Sized),
+    ) -> PendingIo<'a, io::Result<OFlag>> {
+        self.fcntl(fd, FcntlArg::F_GETFL)
+            .map(|r| r.map(|flags| OFlag::from_bits_retain(flags)))
+    }
+
+    /// Set the descriptor flags of a file descriptor, which is equivalent to `F_SETFD(2)`.
+    pub fn set_descriptor_flags<'a>(
+        &'a self,
+        fd: &'a mut (impl UringTarget + Sync + Send + ?Sized),
+        flags: FdFlag,
+    ) -> PendingIo<'a, io::Result<()>> {
+        self.fcntl(fd, FcntlArg::F_SETFD(flags))
+            .map(|r| r.map(|_| ()))
+    }
+
+    /// Get the descriptor flags of a file descriptor, which is equivalent to `F_GETFD(2)`.
+    pub fn get_descriptor_flags<'a>(
+        &'a self,
+        fd: &'a (impl UringTarget + Sync + ?Sized),
+    ) -> PendingIo<'a, io::Result<FdFlag>> {
+        self.fcntl(fd, FcntlArg::F_GETFD)
+            .map(|r| r.map(|flags| FdFlag::from_bits_retain(flags)))
+    }
+
+    /// Set the nonblocking status flag of a file descriptor.
+    pub async fn set_nonblocking<'a>(
+        &'a self,
+        fd: &'a mut (impl UringTarget + Sync + Send + ?Sized),
+        nonblocking: bool,
+    ) -> io::Result<()> {
+        let old_flags = self
+            .get_status_flags(fd)
+            .completion()
+            .expect("no completion future returned")
+            .await?;
+        let new_flags = if nonblocking {
+            old_flags | OFlag::O_NONBLOCK
+        } else {
+            old_flags & !OFlag::O_NONBLOCK
+        };
+        self.set_status_flags(fd, new_flags)
+            .completion()
+            .expect("no completion future returned")
+            .await?;
+        Ok(())
+    }
+
+    /// Set the close-on-exec descriptor flag of a file descriptor.
+    pub async fn set_close_on_exec<'a>(
+        &'a self,
+        fd: &'a mut (impl UringTarget + Sync + Send + ?Sized),
+        close_on_exec: bool,
+    ) -> io::Result<()> {
+        let old_flags = self
+            .get_descriptor_flags(fd)
+            .completion()
+            .expect("no completion future returned")
+            .await?;
+        let new_flags = if close_on_exec {
+            old_flags | FdFlag::FD_CLOEXEC
+        } else {
+            old_flags & !FdFlag::FD_CLOEXEC
+        };
+        self.set_descriptor_flags(fd, new_flags)
+            .completion()
+            .expect("no completion future returned")
+            .await?;
+        Ok(())
     }
 
     /// Cancel a pending io_uring operation.

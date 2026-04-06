@@ -39,6 +39,8 @@ mod runtime;
 
 use crate::client::pending_io::fixed_value::FixedValuePendingIo;
 use nix::fcntl::AT_FDCWD;
+use nix::fcntl::FdFlag;
+use nix::fcntl::OFlag;
 use nix::fcntl::RenameFlags;
 use nix::sys::time::TimeSpec;
 use nix::unistd::LinkatFlags;
@@ -498,6 +500,68 @@ pub trait HybridFile: UringTarget + Sync {
     /// Alias for [`HybridFile::sync_data`].
     fn hybrid_sync_data<'a>(&'a self) -> PendingIo<'a, io::Result<()>> {
         default_client().sync_data(self)
+    }
+
+    #[inline]
+    async fn set_nonblocking(&mut self, nonblocking: bool) -> io::Result<()> {
+        self.hybrid_set_nonblocking(nonblocking).await
+    }
+
+    /// Alias for [`HybridFd::set_nonblocking`].
+    async fn hybrid_set_nonblocking(&mut self, nonblocking: bool) -> io::Result<()> {
+        default_client().set_nonblocking(self, nonblocking).await
+    }
+
+    #[inline]
+    async fn get_status_flags(&mut self) -> io::Result<OFlag> {
+        self.hybrid_get_status_flags().await
+    }
+
+    /// Alias for [`HybridFd::get_flags`].
+    async fn hybrid_get_status_flags(&mut self) -> io::Result<OFlag> {
+        default_client().get_status_flags(self).await
+    }
+
+    #[inline]
+    async fn set_status_flags(&mut self, flags: OFlag) -> io::Result<()> {
+        self.hybrid_set_status_flags(flags).await
+    }
+
+    /// Alias for [`HybridFd::set_flags`].
+    async fn hybrid_set_status_flags(&mut self, flags: OFlag) -> io::Result<()> {
+        default_client().set_status_flags(self, flags).await
+    }
+
+    #[inline]
+    async fn get_descriptor_flags(&mut self) -> io::Result<FdFlag> {
+        self.hybrid_get_descriptor_flags().await
+    }
+
+    /// Alias for [`HybridFd::get_descriptor_flags`].
+    async fn hybrid_get_descriptor_flags(&mut self) -> io::Result<FdFlag> {
+        default_client().get_descriptor_flags(self).await
+    }
+
+    #[inline]
+    async fn set_descriptor_flags(&mut self, flags: FdFlag) -> io::Result<()> {
+        self.hybrid_set_descriptor_flags(flags).await
+    }
+
+    /// Alias for [`HybridFd::set_descriptor_flags`].
+    async fn hybrid_set_descriptor_flags(&mut self, flags: FdFlag) -> io::Result<()> {
+        default_client().set_descriptor_flags(self, flags).await
+    }
+
+    #[inline]
+    async fn set_close_on_exec(&mut self, close_on_exec: bool) -> io::Result<()> {
+        self.hybrid_set_close_on_exec(close_on_exec).await
+    }
+
+    /// Alias for [`HybridFd::set_close_on_exec`].
+    async fn hybrid_set_close_on_exec(&mut self, close_on_exec: bool) -> io::Result<()> {
+        default_client()
+            .set_close_on_exec(self, close_on_exec)
+            .await
     }
 
     /// Register a file for use with the global io_uring instance.
