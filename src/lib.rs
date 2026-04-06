@@ -376,7 +376,7 @@ pub trait HybridSeek: UringTarget + Sync + Send {
 }
 
 #[async_trait::async_trait]
-pub trait HybridFile: UringTarget + Sync {
+pub trait HybridFile: UringTarget + Sync + Send {
     fn close<'a>(self) -> PendingIo<'a, io::Result<()>>
     where
         Self: IntoRawFd + Sized + Send + 'a,
@@ -513,43 +513,46 @@ pub trait HybridFile: UringTarget + Sync {
     }
 
     #[inline]
-    async fn get_status_flags(&mut self) -> io::Result<OFlag> {
-        self.hybrid_get_status_flags().await
+    fn get_status_flags<'a>(&'a mut self) -> PendingIo<'a, io::Result<OFlag>> {
+        self.hybrid_get_status_flags()
     }
 
     /// Alias for [`HybridFd::get_flags`].
-    async fn hybrid_get_status_flags(&mut self) -> io::Result<OFlag> {
-        default_client().get_status_flags(self).await
+    fn hybrid_get_status_flags<'a>(&'a mut self) -> PendingIo<'a, io::Result<OFlag>> {
+        default_client().get_status_flags(self)
     }
 
     #[inline]
-    async fn set_status_flags(&mut self, flags: OFlag) -> io::Result<()> {
-        self.hybrid_set_status_flags(flags).await
+    fn set_status_flags<'a>(&'a mut self, flags: OFlag) -> PendingIo<'a, io::Result<()>> {
+        self.hybrid_set_status_flags(flags)
     }
 
     /// Alias for [`HybridFd::set_flags`].
-    async fn hybrid_set_status_flags(&mut self, flags: OFlag) -> io::Result<()> {
-        default_client().set_status_flags(self, flags).await
+    fn hybrid_set_status_flags<'a>(&'a mut self, flags: OFlag) -> PendingIo<'a, io::Result<()>> {
+        default_client().set_status_flags(self, flags)
     }
 
     #[inline]
-    async fn get_descriptor_flags(&mut self) -> io::Result<FdFlag> {
-        self.hybrid_get_descriptor_flags().await
+    fn get_descriptor_flags<'a>(&'a mut self) -> PendingIo<'a, io::Result<FdFlag>> {
+        self.hybrid_get_descriptor_flags()
     }
 
     /// Alias for [`HybridFd::get_descriptor_flags`].
-    async fn hybrid_get_descriptor_flags(&mut self) -> io::Result<FdFlag> {
-        default_client().get_descriptor_flags(self).await
+    fn hybrid_get_descriptor_flags<'a>(&'a mut self) -> PendingIo<'a, io::Result<FdFlag>> {
+        default_client().get_descriptor_flags(self)
     }
 
     #[inline]
-    async fn set_descriptor_flags(&mut self, flags: FdFlag) -> io::Result<()> {
-        self.hybrid_set_descriptor_flags(flags).await
+    fn set_descriptor_flags<'a>(&'a mut self, flags: FdFlag) -> PendingIo<'a, io::Result<()>> {
+        self.hybrid_set_descriptor_flags(flags)
     }
 
     /// Alias for [`HybridFd::set_descriptor_flags`].
-    async fn hybrid_set_descriptor_flags(&mut self, flags: FdFlag) -> io::Result<()> {
-        default_client().set_descriptor_flags(self, flags).await
+    fn hybrid_set_descriptor_flags<'a>(
+        &'a mut self,
+        flags: FdFlag,
+    ) -> PendingIo<'a, io::Result<()>> {
+        default_client().set_descriptor_flags(self, flags)
     }
 
     #[inline]
