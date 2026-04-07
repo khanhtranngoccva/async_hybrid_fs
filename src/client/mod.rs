@@ -270,7 +270,7 @@ fn submission_thread(
             // This is still necessary even with sqpoll, as our kernel thread may have gone to sleep.
             ring.submit().unwrap();
             if let Some(ack) = ack {
-                ack.send(id).unwrap();
+                let _ = ack.send(id);
             }
         }
     }

@@ -42,6 +42,7 @@ dependencies = [
  "io-uring",
  "lazy_static",
  "libc",
+ "log",
  "nix",
  "oneshot",
  "tempfile",
