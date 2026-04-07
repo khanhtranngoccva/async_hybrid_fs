@@ -325,3 +325,15 @@ where
         self.as_fd()
     }
 }
+
+pub type BoxedUringTarget<'a> = Box<dyn UringTarget + Send + Sync + 'a>;
+
+impl<'a> UringTarget for BoxedUringTarget<'a> {
+    unsafe fn as_target(&self, _uring_identity: &Arc<()>) -> Target {
+        unsafe { self.as_ref().as_target(_uring_identity) }
+    }
+
+    fn as_file_descriptor(&self) -> BorrowedFd<'_> {
+        self.as_ref().as_file_descriptor()
+    }
+}
