@@ -9,11 +9,12 @@ mod requests;
 use std::collections::VecDeque;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::thread::JoinHandle;
 use std::{io, thread};
 
 use command::Command;
+use crossbeam_channel::TryRecvError;
 use dashmap::{DashMap, DashSet};
 use io_uring::IoUring;
 use io_uring::cqueue::Entry as CEntry;
@@ -175,18 +176,16 @@ impl Client {
             let _ = ring.submitter().register_files_sparse(MAX_REGISTERED_FILES);
             let ring = Arc::new(ring);
             let (sender, receiver) = crossbeam_channel::unbounded::<Command>();
-            let done = Arc::new(AtomicBool::new(false));
+            let (wait_permit_tx, wait_permit_rx) = crossbeam_channel::unbounded::<()>();
             let sthread = thread::spawn({
                 let pending = pending.clone();
                 let ring = ring.clone();
-                let done = done.clone();
-                move || submission_thread(ring, pending, receiver, done)
+                move || submission_thread(ring, pending, receiver, wait_permit_tx)
             });
             let cthread = thread::spawn({
                 let pending = pending.clone();
                 let ring = ring.clone();
-                let done = done.clone();
-                move || completion_thread(ring, pending, done)
+                move || completion_thread(ring, pending, wait_permit_rx)
             });
             let mut probe = io_uring::Probe::new();
             ring.submitter().register_probe(&mut probe)?;
@@ -210,25 +209,38 @@ fn submission_thread(
     ring: Arc<IoUring>,
     pending: Arc<DashMap<u64, Command>>,
     receiver: crossbeam_channel::Receiver<Command>,
-    done: Arc<AtomicBool>,
+    wait_permit_tx: crossbeam_channel::Sender<()>,
 ) {
-    // Panic-safe defer for the done flag.
-    struct DeferredDone {
-        done: Arc<AtomicBool>,
-    }
-
-    impl Drop for DeferredDone {
-        fn drop(&mut self) {
-            self.done.store(true, Ordering::SeqCst);
-        }
-    }
-
-    let _deferred_done = DeferredDone { done: done.clone() };
-
     // SAFETY: We ensure that the submission queue is only accessed from this single thread. The completion queue is accessed from a separate thread.
     let mut submission = unsafe { ring.submission_shared() };
     let mut next_id = 0u64;
     let mut queue = VecDeque::new();
+
+    // Structure that allows entry removal from the pending map during a panic unwind.
+    struct PendingEntryGuard {
+        pending: Arc<DashMap<u64, Command>>,
+        id: u64,
+        armed: bool,
+    }
+    impl PendingEntryGuard {
+        fn new(pending: Arc<DashMap<u64, Command>>, id: u64) -> Self {
+            Self {
+                pending,
+                id,
+                armed: true,
+            }
+        }
+        fn disarm(&mut self) {
+            self.armed = false;
+        }
+    }
+    impl Drop for PendingEntryGuard {
+        fn drop(&mut self) {
+            if self.armed {
+                self.pending.remove(&self.id);
+            }
+        }
+    }
 
     while let Ok(command) = receiver.recv() {
         queue.push_back(command);
@@ -241,7 +253,10 @@ fn submission_thread(
         // - There are atomic head and tail indices that allow them to be shared mutably between kernel and userspace safely.
         // - The Rust library we're using abstracts over this by caching the head and tail as local values. Once we've made our inserts, we update the atomic tail and then tell the kernel to consume some of the queue. When we update the atomic tail, we also check the atomic head and update our local cached value; some entries may have been consumed by the kernel in some other thread since we last checked and we may actually have more free space than we thought.
         while let Some(mut command) = queue.pop_front() {
-            let (io_uring_entry, ack, id) = 'entry_build: loop {
+            if submission.is_full() {
+                ring.submit_and_wait(1).expect("failed to submit to ring");
+            }
+            let (io_uring_entry, ack, id, mut guard) = 'entry_build: loop {
                 let id = next_id;
                 next_id = next_id.wrapping_add(1);
 
@@ -250,16 +265,14 @@ fn submission_thread(
                     dashmap::Entry::Vacant(pending_guard) => {
                         let ack = command::take_command_ack(&mut command);
                         pending_guard.insert(command);
-                        break 'entry_build (io_uring_entry, ack, id);
+                        let guard = PendingEntryGuard::new(pending.clone(), id);
+                        break 'entry_build (io_uring_entry, ack, id, guard);
                     }
                     dashmap::Entry::Occupied(_) => {
                         continue 'entry_build;
                     }
                 }
             };
-            if submission.is_full() {
-                ring.submit_and_wait(1).expect("failed to submit to ring");
-            }
             // SAFETY: The submission entry references memory owned by the caller's future, which is awaiting completion.
             unsafe {
                 submission
@@ -269,9 +282,16 @@ fn submission_thread(
             submission.sync();
             // This is still necessary even with sqpoll, as our kernel thread may have gone to sleep.
             ring.submit().unwrap();
+            // Only commit the pending entry guard after the submission is successful.
+            guard.disarm();
+            // Send the operation ID to the pending I/O object to allow it to be cancelled.
             if let Some(ack) = ack {
                 let _ = ack.send(id);
             }
+            // Send a wait permit to the completion thread to indicate that it can now perform a blocking read of the next completion entry.
+            wait_permit_tx
+                .send(())
+                .expect("completion thread must wait until submission thread exits");
         }
     }
 }
@@ -279,29 +299,55 @@ fn submission_thread(
 fn completion_thread(
     ring: Arc<IoUring>,
     pending: Arc<DashMap<u64, Command>>,
-    submission_thread_done: Arc<AtomicBool>,
+    wait_permit_rx: crossbeam_channel::Receiver<()>,
 ) {
     let mut completion = unsafe { ring.completion_shared() };
+    // This flag marks that the submission thread has terminated and we should drain all remaining operations in the pending map until it is empty.
+    let mut submission_thread_terminated = false;
     loop {
-        if submission_thread_done.load(Ordering::SeqCst) {
-            // If the submission thread is done, the pending map belongs exclusively to this thread, no races are possible.
-            if pending.is_empty() {
-                break;
+        if submission_thread_terminated && pending.is_empty() {
+            break;
+        }
+        let mut wait_permits = 1u64;
+        if !submission_thread_terminated {
+            // The completion thread relies on the submission thread to send us a message that an operation has to be completed.
+            match wait_permit_rx.recv() {
+                Ok(()) => {
+                    if wait_permits < 65536 {
+                        // Try to batch more wait permits.
+                        match wait_permit_rx.try_recv() {
+                            Ok(()) => wait_permits += 1,
+                            Err(TryRecvError::Empty) => {}
+                            Err(TryRecvError::Disconnected) => {
+                                submission_thread_terminated = true;
+                                continue;
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    submission_thread_terminated = true;
+                    continue;
+                }
             }
         }
-        // FIXME: This is a blocking call and we need to be able to interrupt this (use IORING_ENTER_EXT_ARG)
-        let Some(e) = completion.next() else {
-            ring.submitter()
-                .submit_and_wait(1)
-                .expect("failed to wait for completion");
-            completion.sync();
-            continue;
-        };
-        let id = e.user_data();
-        let (_, req) = pending
-            .remove(&id)
-            .expect("completion for unknown request id");
-        completion::handle_completion(req, e.result());
+        for _ in 0..wait_permits {
+            // Blocking with io_uring_enter is OK now, since the submission thread permits a wait.
+            let Some(e) = completion.next() else {
+                log::debug!("no completion found, submitting and waiting");
+                ring.submitter()
+                    .submit_and_wait(1)
+                    .expect("failed to wait for completion");
+                log::debug!("exiting wait");
+                completion.sync();
+                continue;
+            };
+            let id = e.user_data();
+            let (_, req) = pending
+                .remove(&id)
+                .expect("completion for unknown request id");
+            completion::handle_completion(req, e.result());
+        }
     }
 }
 
@@ -335,5 +381,17 @@ impl<'a> UringTarget for BoxedUringTarget<'a> {
 
     fn as_file_descriptor(&self) -> BorrowedFd<'_> {
         self.as_ref().as_file_descriptor()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Client, UringCfg};
+
+    #[tokio::test]
+    #[test_log::test]
+    async fn client_should_drop() {
+        let client = Client::build(UringCfg::default()).expect("failed to build client");
+        drop(client);
     }
 }
