@@ -1,9 +1,7 @@
 macro_rules! uring_cancel_impl {
     ($item:expr) => {{
-        if $item.ack_tx.is_some() {
-            // Operation has not been submitted yet, we can safely return
-            return None;
-        }
+        assert!($item.ack_tx.is_none(), "operation must have been converted into a Command and submitted");
+        assert!($item.result_tx.is_none(), "operation must have been converted into a Command and submitted");
         if $item.completion_state.is_none() {
             // There is nothing to cancel, the operation is already done or cancelled
             return None;
