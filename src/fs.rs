@@ -350,6 +350,10 @@ pub fn metadata(path: impl AsRef<Path>) -> PendingIo<'static, io::Result<Metadat
     default::default_client().metadata_path(path)
 }
 
+pub fn symlink_metadata(path: impl AsRef<Path>) -> PendingIo<'static, io::Result<Metadata>> {
+    default::default_client().symlink_metadata_path(path)
+}
+
 pub async fn read_dir(path: impl AsRef<Path>) -> io::Result<tokio::fs::ReadDir> {
     // FIXME: This function depends on tokio
     tokio::fs::read_dir(path).await
