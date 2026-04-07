@@ -31,3 +31,90 @@ pub(crate) trait UringPendingIo<T>: PendingIoImpl<T> {
     /// The command must also not outlive the [`UringPendingIo`] structure.
     unsafe fn build_command(&mut self) -> Command;
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::{HybridRead, default_client};
+    use std::{io::pipe, os::fd::AsFd, time::Duration};
+    use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    #[test_log::test]
+    async fn uring_future_should_multiplex_with_cancel_token() {
+        if !default_client().is_uring_available_and_active() {
+            println!("uring is not available, skipping test");
+        }
+        let (tx, rx) = oneshot::channel::<()>();
+        let cancellation_token = CancellationToken::new();
+        let join_handle = tokio::task::spawn({
+            let cancellation_token = cancellation_token.clone();
+            async move {
+                let (pipe_read, _pipe_write) = pipe().expect("should be able to create a pipe");
+                let mut buf = [0; 64];
+                let mut pipe_read_fd = pipe_read.as_fd();
+                let mut pending_io = pipe_read_fd.hybrid_read(&mut buf).map(|_| {
+                    let _ = tx.send(());
+                });
+                let future = pending_io
+                    .completion()
+                    .expect("future should not be cancelled");
+                tokio::select! {
+                    _ = future => {
+                        panic!("future should not be completable because the pipe writer is not used")
+                    },
+                    _ = cancellation_token.cancelled() => {
+                        log::info!("cancellation token cancelled");
+                        assert!(
+                            pending_io.cancel().await.is_none(),
+                            "pipe operation should be cancellable because the writer has not sent anything"
+                        );
+                    }
+                };
+            }
+        });
+        cancellation_token.cancel();
+        join_handle.await.expect("task should not panic");
+        rx.recv().expect_err(
+            "should not be able to receive a message because the processor code should not run",
+        );
+    }
+
+    #[tokio::test]
+    #[test_log::test]
+    async fn uring_future_should_multiplex_with_timeout() {
+        if !default_client().is_uring_available_and_active() {
+            println!("uring is not available, skipping test");
+        }
+        let (tx, rx) = oneshot::channel::<()>();
+        let join_handle = tokio::task::spawn({
+            async move {
+                let (pipe_read, _pipe_write) = pipe().expect("should be able to create a pipe");
+                let mut buf = [0; 64];
+                let mut pipe_read_fd = pipe_read.as_fd();
+                let mut pending_io = pipe_read_fd.hybrid_read(&mut buf).map(|_| {
+                    let _ = tx.send(());
+                });
+                let future = pending_io
+                    .completion()
+                    .expect("future should not be cancelled");
+                let timeout = tokio::time::sleep(Duration::from_secs_f64(0.5));
+                tokio::select! {
+                    _ = future => {
+                        panic!("future should not be completable because the pipe writer is not used")
+                    },
+                    _ = timeout => {
+                        log::info!("successfully timed out");
+                        assert!(
+                            pending_io.cancel().await.is_none(),
+                            "pipe operation should be cancellable because the writer has not sent anything"
+                        );
+                    }
+                };
+            }
+        });
+        join_handle.await.expect("task should not panic");
+        rx.recv().expect_err(
+            "should not be able to receive a message because the processor code should not run",
+        );
+    }
+}
