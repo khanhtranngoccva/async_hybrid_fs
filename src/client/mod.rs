@@ -334,11 +334,9 @@ fn completion_thread(
         for _ in 0..wait_permits {
             // Blocking with io_uring_enter is OK now, since the submission thread permits a wait.
             let Some(e) = completion.next() else {
-                log::debug!("no completion found, submitting and waiting");
                 ring.submitter()
                     .submit_and_wait(1)
                     .expect("failed to wait for completion");
-                log::debug!("exiting wait");
                 completion.sync();
                 continue;
             };
