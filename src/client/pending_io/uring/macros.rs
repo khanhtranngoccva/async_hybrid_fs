@@ -22,8 +22,9 @@ macro_rules! uring_cancel_impl {
         $item.cancel_done = true;
         match res {
             Ok(_) => {
-                // Remove the channel to avoid the need to wait.
-                $item.completion_state = None;
+                // Await the future to ensure that the operation completely ends.
+                // The result can be ignored because it is always ECANCELED
+                let _ = $item._completion()?.await;
                 None
             }
             // Assertion: the operation is done. However, the completion thread has not sent the completion event yet for some reason, so we still need to wait.
