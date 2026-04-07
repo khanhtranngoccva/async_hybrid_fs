@@ -332,13 +332,16 @@ fn completion_thread(
             }
         }
         for _ in 0..wait_permits {
-            // Blocking with io_uring_enter is OK now, since the submission thread permits a wait.
-            let Some(e) = completion.next() else {
-                ring.submitter()
-                    .submit_and_wait(1)
-                    .expect("failed to wait for completion");
-                completion.sync();
-                continue;
+            // Blocking and looping with io_uring_enter is OK now, since the submission thread permits a wait.
+            let e = loop {
+                let Some(entry) = completion.next() else {
+                    ring.submitter()
+                        .submit_and_wait(1)
+                        .expect("failed to wait for completion");
+                    completion.sync();
+                    continue;
+                };
+                break entry;
             };
             let id = e.user_data();
             let (_, req) = pending
