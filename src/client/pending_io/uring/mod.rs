@@ -34,8 +34,12 @@ pub(crate) trait UringPendingIo<T>: PendingIoImpl<T> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{HybridFile, HybridRead, default_client};
-    use std::{io::pipe, os::fd::AsFd, time::Duration};
+    use crate::{
+        HybridFile, HybridRead, PendingIo, client::pending_io::uring::read_into::UringReadIntoAt,
+        default_client,
+    };
+    use std::{io::pipe, os::fd::AsFd, time::Duration, u64};
+    use tokio::runtime::{Handle, RuntimeFlavor};
     use tokio_util::sync::CancellationToken;
 
     #[tokio::test]
@@ -161,5 +165,25 @@ mod tests {
         rx.recv().expect_err(
             "should not be able to receive a message because the processor code should not run",
         );
+    }
+
+    #[tokio::test]
+    #[test_log::test]
+    async fn uring_future_should_be_able_to_drop_on_single_thread_runtime() {
+        let handle = Handle::current();
+        assert!(handle.runtime_flavor() == RuntimeFlavor::CurrentThread);
+        let client = default_client();
+        if !client.is_uring_available_and_active() {
+            println!("uring is not available, skipping test");
+        }
+        let (pipe_read, _pipe_write) = pipe().expect("should be able to create a pipe");
+        let mut buf = [0u8; 64];
+        let pending_io = PendingIo::new(UringReadIntoAt::new(
+            &client,
+            &pipe_read,
+            buf.as_mut_slice(),
+            u64::MAX,
+        ));
+        drop(pending_io);
     }
 }

@@ -127,3 +127,37 @@ where
         runtime::execute_future_from_sync(self._cancel());
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+
+    use crate::HybridWrite;
+
+    use super::TokioScopedPendingIo;
+    use std::{
+        io::{self, pipe},
+        os::fd::AsFd,
+    };
+
+    #[tokio::test]
+    #[test_log::test]
+    async fn single_thread_runtime_should_be_able_to_drop_pending_io() {
+        let handle = Handle::current();
+        assert!(handle.runtime_flavor() == RuntimeFlavor::CurrentThread);
+        let (tx, rx) = oneshot::channel::<()>();
+        let (pipe_read, mut pipe_write) = pipe().expect("should be able to create a pipe");
+        let pending_io = TokioScopedPendingIo::new(move || -> io::Result<()> {
+            let mut buf = [0; 64];
+            nix::unistd::read(pipe_read.as_fd(), &mut buf)?;
+            let _ = tx.send(());
+            Ok(())
+        });
+        pipe_write
+            .write_all(b"test")
+            .await
+            .expect("should be able to write to pipe to allow completion");
+        drop(pending_io);
+        assert!(rx.recv().is_ok());
+    }
+}
