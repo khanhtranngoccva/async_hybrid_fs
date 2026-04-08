@@ -1861,7 +1861,7 @@ impl Client {
             path,
             uid,
             gid,
-            FchownatFlags::AT_SYMLINK_FOLLOW | FchownatFlags::AT_EMPTY_PATH,
+            FchownatFlags::AT_EMPTY_PATH,
         )
     }
 
@@ -1877,7 +1877,7 @@ impl Client {
             path,
             uid,
             gid,
-            FchownatFlags::AT_SYMLINK_NOFOLLOW | FchownatFlags::AT_EMPTY_PATH,
+            FchownatFlags::AT_EMPTY_PATH | FchownatFlags::AT_SYMLINK_NOFOLLOW,
         )
     }
 
