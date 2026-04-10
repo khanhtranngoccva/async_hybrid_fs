@@ -6,14 +6,17 @@ This crate aims to enhance performance for asynchronous I/O operations by levera
 
 Unlike other `io_uring` crates which primarily target servers, this library is primarily targeted at applications that can benefit from fewer syscalls and run on end-user/consumer devices like a custom filesystem, on which support for `io_uring` is not guaranteed or `io_uring` is restricted by policy.
 
-## Comparison with original library
+## Features and comparison
 - This crate is directly based on the `uring_file`(https://docs.rs/uring-file/latest/uring_file) crate by [wilsonzlin](https://github.com/wilsonzlin), but with some breaking modifications:
     - Features a more complete set of filesystem APIs, which is a superset of [`std::fs`]. This includes abstractions for race-free APIs like the "*at" syscall family, as well as the vectored I/O APIs.
     - Dynamically detects whether `io_uring` is available on the system supported for the operation, and falls back to the async runtime's methods when it is not.
     - Registered files types use safe implementations and are dropped when out of scope.
+- Certain requests return atomic pending I/O primitives.
+    - They can be cancelled by explicitly calling the cancel() method. If cancellation is not possible, this method will return the completion result. 
+    - These requests are also safe to drop, but they are not directly pollable by default to prevent missed completions when they are multiplexed with other futures.
 
 ## Limitations
-- This crate prioritizes ease of use, API completeness and compatibility with end-user devices over raw throughput.
+- This crate prioritizes ease of use, API completeness, liveness, safety, and compatibility with end-user devices over raw throughput.
 - The interface provided by this crate may not be identical to `std::fs`. 
 
 ## Credits
