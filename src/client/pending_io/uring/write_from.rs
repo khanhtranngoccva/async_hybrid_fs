@@ -2,10 +2,10 @@ use super::UringPendingIo;
 use super::macros;
 use crate::runtime;
 use crate::{
-    Client, UringTarget,
+    ClientUring, UringTarget,
     client::{
-        command::Command, completion::WriteResult, pending_io::PendingIoImpl,
-        requests::WriteRequest,
+        command::Command, completion::WriteResult, pending_io::{PendingIoDebuggingEvent, PendingIoImpl},
+        requests::WriteRequest, ticketing::SubmissionTicketId,
     },
     iobuf::IoBuf,
 };
@@ -110,15 +110,15 @@ where
     /// Offset to write to.
     offset: u64,
     /// Channel for sending operation IDs.
-    ack_tx: Option<oneshot::Sender<u64>>,
+    ack_tx: Option<oneshot::Sender<SubmissionTicketId>>,
     /// Channel for receiving confirmation that the operation has been submitted. The ID must be received before the operation could be cancelled; otherwise, the future might drop before the operation even starts, leading to an operation with dangling pointers. We do not need the ID for any other purpose.
-    ack_rx: Option<oneshot::Receiver<u64>>,
+    ack_rx: Option<oneshot::Receiver<SubmissionTicketId>>,
     /// Channel for sending operation results.
     result_tx: Option<oneshot_async::Sender<io::Result<u32>>>,
     /// Client to use for submitting the operation and cancelling it.
-    client: &'a Client,
+    client: &'a ClientUring,
     /// Cancellation ID.
-    cancellation: Option<u64>,
+    cancellation: Option<SubmissionTicketId>,
     /// Whether cancellation is acknowledged.
     // The reason for an extra field is that the cancel_uring method may not be called twice.
     cancel_done: bool,
@@ -157,12 +157,12 @@ where
     Target: UringTarget + Sync + ?Sized,
     Buf: IoBuf,
 {
-    pub(crate) fn new(client: &'a Client, target: &'a Target, buf: Buf, offset: u64) -> Self {
+    pub(crate) fn new(uring: &'a ClientUring, target: &'a Target, buf: Buf, offset: u64, debug_event_tx: Option<tokio::sync::mpsc::UnboundedSender<PendingIoDebuggingEvent>>) -> Self {
         let (ack_tx, ack_rx) = oneshot::channel();
         let (result_tx, result_rx) = oneshot_async::channel();
         let mut op = Self {
             target,
-            identity: &client.uring.as_ref().expect("uring must be Some").identity,
+            identity: &uring.identity,
             completion_state: Some(CompletionState {
                 buf,
                 result_rx: result_rx,
@@ -171,12 +171,12 @@ where
             ack_rx: Some(ack_rx),
             ack_tx: Some(ack_tx),
             result_tx: Some(result_tx),
-            client,
+            client: uring,
             cancellation: None,
             cancel_done: false,
         };
         let command = unsafe { op.build_command() };
-        client.send(command);
+        uring.send(command, debug_event_tx);
         op
     }
 }

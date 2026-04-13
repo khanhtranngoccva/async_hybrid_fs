@@ -4,7 +4,13 @@ use super::requests::{
     StatxRequest, SymlinkAtRequest, SyncRequest, Target, UnlinkAtRequest, WriteRequest,
     WritevRequest,
 };
-use crate::{client::requests::CancelRequest, metadata::Metadata};
+use crate::{
+    client::{
+        requests::CancelRequest,
+        ticketing::{SubmissionTicket, SubmissionTicketId},
+    },
+    metadata::Metadata,
+};
 use io_uring::{opcode, squeue::Entry, types};
 use std::{io, os::fd::OwnedFd};
 use tokio::sync::oneshot as oneshot_async;
@@ -13,57 +19,57 @@ use tokio::sync::oneshot as oneshot_async;
 pub(crate) enum Command {
     Read {
         req: ReadRequest,
-        ack: Option<oneshot::Sender<u64>>,
+        ack: Option<oneshot::Sender<SubmissionTicketId>>,
         res: oneshot_async::Sender<io::Result<u32>>,
     },
     Readv {
         req: ReadvRequest,
-        ack: Option<oneshot::Sender<u64>>,
+        ack: Option<oneshot::Sender<SubmissionTicketId>>,
         res: oneshot_async::Sender<io::Result<u32>>,
     },
     Write {
         req: WriteRequest,
-        ack: Option<oneshot::Sender<u64>>,
+        ack: Option<oneshot::Sender<SubmissionTicketId>>,
         res: oneshot_async::Sender<io::Result<u32>>,
     },
     Writev {
         req: WritevRequest,
-        ack: Option<oneshot::Sender<u64>>,
+        ack: Option<oneshot::Sender<SubmissionTicketId>>,
         res: oneshot_async::Sender<io::Result<u32>>,
     },
     Sync {
         req: SyncRequest,
-        ack: Option<oneshot::Sender<u64>>,
+        ack: Option<oneshot::Sender<SubmissionTicketId>>,
         res: oneshot_async::Sender<io::Result<()>>,
     },
     Statx {
         req: StatxRequest,
-        ack: Option<oneshot::Sender<u64>>,
+        ack: Option<oneshot::Sender<SubmissionTicketId>>,
         res: oneshot_async::Sender<io::Result<Metadata>>,
     },
     Fallocate {
         req: FallocateRequest,
-        ack: Option<oneshot::Sender<u64>>,
+        ack: Option<oneshot::Sender<SubmissionTicketId>>,
         res: oneshot_async::Sender<io::Result<()>>,
     },
     Fadvise {
         req: FadviseRequest,
-        ack: Option<oneshot::Sender<u64>>,
+        ack: Option<oneshot::Sender<SubmissionTicketId>>,
         res: oneshot_async::Sender<io::Result<()>>,
     },
     Ftruncate {
         req: FtruncateRequest,
-        ack: Option<oneshot::Sender<u64>>,
+        ack: Option<oneshot::Sender<SubmissionTicketId>>,
         res: oneshot_async::Sender<io::Result<()>>,
     },
     OpenAt {
         req: OpenAtRequest,
-        ack: Option<oneshot::Sender<u64>>,
+        ack: Option<oneshot::Sender<SubmissionTicketId>>,
         res: oneshot_async::Sender<io::Result<OwnedFd>>,
     },
     StatxPath {
         req: StatxPathRequest,
-        ack: Option<oneshot::Sender<u64>>,
+        ack: Option<oneshot::Sender<SubmissionTicketId>>,
         res: oneshot_async::Sender<io::Result<Metadata>>,
     },
     Close {
@@ -72,27 +78,27 @@ pub(crate) enum Command {
     },
     RenameAt {
         req: RenameAtRequest,
-        ack: Option<oneshot::Sender<u64>>,
+        ack: Option<oneshot::Sender<SubmissionTicketId>>,
         res: oneshot_async::Sender<io::Result<()>>,
     },
     UnlinkAt {
         req: UnlinkAtRequest,
-        ack: Option<oneshot::Sender<u64>>,
+        ack: Option<oneshot::Sender<SubmissionTicketId>>,
         res: oneshot_async::Sender<io::Result<()>>,
     },
     MkdirAt {
         req: MkdirAtRequest,
-        ack: Option<oneshot::Sender<u64>>,
+        ack: Option<oneshot::Sender<SubmissionTicketId>>,
         res: oneshot_async::Sender<io::Result<()>>,
     },
     SymlinkAt {
         req: SymlinkAtRequest,
-        ack: Option<oneshot::Sender<u64>>,
+        ack: Option<oneshot::Sender<SubmissionTicketId>>,
         res: oneshot_async::Sender<io::Result<()>>,
     },
     LinkAt {
         req: LinkAtRequest,
-        ack: Option<oneshot::Sender<u64>>,
+        ack: Option<oneshot::Sender<SubmissionTicketId>>,
         res: oneshot_async::Sender<io::Result<()>>,
     },
     Cancel {
@@ -100,6 +106,12 @@ pub(crate) enum Command {
         // Cancel requests are synchronous to avoid the risk of it being dropped which may cause UB
         res: oneshot::Sender<io::Result<()>>,
     },
+}
+
+#[derive(Debug)]
+pub(crate) struct CommandWithTicket {
+    pub(crate) submission_ticket: SubmissionTicket,
+    pub(crate) command: Command,
 }
 
 /// Helper to build a submission entry for either Fd or Fixed target.
@@ -135,8 +147,8 @@ macro_rules! build_op_fd_only {
 }
 
 #[inline]
-pub(crate) fn build_io_uring_entry(command: &Command, id: u64) -> Entry {
-    match &command {
+pub(crate) fn build_io_uring_entry(ticket: &CommandWithTicket) -> Entry {
+    match &ticket.command {
         Command::Read { req, .. } => {
             build_op!(req.target, |fd| opcode::Read::new(
                 fd,
@@ -145,7 +157,7 @@ pub(crate) fn build_io_uring_entry(command: &Command, id: u64) -> Entry {
             )
             .offset(req.offset)
             .build()
-            .user_data(id))
+            .user_data(ticket.submission_ticket.id().0))
         }
         Command::Readv { req, .. } => {
             build_op!(req.target, |fd| opcode::Readv::new(
@@ -155,7 +167,7 @@ pub(crate) fn build_io_uring_entry(command: &Command, id: u64) -> Entry {
             )
             .offset(req.offset)
             .build()
-            .user_data(id))
+            .user_data(ticket.submission_ticket.id().0))
         }
         Command::Write { req, .. } => {
             build_op!(req.target, |fd| opcode::Write::new(
@@ -165,7 +177,7 @@ pub(crate) fn build_io_uring_entry(command: &Command, id: u64) -> Entry {
             )
             .offset(req.offset)
             .build()
-            .user_data(id))
+            .user_data(ticket.submission_ticket.id().0))
         }
         Command::Writev { req, .. } => {
             build_op!(req.target, |fd| opcode::Writev::new(
@@ -175,7 +187,7 @@ pub(crate) fn build_io_uring_entry(command: &Command, id: u64) -> Entry {
             )
             .offset(req.offset)
             .build()
-            .user_data(id))
+            .user_data(ticket.submission_ticket.id().0))
         }
         Command::Sync { req, .. } => {
             build_op!(req.target, |fd| {
@@ -183,7 +195,7 @@ pub(crate) fn build_io_uring_entry(command: &Command, id: u64) -> Entry {
                 if req.datasync {
                     fsync = fsync.flags(types::FsyncFlags::DATASYNC);
                 }
-                fsync.build().user_data(id)
+                fsync.build().user_data(ticket.submission_ticket.id().0)
             })
         }
         Command::Statx { req, .. } => {
@@ -203,14 +215,14 @@ pub(crate) fn build_io_uring_entry(command: &Command, id: u64) -> Entry {
             .flags(AT_EMPTY_PATH)
             .mask(STATX_BASIC_STATS)
             .build()
-            .user_data(id))
+            .user_data(ticket.submission_ticket.id().0))
         }
         Command::Fallocate { req, .. } => {
             build_op!(req.target, |fd| opcode::Fallocate::new(fd, req.len)
                 .offset(req.offset)
                 .mode(req.mode)
                 .build()
-                .user_data(id))
+                .user_data(ticket.submission_ticket.id().0))
         }
         Command::Fadvise { req, .. } => {
             build_op!(req.target, |fd| opcode::Fadvise::new(
@@ -218,19 +230,19 @@ pub(crate) fn build_io_uring_entry(command: &Command, id: u64) -> Entry {
             )
             .offset(req.offset)
             .build()
-            .user_data(id))
+            .user_data(ticket.submission_ticket.id().0))
         }
         Command::Ftruncate { req, .. } => {
             build_op!(req.target, |fd| opcode::Ftruncate::new(fd, req.len)
                 .build()
-                .user_data(id))
+                .user_data(ticket.submission_ticket.id().0))
         }
         Command::OpenAt { req, .. } => {
             opcode::OpenAt::new(types::Fd(req.dir_fd), req.path.as_ptr())
                 .flags(req.flags)
                 .mode(req.mode)
                 .build()
-                .user_data(id)
+                .user_data(ticket.submission_ticket.id().0)
         }
         Command::StatxPath { req, .. } => {
             const STATX_BASIC_STATS: u32 = 0x000007ff;
@@ -240,9 +252,11 @@ pub(crate) fn build_io_uring_entry(command: &Command, id: u64) -> Entry {
                 .flags(req.flags)
                 .mask(STATX_BASIC_STATS)
                 .build()
-                .user_data(id)
+                .user_data(ticket.submission_ticket.id().0)
         }
-        Command::Close { req, .. } => opcode::Close::new(types::Fd(req.fd)).build().user_data(id),
+        Command::Close { req, .. } => opcode::Close::new(types::Fd(req.fd))
+            .build()
+            .user_data(ticket.submission_ticket.id().0),
         Command::RenameAt { req, .. } => opcode::RenameAt::new(
             types::Fd(req.old_dir_fd),
             req.old_path.as_ptr(),
@@ -251,18 +265,18 @@ pub(crate) fn build_io_uring_entry(command: &Command, id: u64) -> Entry {
         )
         .flags(req.flags)
         .build()
-        .user_data(id),
+        .user_data(ticket.submission_ticket.id().0),
         Command::UnlinkAt { req, .. } => {
             opcode::UnlinkAt::new(types::Fd(req.dir_fd), req.path.as_ptr())
                 .flags(req.flags)
                 .build()
-                .user_data(id)
+                .user_data(ticket.submission_ticket.id().0)
         }
         Command::MkdirAt { req, .. } => {
             opcode::MkDirAt::new(types::Fd(req.dir_fd), req.path.as_ptr())
                 .mode(req.mode)
                 .build()
-                .user_data(id)
+                .user_data(ticket.submission_ticket.id().0)
         }
         Command::SymlinkAt { req, .. } => opcode::SymlinkAt::new(
             types::Fd(req.new_dir_fd),
@@ -270,7 +284,7 @@ pub(crate) fn build_io_uring_entry(command: &Command, id: u64) -> Entry {
             req.link_path.as_ptr(),
         )
         .build()
-        .user_data(id),
+        .user_data(ticket.submission_ticket.id().0),
         Command::LinkAt { req, .. } => opcode::LinkAt::new(
             types::Fd(req.old_dir_fd),
             req.old_path.as_ptr(),
@@ -279,13 +293,17 @@ pub(crate) fn build_io_uring_entry(command: &Command, id: u64) -> Entry {
         )
         .flags(req.flags)
         .build()
-        .user_data(id),
-        Command::Cancel { req, .. } => opcode::AsyncCancel::new(req.id).build().user_data(id),
+        .user_data(ticket.submission_ticket.id().0),
+        Command::Cancel { req, .. } => opcode::AsyncCancel::new(req.id.0)
+            .build()
+            .user_data(ticket.submission_ticket.id().0),
     }
 }
 
 #[inline]
-pub(crate) fn take_command_ack(command: &mut Command) -> Option<oneshot::Sender<u64>> {
+pub(crate) fn take_command_ack(
+    command: &mut Command,
+) -> Option<oneshot::Sender<SubmissionTicketId>> {
     match command {
         Command::Read { ack, .. } => ack.take(),
         Command::Readv { ack, .. } => ack.take(),

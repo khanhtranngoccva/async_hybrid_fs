@@ -37,6 +37,7 @@ pub mod iobuf;
 pub mod metadata;
 mod runtime;
 
+use crate::client::ClientUring;
 use crate::client::pending_io::fixed_value::FixedValuePendingIo;
 use nix::fcntl::AT_FDCWD;
 use nix::fcntl::FdFlag;
@@ -68,7 +69,6 @@ pub use crate::metadata::MknodType;
 pub use crate::metadata::Permissions;
 pub use client::Client;
 pub use client::ClientBuildError;
-pub use client::ClientUring;
 pub use client::OwnedRegisteredFile;
 pub use client::RegisterError;
 pub use client::RegisteredFile;

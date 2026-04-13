@@ -1,9 +1,10 @@
 use super::{UringPendingIo, macros};
-use crate::client::pending_io::PendingIoImpl;
+use crate::client::pending_io::{PendingIoDebuggingEvent, PendingIoImpl};
 use crate::client::requests::IovecArray;
+use crate::client::ticketing::SubmissionTicketId;
 use crate::runtime;
 use crate::{
-    Client, UringTarget,
+    ClientUring, UringTarget,
     client::{command::Command, completion::ReadvResult, requests::ReadvRequest},
     iobuf::IoBufMut,
 };
@@ -115,17 +116,17 @@ where
     /// Offset to read from.
     offset: u64,
     /// Channel for sending operation IDs.
-    ack_tx: Option<oneshot::Sender<u64>>,
+    ack_tx: Option<oneshot::Sender<SubmissionTicketId>>,
     /// Channel for receiving confirmation that the operation has been submitted. The ID must be received before the operation could be cancelled; otherwise, the future might drop before the operation even starts, leading to an operation with dangling pointers. We do not need the ID for any other purpose.
-    ack_rx: Option<oneshot::Receiver<u64>>,
+    ack_rx: Option<oneshot::Receiver<SubmissionTicketId>>,
     /// Channel for sending operation results.
     result_tx: Option<oneshot_async::Sender<io::Result<u32>>>,
     /// Completion state for the operation.
     completion_state: Option<CompletionState<Buf>>,
     /// Client to use for submitting the operation and cancelling it.
-    client: &'a Client,
+    client: &'a ClientUring,
     /// Cancellation ID.
-    cancellation: Option<u64>,
+    cancellation: Option<SubmissionTicketId>,
     /// Whether cancellation is acknowledged.
     // The reason for an extra field is that the cancel_uring method may not be called twice.
     cancel_done: bool,
@@ -168,16 +169,17 @@ where
     Buf: IoBufMut,
 {
     pub(crate) fn new(
-        client: &'a Client,
+        uring: &'a ClientUring,
         target: &'a Target,
         mut bufs: Vec<Buf>,
         offset: u64,
+        debug_event_tx: Option<tokio::sync::mpsc::UnboundedSender<PendingIoDebuggingEvent>>,
     ) -> Self {
         let (ack_tx, ack_rx) = oneshot::channel();
         let (result_tx, result_rx) = oneshot_async::channel();
         let mut op = Self {
             target,
-            identity: &client.uring.as_ref().expect("uring must be Some").identity,
+            identity: &uring.identity,
             // Need to pin the iovec array because the command object requires a pointer.
             iovec_array: Pin::new(IovecArray(
                 bufs.iter_mut()
@@ -192,12 +194,12 @@ where
             ack_rx: Some(ack_rx),
             ack_tx: Some(ack_tx),
             result_tx: Some(result_tx),
-            client,
+            client: uring,
             cancellation: None,
             cancel_done: false,
         };
         let command = unsafe { op.build_command() };
-        client.send(command);
+        uring.send(command, debug_event_tx);
         op
     }
 }

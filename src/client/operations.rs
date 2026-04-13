@@ -3,9 +3,10 @@ use crate::{
     PendingIo, Target,
     borrowed_buf::BorrowedBuf,
     client::{
-        Client, URING_LEN_MAX, UringTarget,
+        Client, ClientUring, URING_LEN_MAX, UringTarget,
         completion::{ReadResult, ReadvResult, WriteResult, WritevResult},
         pending_io::{
+            PendingIoDebuggingEvent,
             fallback::TokioScopedPendingIo,
             fixed_value::FixedValuePendingIo,
             uring::{
@@ -19,6 +20,7 @@ use crate::{
             },
         },
         requests::CancelRequest,
+        ticketing::SubmissionTicketId,
     },
     helpers,
     iobuf::{IoBuf, IoBufMut},
@@ -43,6 +45,43 @@ use std::{
     sync::atomic::Ordering,
     u32, u64,
 };
+
+impl ClientUring {
+    pub(crate) fn send(
+        &self,
+        command: Command,
+        debug_event_tx: Option<tokio::sync::mpsc::UnboundedSender<PendingIoDebuggingEvent>>,
+    ) {
+        self.normal_sender
+            .send((command, debug_event_tx))
+            .expect("normal submission thread dead");
+    }
+
+    fn send_cancel(&self, ticket_id: SubmissionTicketId) -> oneshot::Receiver<io::Result<()>> {
+        let (tx, rx) = oneshot::channel();
+        self.cancel_sender
+            .send((
+                Command::Cancel {
+                    req: CancelRequest { id: ticket_id },
+                    res: tx,
+                },
+                None,
+            ))
+            .expect("cancel submission thread dead");
+        rx
+    }
+
+    /// Cancel a pending io_uring operation.
+    pub(crate) fn cancel_uring(&self, id: SubmissionTicketId) -> io::Result<()> {
+        assert!(
+            self.probe.is_supported(opcode::AsyncCancel::CODE),
+            "async cancel is not supported"
+        );
+        let rx = self.send_cancel(id);
+        rx.recv().expect("uring completion channel dropped")?;
+        Ok(())
+    }
+}
 
 impl Client {
     const AT_FDCWD: BorrowedFd<'static> = unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) };
@@ -70,15 +109,6 @@ impl Client {
             None => Target::Fd(target.as_file_descriptor().as_raw_fd()),
             Some(uring) => unsafe { target.as_target(&uring.identity) },
         }
-    }
-
-    pub(crate) fn send(&self, command: Command) {
-        self.uring
-            .as_ref()
-            .expect("uring not supported, callers must ensure uring support first")
-            .sender
-            .send(command)
-            .expect("uring submission thread dead");
     }
 
     /// Indicates how much extra capacity is needed to read the rest of the file.
@@ -134,7 +164,8 @@ impl Client {
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Read::CODE)
         {
-            PendingIo::new(UringReadIntoAt::new(self, file, buf, offset))
+            let uring = self.uring.as_ref().expect("uring must be Some");
+            PendingIo::new(UringReadIntoAt::new(uring, file, buf, offset, None))
         } else {
             PendingIo::new(TokioScopedPendingIo::new(
                 move || -> io::Result<ReadResult<B>> {
@@ -209,7 +240,10 @@ impl Client {
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Readv::CODE)
         {
-            PendingIo::new(UringReadIntoVectoredAt::new(self, file, bufs, offset))
+            let uring = self.uring.as_ref().expect("uring must be Some");
+            PendingIo::new(UringReadIntoVectoredAt::new(
+                uring, file, bufs, offset, None,
+            ))
         } else {
             PendingIo::new(TokioScopedPendingIo::new(
                 move || -> io::Result<ReadvResult<B>> {
@@ -263,11 +297,13 @@ impl Client {
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Readv::CODE)
         {
+            let uring = self.uring.as_ref().expect("uring must be Some");
             PendingIo::new(UringReadIntoVectoredAt::new(
-                self,
+                uring,
                 file,
                 bufs,
                 (-1i64) as u64,
+                None,
             ))
         } else {
             PendingIo::new(TokioScopedPendingIo::new(
@@ -348,7 +384,8 @@ impl Client {
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Read::CODE)
         {
-            PendingIo::new(UringReadIntoAt::new(self, file, buf, (-1i64) as u64))
+            let uring = self.uring.as_ref().expect("uring must be Some");
+            PendingIo::new(UringReadIntoAt::new(uring, file, buf, (-1i64) as u64, None))
         } else {
             PendingIo::new(TokioScopedPendingIo::new(
                 move || -> io::Result<ReadResult<B>> {
@@ -639,7 +676,8 @@ impl Client {
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Write::CODE)
         {
-            PendingIo::new(UringWriteFromAt::new(self, file, buf, offset))
+            let uring = self.uring.as_ref().expect("uring must be Some");
+            PendingIo::new(UringWriteFromAt::new(uring, file, buf, offset, None))
         } else {
             PendingIo::new(TokioScopedPendingIo::new(
                 move || -> io::Result<WriteResult<B>> {
@@ -694,7 +732,10 @@ impl Client {
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Writev::CODE)
         {
-            PendingIo::new(UringWriteFromVectoredAt::new(self, file, bufs, offset))
+            let uring = self.uring.as_ref().expect("uring must be Some");
+            PendingIo::new(UringWriteFromVectoredAt::new(
+                uring, file, bufs, offset, None,
+            ))
         } else {
             PendingIo::new(TokioScopedPendingIo::new(
                 move || -> io::Result<WritevResult<B>> {
@@ -796,7 +837,14 @@ impl Client {
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Write::CODE)
         {
-            PendingIo::new(UringWriteFromAt::new(self, file, buf, (-1i64) as u64))
+            let uring = self.uring.as_ref().expect("uring must be Some");
+            PendingIo::new(UringWriteFromAt::new(
+                uring,
+                file,
+                buf,
+                (-1i64) as u64,
+                None,
+            ))
         } else {
             PendingIo::new(TokioScopedPendingIo::new(
                 move || -> io::Result<WriteResult<B>> {
@@ -828,11 +876,13 @@ impl Client {
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Writev::CODE)
         {
+            let uring = self.uring.as_ref().expect("uring must be Some");
             PendingIo::new(UringWriteFromVectoredAt::new(
-                self,
+                uring,
                 file,
                 bufs,
                 (-1i64) as u64,
+                None,
             ))
         } else {
             PendingIo::new(TokioScopedPendingIo::new(
@@ -976,7 +1026,8 @@ impl Client {
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Fsync::CODE)
         {
-            PendingIo::new(UringSync::new(self, file, false))
+            let uring = self.uring.as_ref().expect("uring must be Some");
+            PendingIo::new(UringSync::new(uring, file, false, None))
         } else {
             PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
                 nix::unistd::fsync(file.as_file_descriptor())?;
@@ -993,7 +1044,8 @@ impl Client {
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Fsync::CODE)
         {
-            PendingIo::new(UringSync::new(self, file, false))
+            let uring = self.uring.as_ref().expect("uring must be Some");
+            PendingIo::new(UringSync::new(uring, file, true, None))
         } else {
             PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
                 nix::unistd::fsync(file.as_file_descriptor())?;
@@ -1011,7 +1063,8 @@ impl Client {
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Statx::CODE)
         {
-            PendingIo::new(UringStatx::new(self, file))
+            let uring = self.uring.as_ref().expect("uring must be Some");
+            PendingIo::new(UringStatx::new(uring, file, None))
         } else {
             PendingIo::new(TokioScopedPendingIo::new(
                 move || -> io::Result<Metadata> {
@@ -1047,7 +1100,8 @@ impl Client {
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Statx::CODE)
         {
-            PendingIo::new(UringStatxPath::new(self, fd, path_cstr, flags))
+            let uring = self.uring.as_ref().expect("uring must be Some");
+            PendingIo::new(UringStatxPath::new(uring, fd, path_cstr, flags, None))
         } else {
             PendingIo::new(TokioScopedPendingIo::new(
                 move || -> io::Result<Metadata> {
@@ -1127,7 +1181,8 @@ impl Client {
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Fallocate::CODE)
         {
-            PendingIo::new(UringFallocate::new(self, file, mode, offset, len))
+            let uring = self.uring.as_ref().expect("uring must be Some");
+            PendingIo::new(UringFallocate::new(uring, file, mode, offset, len, None))
         } else {
             PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
                 nix::fcntl::fallocate(
@@ -1182,7 +1237,10 @@ impl Client {
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Fadvise::CODE)
         {
-            PendingIo::new(UringFadvise::new(self, file, advice, offset, len as i64))
+            let uring = self.uring.as_ref().expect("uring must be Some");
+            PendingIo::new(UringFadvise::new(
+                uring, file, advice, offset, len as i64, None,
+            ))
         } else {
             PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
                 nix::fcntl::posix_fadvise(
@@ -1220,7 +1278,8 @@ impl Client {
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Ftruncate::CODE)
         {
-            PendingIo::new(UringFtruncate::new(self, file, len))
+            let uring = self.uring.as_ref().expect("uring must be Some");
+            PendingIo::new(UringFtruncate::new(uring, file, len, None))
         } else {
             PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
                 nix::unistd::ftruncate(file.as_file_descriptor(), len as i64)?;
@@ -1256,12 +1315,14 @@ impl Client {
                     return PendingIo::new(FixedValuePendingIo::new(Err(e)));
                 }
             };
+            let uring = self.uring.as_ref().expect("uring must be Some");
             PendingIo::new(UringOpenAt::new(
-                self,
+                uring,
                 dir_fd,
                 path,
                 flags,
                 Mode::from_bits_retain(permissions.mode()),
+                None,
             ))
         } else {
             let path_owned = path.as_ref().to_owned();
@@ -1364,7 +1425,8 @@ impl Client {
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Close::CODE)
         {
-            PendingIo::new(UringClose::new(self, fd))
+            let uring = self.uring.as_ref().expect("uring must be Some");
+            PendingIo::new(UringClose::new(uring, fd, None))
         } else {
             let raw_fd = fd.into_raw_fd();
             let owned_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
@@ -1401,8 +1463,9 @@ impl Client {
                     return PendingIo::new(FixedValuePendingIo::new(Err(e)));
                 }
             };
+            let uring = self.uring.as_ref().expect("uring must be Some");
             PendingIo::new(UringRenameAt::new(
-                self, old_dir_fd, old_path, new_dir_fd, new_path, flags,
+                uring, old_dir_fd, old_path, new_dir_fd, new_path, flags, None,
             ))
         } else {
             let old_path_owned = old_path.as_ref().to_owned();
@@ -1453,7 +1516,8 @@ impl Client {
                     return PendingIo::new(FixedValuePendingIo::new(Err(e)));
                 }
             };
-            PendingIo::new(UringUnlinkAt::new(self, dir_fd, path, flags))
+            let uring = self.uring.as_ref().expect("uring must be Some");
+            PendingIo::new(UringUnlinkAt::new(uring, dir_fd, path, flags, None))
         } else {
             let path_owned = path.as_ref().to_owned();
             PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
@@ -1495,11 +1559,13 @@ impl Client {
                     return PendingIo::new(FixedValuePendingIo::new(Err(e)));
                 }
             };
+            let uring = self.uring.as_ref().expect("uring must be Some");
             PendingIo::new(UringMkdirAt::new(
-                self,
+                uring,
                 dir_fd,
                 path,
                 Mode::from_bits_retain(permissions.mode()),
+                None,
             ))
         } else {
             let path_owned = path.as_ref().to_owned();
@@ -1633,7 +1699,10 @@ impl Client {
                     return PendingIo::new(FixedValuePendingIo::new(Err(e)));
                 }
             };
-            PendingIo::new(UringSymlinkAt::new(self, new_dir_fd, target, link_path))
+            let uring = self.uring.as_ref().expect("uring must be Some");
+            PendingIo::new(UringSymlinkAt::new(
+                uring, new_dir_fd, target, link_path, None,
+            ))
         } else {
             let target_owned = target.as_ref().to_owned();
             let link_path_owned = link_path.as_ref().to_owned();
@@ -1681,8 +1750,9 @@ impl Client {
                     return PendingIo::new(FixedValuePendingIo::new(Err(e)));
                 }
             };
+            let uring = self.uring.as_ref().expect("uring must be Some");
             PendingIo::new(UringLinkAt::new(
-                self, old_dir_fd, old_path, new_dir_fd, new_path, flags,
+                uring, old_dir_fd, old_path, new_dir_fd, new_path, flags, None,
             ))
         } else {
             let old_path_owned = old_path.as_ref().to_owned();
@@ -2095,23 +2165,6 @@ impl Client {
             .completion()
             .expect("no completion future returned")
             .await?;
-        Ok(())
-    }
-
-    /// Cancel a pending io_uring operation.
-    pub(crate) fn cancel_uring(&self, id: u64) -> io::Result<()> {
-        let (tx, rx) = oneshot::channel();
-        assert!(
-            self.is_uring_operation_supported(opcode::AsyncCancel::CODE),
-            "async cancel is not supported"
-        );
-        self.send(Command::Cancel {
-            req: CancelRequest { id },
-            res: tx,
-        });
-        // Cannot use await here because we may not drop a processing cancel operation.
-        rx.recv().expect("uring completion channel dropped")?;
-        // Remove the operation from the pending map.
         Ok(())
     }
 }

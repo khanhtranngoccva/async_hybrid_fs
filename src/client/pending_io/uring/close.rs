@@ -1,7 +1,11 @@
 use super::UringPendingIo;
 use crate::{
-    Client,
-    client::{command::Command, pending_io::PendingIoImpl, requests::CloseRequest},
+    ClientUring,
+    client::{
+        command::Command,
+        pending_io::{PendingIoDebuggingEvent, PendingIoImpl},
+        requests::CloseRequest,
+    },
 };
 use std::{io, os::fd::IntoRawFd, pin::Pin, sync::Arc, task::Poll};
 use tokio::sync::oneshot::{self, Receiver, Sender};
@@ -79,7 +83,7 @@ where
     /// Minimal completion state.
     state: Option<CompletionState>,
     _identity: &'a Arc<()>,
-    _client: &'a Client,
+    _client: &'a ClientUring,
 }
 
 impl<'a, Target> UringPendingIo<Result<(), io::Error>> for UringClose<'a, Target>
@@ -107,17 +111,21 @@ impl<'a, Target> UringClose<'a, Target>
 where
     Target: IntoRawFd + Sized + Send,
 {
-    pub(crate) fn new(client: &'a Client, target: Target) -> Self {
+    pub(crate) fn new(
+        client: &'a ClientUring,
+        target: Target,
+        debug_event_tx: Option<tokio::sync::mpsc::UnboundedSender<PendingIoDebuggingEvent>>,
+    ) -> Self {
         let (result_tx, result_rx) = oneshot::channel();
         let mut op = Self {
             target: Some(target),
-            _identity: &client.uring.as_ref().expect("uring must be Some").identity,
+            _identity: &client.identity,
             result_tx: Some(result_tx),
             state: Some(CompletionState { result_rx }),
             _client: client,
         };
         let command = unsafe { op.build_command() };
-        client.send(command);
+        client.send(command, debug_event_tx);
         op
     }
 }

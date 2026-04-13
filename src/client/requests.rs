@@ -1,4 +1,4 @@
-use crate::UringTarget;
+use crate::{UringTarget, client::ticketing::SubmissionTicketId};
 use libc::iovec;
 use std::{
     ffi::CString,
@@ -213,5 +213,5 @@ pub(crate) struct LinkAtRequest {
 
 #[derive(Debug)]
 pub(crate) struct CancelRequest {
-    pub(crate) id: u64,
+    pub(crate) id: SubmissionTicketId,
 }

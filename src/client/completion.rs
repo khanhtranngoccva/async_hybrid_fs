@@ -1,4 +1,7 @@
-use crate::{client::command::Command, metadata::Metadata};
+use crate::{
+    client::command::{Command, CommandWithTicket},
+    metadata::Metadata,
+};
 use std::{
     io,
     os::fd::{FromRawFd, OwnedFd},
@@ -36,13 +39,13 @@ pub struct WritevResult<B> {
     pub bytes_written: usize,
 }
 
-pub(crate) fn handle_completion(cmd: Command, result: i32) {
+pub(crate) fn handle_completion(cmd: CommandWithTicket, result: i32) {
     let result: io::Result<i32> = if result < 0 {
         Err(io::Error::from_raw_os_error(-result))
     } else {
         Ok(result)
     };
-    match cmd {
+    match cmd.command {
         Command::Read { res, .. } => {
             let _ = res.send(result.map(|n| n as u32));
         }

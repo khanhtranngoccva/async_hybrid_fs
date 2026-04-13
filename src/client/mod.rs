@@ -5,6 +5,7 @@ mod pending;
 pub(crate) mod pending_io;
 mod register;
 mod requests;
+pub(crate) mod ticketing;
 
 use std::collections::VecDeque;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
@@ -12,9 +13,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::thread::JoinHandle;
 use std::{io, thread};
+use ticketing::SubmissionTicketQueue;
 
-use command::Command;
-use crossbeam_channel::TryRecvError;
 use dashmap::{DashMap, DashSet};
 use io_uring::IoUring;
 use io_uring::cqueue::Entry as CEntry;
@@ -23,6 +23,12 @@ pub use register::OwnedRegisteredFile;
 pub use register::RegisterError;
 pub use register::RegisteredFile;
 pub use requests::Target;
+
+use crate::client::command::{Command, CommandWithTicket};
+use crate::client::pending_io::PendingIoDebuggingEvent;
+use crate::client::ticketing::{
+    CompletionTicketQueue, CompletionTicketSubmitter, SubmissionTicketId,
+};
 
 /// Maximum length for a single io_uring read/write operation.
 ///
@@ -36,9 +42,17 @@ pub struct Client {
     uring_enabled: Arc<AtomicBool>,
 }
 
-pub struct ClientUring {
-    // We don't use std::sync::mpsc::Sender as it is not Sync, so it's really complicated to use from any async function.
-    sender: crossbeam_channel::Sender<Command>,
+pub(crate) struct ClientUring {
+    normal_sender: crossbeam_channel::Sender<(
+        Command,
+        Option<tokio::sync::mpsc::UnboundedSender<PendingIoDebuggingEvent>>,
+    )>,
+    cancel_sender: crossbeam_channel::Sender<(
+        Command,
+        Option<tokio::sync::mpsc::UnboundedSender<PendingIoDebuggingEvent>>,
+    )>,
+    normal_backpressure_thread: JoinHandle<()>,
+    cancel_backpressure_thread: JoinHandle<()>,
     uring: Arc<IoUring>,
     probe: io_uring::Probe,
     uring_sthread: JoinHandle<()>,
@@ -53,8 +67,19 @@ impl Drop for Client {
         // Remove the uring instance, then join the threads.
         let uring = self.uring.take();
         if let Some(uring) = uring {
-            drop(uring.sender);
+            // Drop the senders to prevent any more commands from being submitted.
+            drop(uring.normal_sender);
+            drop(uring.cancel_sender);
             drop(uring.uring);
+            // Join the backpressure threads.
+            uring
+                .normal_backpressure_thread
+                .join()
+                .expect("normal_backpressure_thread join failed");
+            uring
+                .cancel_backpressure_thread
+                .join()
+                .expect("cancel_backpressure_thread join failed");
             uring
                 .uring_sthread
                 .join()
@@ -76,12 +101,17 @@ pub enum ClientBuildError {
     IoUringBuildFailed(#[from] io::Error),
 }
 
-/// Default ring size for io_uring (16384 entries).
-///
+/// Default operation queue size for io_uring (16384 - 512 entries). This leaves room for the cancel queue.
 /// This is a conservative default that works in most environments including containers
 /// and memory-constrained systems. The kernel will further clamp this if needed via
 /// `IORING_SETUP_CLAMP`.
-pub const DEFAULT_RING_SIZE: u32 = 16384;
+pub const DEFAULT_OP_QUEUE_SIZE: u32 = 16384 - 512;
+
+/// Default cancel queue size for io_uring (512 entries).
+/// This is a conservative default that works in most environments including containers
+/// and memory-constrained systems. The kernel will further clamp this if needed via
+/// `IORING_SETUP_CLAMP`.
+pub const DEFAULT_CANCEL_QUEUE_SIZE: u32 = 512;
 
 /// Configuration options for io_uring initialization.
 ///
@@ -97,14 +127,23 @@ pub const DEFAULT_RING_SIZE: u32 = 16384;
 /// - `iopoll`: Only works with O_DIRECT files on supported filesystems
 #[derive(Clone, Debug)]
 pub struct UringCfg {
-    /// Size of the io_uring submission/completion queues (number of entries).
+    /// Size of the io_uring submission/completion queues for normal operations (number of entries).
     ///
     /// Larger values allow more operations to be batched but consume more memory.
     /// The kernel will clamp this to the maximum supported size via `IORING_SETUP_CLAMP`.
     ///
     /// If you encounter `ENOMEM` errors during initialization, try reducing this value.
     /// Defaults to [`DEFAULT_RING_SIZE`] (16384 entries).
-    pub ring_size: u32,
+    pub operation_queue_size: u32,
+
+    /// Size of the io_uring submission/completion queues for cancel operations (number of entries).
+    ///
+    /// Larger values allow more operations to be batched but consume more memory.
+    /// The kernel will clamp this to the maximum supported size via `IORING_SETUP_CLAMP`.
+    ///
+    /// If you encounter `ENOMEM` errors during initialization, try reducing this value.
+    /// Defaults to [`DEFAULT_RING_SIZE`] (16384 entries).
+    pub cancel_queue_size: u32,
 
     /// Enable cooperative task running (Linux 5.19+). When enabled, the kernel will only process completions when the application explicitly asks for them, reducing overhead.
     pub coop_taskrun: bool,
@@ -125,7 +164,8 @@ pub struct UringCfg {
 impl Default for UringCfg {
     fn default() -> Self {
         Self {
-            ring_size: DEFAULT_RING_SIZE,
+            operation_queue_size: DEFAULT_OP_QUEUE_SIZE,
+            cancel_queue_size: DEFAULT_CANCEL_QUEUE_SIZE,
             coop_taskrun: false,
             defer_taskrun: false,
             iopoll: false,
@@ -137,11 +177,21 @@ impl Default for UringCfg {
 
 impl Client {
     pub fn build(cfg: UringCfg) -> Result<Client, ClientBuildError> {
+        let expected_total_squeue_size = cfg
+            .operation_queue_size
+            .checked_add(cfg.cancel_queue_size)
+            .ok_or_else(|| {
+                ClientBuildError::IoUringBuildFailed(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "total queue size is too large",
+                ))
+            })?;
+
         let ring = {
             #[cfg(target_os = "linux")]
             let mut builder = IoUring::<SEntry, CEntry>::builder();
-            // Use IORING_SETUP_CLAMP to let the kernel reduce the ring size if our requested size exceeds system limits. This is safer than failing outright.
-            builder.setup_clamp();
+            // Clamp is not used here to ensure that the submission queue is not smaller than the requested size.
+            // If there is a problem, .
             if cfg.coop_taskrun {
                 builder.setup_coop_taskrun();
             };
@@ -154,7 +204,7 @@ impl Client {
             if let Some(sqpoll) = cfg.sqpoll {
                 builder.setup_sqpoll(sqpoll);
             };
-            match builder.build(cfg.ring_size) {
+            match builder.build(expected_total_squeue_size) {
                 Ok(uring) => Some(uring),
                 Err(_) if cfg.allow_fallback => None,
                 Err(e) => return Err(ClientBuildError::IoUringBuildFailed(e)),
@@ -166,33 +216,95 @@ impl Client {
                 None
             }
         };
-        let pending: Arc<DashMap<u64, Command>> = Default::default();
+        let pending: Arc<DashMap<SubmissionTicketId, CommandWithTicket>> = Default::default();
         let mut client = Client {
             uring: None,
             uring_enabled: Arc::new(AtomicBool::new(true)),
         };
-        if let Some(ring) = ring {
+        if let Some(mut ring) = ring {
             // Pre-allocate sparse file table for registration (Linux 5.12+). If this fails, file registration won't work but unregistered fds will still function.
             let _ = ring.submitter().register_files_sparse(MAX_REGISTERED_FILES);
+            let actual_total_squeue_size = ring.submission().capacity();
+            // Investigate the submission queue size.
+            let (op_ticket_queue_size, cancel_ticket_queue_size) = if actual_total_squeue_size
+                >= expected_total_squeue_size as usize
+            {
+                // We allocate the ticket queue sizes as planned.
+                (
+                    cfg.operation_queue_size as usize,
+                    cfg.cancel_queue_size as usize,
+                )
+            } else {
+                // We need to adjust the ticket queue sizes to fit the submission queue size using a ratio.
+                log::debug!(
+                    "actual_total_squeue_size: {}, expected_total_squeue_size: {}",
+                    actual_total_squeue_size,
+                    expected_total_squeue_size
+                );
+                let cancel_queue_size = actual_total_squeue_size
+                    .saturating_mul(cfg.cancel_queue_size as usize)
+                    .saturating_div(expected_total_squeue_size as usize);
+                if cancel_queue_size == 0 {
+                    return Err(ClientBuildError::IoUringBuildFailed(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "cancel queue size after clamping is 0, try to increase cfg.cancel_queue_size",
+                    )));
+                }
+                let operation_queue_size =
+                    actual_total_squeue_size.saturating_sub(cancel_queue_size);
+                if operation_queue_size == 0 {
+                    return Err(ClientBuildError::IoUringBuildFailed(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "operation queue size after clamping is 0, try to increase cfg.operation_queue_size",
+                    )));
+                }
+                (operation_queue_size, cancel_queue_size)
+            };
+            // Create the ticket queues.
+            let mut ticket_queues = SubmissionTicketQueue::new_multiple(&[
+                op_ticket_queue_size,
+                cancel_ticket_queue_size,
+            ]);
+            let cancel_submission_ticket_queue = ticket_queues.pop().unwrap();
+            let normal_submission_ticket_queue = ticket_queues.pop().unwrap();
+            let (completion_ticket_submitter, completion_ticket_queue) =
+                ticketing::completion_ticket_pair();
+
             let ring = Arc::new(ring);
-            let (sender, receiver) = crossbeam_channel::unbounded::<Command>();
-            let (wait_permit_tx, wait_permit_rx) = crossbeam_channel::unbounded::<()>();
+            let (sender, receiver) = crossbeam_channel::unbounded::<CommandWithTicket>();
+            let (normal_sender, normal_receiver) = crossbeam_channel::unbounded();
+            let (cancel_sender, cancel_receiver) = crossbeam_channel::unbounded();
+            let normal_backpressure_thread = thread::spawn({
+                let dispatch = sender.clone();
+                move || {
+                    backpressure_thread(normal_receiver, normal_submission_ticket_queue, dispatch)
+                }
+            });
+            let cancel_backpressure_thread = thread::spawn({
+                let dispatch = sender.clone();
+                move || {
+                    backpressure_thread(cancel_receiver, cancel_submission_ticket_queue, dispatch)
+                }
+            });
             let sthread = thread::spawn({
                 let pending = pending.clone();
                 let ring = ring.clone();
-                move || submission_thread(ring, pending, receiver, wait_permit_tx)
+                move || submission_thread(ring, pending, receiver, completion_ticket_submitter)
             });
             let cthread = thread::spawn({
                 let pending = pending.clone();
                 let ring = ring.clone();
-                move || completion_thread(ring, pending, wait_permit_rx)
+                move || completion_thread(ring, pending, completion_ticket_queue)
             });
             let mut probe = io_uring::Probe::new();
             ring.submitter().register_probe(&mut probe)?;
             client.uring = Some(ClientUring {
-                sender,
+                normal_sender,
+                cancel_sender,
                 uring: ring,
                 probe: probe,
+                normal_backpressure_thread,
+                cancel_backpressure_thread,
                 uring_sthread: sthread,
                 uring_cthread: cthread,
                 registered_files: Arc::new(DashSet::new()),
@@ -200,30 +312,56 @@ impl Client {
                 next_file_slot: Arc::new(AtomicU32::new(0)),
             });
         }
-
         Ok(client)
     }
 }
 
+/// Thread for submitting events with backpressure - if a queue is full, the thread will block until a task is freed. As a result, the caller that sends commands to this thread does not need to block.
+fn backpressure_thread(
+    command_receiver: crossbeam_channel::Receiver<(
+        Command,
+        Option<tokio::sync::mpsc::UnboundedSender<PendingIoDebuggingEvent>>,
+    )>,
+    ticket_queue: SubmissionTicketQueue,
+    dispatch: crossbeam_channel::Sender<CommandWithTicket>,
+) {
+    loop {
+        let (command, debugging_event_tx) = match command_receiver.recv() {
+            Ok(item) => item,
+            Err(crossbeam_channel::RecvError) => break,
+        };
+        let ticket = ticket_queue.request_submission_ticket(debugging_event_tx.as_ref());
+        dispatch
+            .send(CommandWithTicket {
+                submission_ticket: ticket,
+                command,
+            })
+            .expect("main submission thread dead");
+    }
+}
+
+/// Thread for aggregating events from backpressure threads and submitting them to the io_uring submission queue.
 fn submission_thread(
     ring: Arc<IoUring>,
-    pending: Arc<DashMap<u64, Command>>,
-    receiver: crossbeam_channel::Receiver<Command>,
-    wait_permit_tx: crossbeam_channel::Sender<()>,
+    pending: Arc<DashMap<SubmissionTicketId, CommandWithTicket>>,
+    receiver: crossbeam_channel::Receiver<CommandWithTicket>,
+    completion_ticket_submitter: CompletionTicketSubmitter,
 ) {
     // SAFETY: We ensure that the submission queue is only accessed from this single thread. The completion queue is accessed from a separate thread.
     let mut submission = unsafe { ring.submission_shared() };
-    let mut next_id = 0u64;
     let mut queue = VecDeque::new();
 
     // Structure that allows entry removal from the pending map during a panic unwind.
     struct PendingEntryGuard {
-        pending: Arc<DashMap<u64, Command>>,
-        id: u64,
+        pending: Arc<DashMap<SubmissionTicketId, CommandWithTicket>>,
+        id: SubmissionTicketId,
         armed: bool,
     }
     impl PendingEntryGuard {
-        fn new(pending: Arc<DashMap<u64, Command>>, id: u64) -> Self {
+        fn new(
+            pending: Arc<DashMap<SubmissionTicketId, CommandWithTicket>>,
+            id: SubmissionTicketId,
+        ) -> Self {
             Self {
                 pending,
                 id,
@@ -254,25 +392,19 @@ fn submission_thread(
         // - The Rust library we're using abstracts over this by caching the head and tail as local values. Once we've made our inserts, we update the atomic tail and then tell the kernel to consume some of the queue. When we update the atomic tail, we also check the atomic head and update our local cached value; some entries may have been consumed by the kernel in some other thread since we last checked and we may actually have more free space than we thought.
         while let Some(mut command) = queue.pop_front() {
             if submission.is_full() {
+                // TODO: We do not want to wait using a syscall when we have a cancel event
                 ring.submit_and_wait(1).expect("failed to submit to ring");
             }
-            let (io_uring_entry, ack, id, mut guard) = 'entry_build: loop {
-                let id = next_id;
-                next_id = next_id.wrapping_add(1);
-
-                let io_uring_entry = command::build_io_uring_entry(&command, id);
-                match pending.entry(id) {
-                    dashmap::Entry::Vacant(pending_guard) => {
-                        let ack = command::take_command_ack(&mut command);
-                        pending_guard.insert(command);
-                        let guard = PendingEntryGuard::new(pending.clone(), id);
-                        break 'entry_build (io_uring_entry, ack, id, guard);
-                    }
-                    dashmap::Entry::Occupied(_) => {
-                        continue 'entry_build;
-                    }
-                }
-            };
+            let io_uring_entry = command::build_io_uring_entry(&command);
+            let ack = command::take_command_ack(&mut command.command);
+            let id = command.submission_ticket.id();
+            let insertion_res = pending.insert(id, command);
+            assert!(
+                insertion_res.is_none(),
+                "command with id {} already exists in pending map",
+                id.0
+            );
+            let mut guard = PendingEntryGuard::new(pending.clone(), id);
             // SAFETY: The submission entry references memory owned by the caller's future, which is awaiting completion.
             unsafe {
                 submission
@@ -289,17 +421,16 @@ fn submission_thread(
                 let _ = ack.send(id);
             }
             // Send a wait permit to the completion thread to indicate that it can now perform a blocking read of the next completion entry.
-            wait_permit_tx
-                .send(())
-                .expect("completion thread must wait until submission thread exits");
+            completion_ticket_submitter.grant_completion_ticket();
         }
     }
 }
 
+/// Thread for handling completions from the io_uring completion queue.
 fn completion_thread(
     ring: Arc<IoUring>,
-    pending: Arc<DashMap<u64, Command>>,
-    wait_permit_rx: crossbeam_channel::Receiver<()>,
+    pending: Arc<DashMap<SubmissionTicketId, CommandWithTicket>>,
+    queue: CompletionTicketQueue,
 ) {
     let mut completion = unsafe { ring.completion_shared() };
     // This flag marks that the submission thread has terminated and we should drain all remaining operations in the pending map until it is empty.
@@ -308,24 +439,11 @@ fn completion_thread(
         if submission_thread_terminated && pending.is_empty() {
             break;
         }
-        let mut wait_permits = 1u64;
+        let mut wait_permits = 1usize;
         if !submission_thread_terminated {
-            // The completion thread relies on the submission thread to send us a message that an operation has to be completed.
-            match wait_permit_rx.recv() {
-                Ok(()) => {
-                    if wait_permits < 65536 {
-                        // Try to batch more wait permits.
-                        match wait_permit_rx.try_recv() {
-                            Ok(()) => wait_permits += 1,
-                            Err(TryRecvError::Empty) => {}
-                            Err(TryRecvError::Disconnected) => {
-                                submission_thread_terminated = true;
-                                continue;
-                            }
-                        }
-                    }
-                }
-                Err(_) => {
+            match queue.request_completion_tickets() {
+                Some(count) => wait_permits = count,
+                None => {
                     submission_thread_terminated = true;
                     continue;
                 }
@@ -343,7 +461,7 @@ fn completion_thread(
                 };
                 break entry;
             };
-            let id = e.user_data();
+            let id = SubmissionTicketId(e.user_data());
             let (_, req) = pending
                 .remove(&id)
                 .expect("completion for unknown request id");

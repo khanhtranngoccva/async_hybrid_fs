@@ -35,10 +35,11 @@ pub(crate) trait UringPendingIo<T>: PendingIoImpl<T> {
 #[cfg(test)]
 mod tests {
     use crate::{
-        HybridFile, HybridRead, PendingIo, client::pending_io::uring::read_into::UringReadIntoAt,
+        Client, HybridFile, HybridRead, PendingIo, UringCfg,
+        client::pending_io::{PendingIoDebuggingEvent, uring::read_into::UringReadIntoAt},
         default_client,
     };
-    use std::{io::pipe, os::fd::AsFd, time::Duration, u64};
+    use std::{io::pipe, os::fd::AsFd, sync::Arc, time::Duration, u64};
     use tokio::runtime::{Handle, RuntimeFlavor};
     use tokio_util::sync::CancellationToken;
 
@@ -179,11 +180,82 @@ mod tests {
         let (pipe_read, _pipe_write) = pipe().expect("should be able to create a pipe");
         let mut buf = [0u8; 64];
         let pending_io = PendingIo::new(UringReadIntoAt::new(
-            &client,
+            client.uring.as_ref().unwrap(),
             &pipe_read,
             buf.as_mut_slice(),
             u64::MAX,
+            None,
         ));
         drop(pending_io);
+    }
+
+    #[tokio::test(
+        // Multithreading is needed because the pending I/O operation will block until a task is freed (it has to be acknowledged first).
+        flavor = "multi_thread", worker_threads = 2
+    )]
+    #[test_log::test]
+    async fn tiny_uring_client_should_have_dedicated_cancel_queue() {
+        // This test case prevents scenarios where the submission queue is filled with normal operations that cannot progress, but there are no dedicated slots for cancel operations, leading to a deadlock.
+        let client = Arc::new(
+            Client::build(UringCfg {
+                operation_queue_size: 1,
+                cancel_queue_size: 1,
+                ..Default::default()
+            })
+            .expect("failed to build client"),
+        );
+        if !client.is_uring_available_and_active() {
+            log::warn!("uring is not available, skipping test");
+            return;
+        }
+        let (first_ack_tx, mut first_ack_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (second_wait_tx, mut second_wait_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let task_1 = tokio::task::spawn({
+            let client = client.clone();
+            async move {
+                let (reader_1, _writer_1) = pipe().expect("failed to create pipe");
+                let mut buf_1 = [0u8; 64];
+                let pending_io = PendingIo::new(UringReadIntoAt::new(
+                    client.uring.as_ref().unwrap(),
+                    &reader_1,
+                    buf_1.as_mut_slice(),
+                    u64::MAX,
+                    Some(first_ack_tx),
+                ));
+                let event = second_wait_rx
+                    .recv()
+                    .await
+                    .expect("failed to receive from blocking channel");
+                assert_eq!(event, PendingIoDebuggingEvent::NeedWaitForSubmissionTicket);
+                let _ = pending_io.cancel().await;
+            }
+        });
+        let task_2 = tokio::task::spawn({
+            let client = client.clone();
+            async move {
+                let (reader_2, _writer_2) = pipe().expect("failed to create pipe");
+                let mut buf_2 = [0u8; 64];
+                // The first operation must be running first.
+                let event = first_ack_rx
+                    .recv()
+                    .await
+                    .expect("failed to receive from first ack channel - required to guarantee that the following operation will be stuck");
+                assert_eq!(event, PendingIoDebuggingEvent::SubmissionTicketGranted);
+                // The backpressure thread for this operation will block, cancelling the previous pending I/O
+                // will unblock the backpressure thread.
+                let pending_io = PendingIo::new(UringReadIntoAt::new(
+                    client.uring.as_ref().unwrap(),
+                    &reader_2,
+                    buf_2.as_mut_slice(),
+                    u64::MAX,
+                    Some(second_wait_tx),
+                ));
+                let _ = pending_io.cancel().await;
+            }
+        });
+
+        task_1.await.expect("task 1 should not panic");
+        task_2.await.expect("task 2 should not panic");
     }
 }
