@@ -21,12 +21,19 @@
 //!         - This is useful for structures where there is a user-mode offset field that requires atomic synchronization with the kernel-mode seek position.
 //!     - [`PendingIo`] objects do not implement [`Future`] by default.
 //!         - If you wish to await the I/O operation directly, you can use the crate feature `pending-io-futures`.
-//!
+//!     - The cancellation mechanism uses a dedicated submission queue to prevent deadlocks.
+//!  
 //! # Requirements
 //! - Tokio runtime with at least the `rt` feature enabled. This is because this library uses Tokio's blocking executor for fallback implementations when `io_uring` is not available or supported for the operation.
 //! ```toml
 //! tokio = { version = "1", features = ["rt", "macros"] }
 //! ```
+//! # Architecture
+//! - If io_uring is available, the client consists of 4 main threads:
+//!     - Two collection threads with custom backpressure, one for normal operations and one for cancel operations. These two threads ensure the submission queue never overflows and prevents a non-cancelable io_uring_enter call.
+//!     - One submitter thread for aggregating commands from collection threads and submitting to io_uring.
+//!     - One reaper thread for handling completions from the completion queue.
+//! 
 #![cfg(unix)]
 mod borrowed_buf;
 pub mod client;

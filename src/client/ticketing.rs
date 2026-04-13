@@ -63,6 +63,17 @@ impl SubmissionTicketQueue {
         &self,
         debug_event_tx: Option<&tokio::sync::mpsc::UnboundedSender<PendingIoDebuggingEvent>>,
     ) -> SubmissionTicket {
+        // Short path optimization
+        if debug_event_tx.is_none() {
+            let id = self
+                .submission_ticket_rx
+                .recv()
+                .expect("sender is owned by the submission queue");
+            return SubmissionTicket {
+                id,
+                return_tx: self.submission_ticket_tx.clone(),
+            };
+        }
         // Attempt to receive a ticket without blocking. When it would block, emit a debugging event for testing.
         match self.submission_ticket_rx.try_recv() {
             Ok(id) => {
