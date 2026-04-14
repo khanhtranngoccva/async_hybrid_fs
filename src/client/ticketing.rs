@@ -1,5 +1,5 @@
 use crate::client::pending_io::PendingIoDebuggingEvent;
-use crossbeam_channel::TryRecvError;
+use std::sync::{Arc, Condvar, Mutex};
 
 /// The submission ticket ID, which may be used as the user_data field/entry ID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -11,7 +11,8 @@ pub(crate) struct SubmissionTicketId(pub(crate) u64);
 #[derive(Debug)]
 pub(crate) struct SubmissionTicket {
     id: SubmissionTicketId,
-    return_tx: crossbeam_channel::Sender<SubmissionTicketId>,
+    tickets: Arc<Mutex<Vec<SubmissionTicketId>>>,
+    condvar: Arc<Condvar>,
 }
 
 impl SubmissionTicket {
@@ -22,31 +23,31 @@ impl SubmissionTicket {
 
 impl Drop for SubmissionTicket {
     fn drop(&mut self) {
-        let _ = self.return_tx.send(self.id.clone());
+        let mut tickets = self.tickets.lock().unwrap();
+        tickets.push(self.id.clone());
+        self.condvar.notify_one();
     }
 }
 
 /// A queue of submission tickets.
 #[derive(Debug)]
 pub(crate) struct SubmissionTicketQueue {
-    /// Channel for receiving submission tickets.
-    submission_ticket_rx: crossbeam_channel::Receiver<SubmissionTicketId>,
-    /// Channel for returning submission tickets to the submission queue.
-    submission_ticket_tx: crossbeam_channel::Sender<SubmissionTicketId>,
+    /// Queue of submission tickets.
+    tickets: Arc<Mutex<Vec<SubmissionTicketId>>>,
+    /// Condvar for notifying that a ticket is available.
+    condvar: Arc<Condvar>,
 }
 
 impl SubmissionTicketQueue {
     fn new(size: usize, starting_id: u64) -> Self {
-        let (submission_ticket_tx, submission_ticket_rx) =
-            crossbeam_channel::bounded::<SubmissionTicketId>(size);
-        for i in 0..size {
-            submission_ticket_tx
-                .send(SubmissionTicketId(starting_id + i as u64))
-                .unwrap();
-        }
+        let tickets = Mutex::new(
+            (starting_id..starting_id + size as u64)
+                .map(SubmissionTicketId)
+                .collect(),
+        );
         Self {
-            submission_ticket_rx,
-            submission_ticket_tx,
+            tickets: Arc::new(tickets),
+            condvar: Arc::new(Condvar::new()),
         }
     }
 
@@ -68,100 +69,100 @@ impl SubmissionTicketQueue {
         &self,
         debug_event_tx: Option<&tokio::sync::mpsc::UnboundedSender<PendingIoDebuggingEvent>>,
     ) -> SubmissionTicket {
-        // Short path optimization
-        if debug_event_tx.is_none() {
-            let id = self
-                .submission_ticket_rx
-                .recv()
-                .expect("sender is owned by the submission queue");
-            return SubmissionTicket {
-                id,
-                return_tx: self.submission_ticket_tx.clone(),
-            };
+        let mut tickets = self.tickets.lock().unwrap();
+        let mut wait_event_sent = false;
+        while tickets.is_empty() {
+            if !wait_event_sent {
+                if let Some(debug_event_tx) = debug_event_tx {
+                    debug_event_tx
+                        .send(PendingIoDebuggingEvent::NeedWaitForSubmissionTicket)
+                        .unwrap();
+                }
+                wait_event_sent = true;
+            }
+            tickets = self.condvar.wait(tickets).unwrap();
         }
-        // Attempt to receive a ticket without blocking. When it would block, emit a debugging event for testing.
-        match self.submission_ticket_rx.try_recv() {
-            Ok(id) => {
-                if let Some(debug_event_tx) = debug_event_tx {
-                    let _ = debug_event_tx.send(PendingIoDebuggingEvent::SubmissionTicketGranted);
-                }
-                return SubmissionTicket {
-                    id,
-                    return_tx: self.submission_ticket_tx.clone(),
-                };
-            }
-            Err(TryRecvError::Empty) => {
-                if let Some(debug_event_tx) = debug_event_tx {
-                    let _ =
-                        debug_event_tx.send(PendingIoDebuggingEvent::NeedWaitForSubmissionTicket);
-                }
-            }
-            Err(TryRecvError::Disconnected) => {
-                panic!("submission ticket queue is disconnected");
-            }
-        };
-        // Fall back to blocking recv.
-        let ticket_id = self
-            .submission_ticket_rx
-            .recv()
-            .expect("sender is owned by the submission queue");
+        let id = tickets.pop().unwrap();
         if let Some(debug_event_tx) = debug_event_tx {
-            let _ = debug_event_tx.send(PendingIoDebuggingEvent::SubmissionTicketGranted);
+            debug_event_tx
+                .send(PendingIoDebuggingEvent::SubmissionTicketGranted)
+                .unwrap();
         }
         SubmissionTicket {
-            id: ticket_id,
-            return_tx: self.submission_ticket_tx.clone(),
+            id,
+            tickets: self.tickets.clone(),
+            condvar: self.condvar.clone(),
         }
     }
 }
 
-/// A completion ticket represent a permit to perform a blocking read of the completion queue using `io_uring_enter`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct CompletionTicket();
+#[derive(Debug)]
+struct CompletionTicketState {
+    completion_tickets: usize,
+    dropped: bool,
+}
 
 #[derive(Debug)]
 pub(crate) struct CompletionTicketSubmitter {
-    completion_ticket_tx: crossbeam_channel::Sender<CompletionTicket>,
+    completion_tickets: Arc<Mutex<CompletionTicketState>>,
+    condvar: Arc<Condvar>,
 }
 
 impl CompletionTicketSubmitter {
     pub(crate) fn grant_completion_ticket(&self) {
-        self.completion_ticket_tx
-            .send(CompletionTicket())
-            .expect("completion thread must wait until submission thread exits");
+        let mut completion_ticket_state = self.completion_tickets.lock().unwrap();
+        completion_ticket_state.completion_tickets += 1;
+        self.condvar.notify_one();
+    }
+}
+
+impl Drop for CompletionTicketSubmitter {
+    fn drop(&mut self) {
+        let mut completion_ticket_state = self.completion_tickets.lock().unwrap();
+        completion_ticket_state.dropped = true;
+        self.condvar.notify_all();
     }
 }
 
 /// A queue of completion tickets.
 #[derive(Debug)]
 pub(crate) struct CompletionTicketQueue {
-    /// Channel for receiving completion tickets.
-    completion_ticket_rx: crossbeam_channel::Receiver<CompletionTicket>,
+    completion_tickets: Arc<Mutex<CompletionTicketState>>,
+    condvar: Arc<Condvar>,
 }
 
 impl CompletionTicketQueue {
-    /// Request one or more completion tickets. One completion ticket grants one permit to perform a blocking read using io_uring_enter. If `None` is returned, the completion queue is empty, the caller can exit immediately.
+    /// Request one or more completion tickets.
+    /// One completion ticket grants one permit to perform a blocking read using io_uring_enter.
+    /// If `None` is returned, the completion queue is empty, the caller can exit immediately.
     pub(crate) fn request_completion_tickets(&self) -> Option<usize> {
-        let _ticket = self.completion_ticket_rx.recv().ok()?;
-        // Prevent potential unbounded bugs by limiting the number of tickets that can be received.
-        let received = 1 + self
-            .completion_ticket_rx
-            .try_iter()
-            .take(1048576 - 1)
-            .count();
-        Some(received)
+        let mut completion_tickets_guard = self.completion_tickets.lock().unwrap();
+        while completion_tickets_guard.completion_tickets == 0 {
+            if completion_tickets_guard.dropped {
+                return None;
+            }
+            completion_tickets_guard = self.condvar.wait(completion_tickets_guard).unwrap();
+        }
+        let take_count = completion_tickets_guard.completion_tickets.min(1048576);
+        completion_tickets_guard.completion_tickets -= take_count;
+        Some(take_count)
     }
 }
 
 pub(crate) fn completion_ticket_pair() -> (CompletionTicketSubmitter, CompletionTicketQueue) {
-    let (completion_ticket_tx, completion_ticket_rx) =
-        crossbeam_channel::unbounded::<CompletionTicket>();
+    let completion_tickets = Arc::new(Mutex::new(CompletionTicketState {
+        completion_tickets: 0,
+        dropped: false,
+    }));
+    let condvar = Arc::new(Condvar::new());
     (
         CompletionTicketSubmitter {
-            completion_ticket_tx,
+            completion_tickets: completion_tickets.clone(),
+            condvar: condvar.clone(),
         },
         CompletionTicketQueue {
-            completion_ticket_rx,
+            completion_tickets,
+            condvar,
         },
     )
 }

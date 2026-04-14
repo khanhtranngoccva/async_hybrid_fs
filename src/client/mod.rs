@@ -270,7 +270,8 @@ impl Client {
                 ticketing::completion_ticket_pair();
 
             let ring = Arc::new(ring);
-            let (sender, receiver) = crossbeam_channel::unbounded::<CommandWithTicket>();
+            let (sender, receiver) =
+                crossbeam_channel::bounded::<CommandWithTicket>(actual_total_squeue_size as usize);
             let (normal_sender, normal_receiver) = crossbeam_channel::unbounded();
             let (cancel_sender, cancel_receiver) = crossbeam_channel::unbounded();
             let normal_backpressure_thread = thread::spawn({

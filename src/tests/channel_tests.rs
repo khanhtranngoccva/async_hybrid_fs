@@ -3,8 +3,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-// The request pipeline currently consists of 4 channels, which consumes extra time if they block:
-// - A crossbeam channel for implementing the ticket queue. (approx. 30µs)
+// The request pipeline currently consists of 5 channels, which consumes extra time if they block:
+// - A crossbeam channel for the caller to submit commands to the backpressure queues. 
+// - A crossbeam channel for implementing the ticket queue.
 // - A crossbeam channel for sending commands to the submission thread.
 // - A crossbeam channel for receiving a wait permit.
 // - A tokio::sync::oneshot channel for sending the final operation result.
