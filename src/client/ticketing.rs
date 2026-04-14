@@ -36,24 +36,29 @@ pub(crate) struct SubmissionTicketQueue {
 }
 
 impl SubmissionTicketQueue {
+    fn new(size: usize, starting_id: u64) -> Self {
+        let (submission_ticket_tx, submission_ticket_rx) =
+            crossbeam_channel::bounded::<SubmissionTicketId>(size);
+        for i in 0..size {
+            submission_ticket_tx
+                .send(SubmissionTicketId(starting_id + i as u64))
+                .unwrap();
+        }
+        Self {
+            submission_ticket_rx,
+            submission_ticket_tx,
+        }
+    }
+
     /// Create new submission ticket queues with the given sizes. The queues are pre-populated with the given number of tickets starting with 1,
     /// and the total number of tickets across all ticket queues must not exceed the length of the io_uring submission queue.
+    /// Panics if the total number of tickets exceeds numeric bounds.
     pub(crate) fn new_multiple(sizes: &[usize]) -> Vec<Self> {
         let mut starting_id = 0u64;
         let mut queues = Vec::new();
         for size in sizes {
-            let (submission_ticket_tx, submission_ticket_rx) =
-                crossbeam_channel::bounded::<SubmissionTicketId>(*size);
-            for i in 0..*size {
-                submission_ticket_tx
-                    .send(SubmissionTicketId(starting_id + i as u64))
-                    .unwrap();
-            }
+            queues.push(Self::new(*size, starting_id));
             starting_id += *size as u64;
-            queues.push(Self {
-                submission_ticket_rx,
-                submission_ticket_tx,
-            });
         }
         queues
     }

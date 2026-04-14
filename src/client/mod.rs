@@ -1,7 +1,6 @@
 mod command;
 mod completion;
 mod operations;
-mod pending;
 pub(crate) mod pending_io;
 mod register;
 mod requests;
