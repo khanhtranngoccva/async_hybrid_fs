@@ -3,7 +3,10 @@ use crate::{
     ClientUring, UringTarget,
     client::ticketing::SubmissionTicketId,
     client::{
-        command::Command, completion::ReadResult, pending_io::{PendingIoDebuggingEvent, PendingIoImpl}, requests::ReadRequest,
+        command::Command,
+        completion::ReadResult,
+        pending_io::{PendingIoDebuggingEvent, PendingIoImpl},
+        requests::ReadRequest,
     },
     iobuf::IoBufMut,
     runtime,
@@ -163,7 +166,7 @@ where
     Target: UringTarget + Sync + ?Sized,
     Buf: IoBufMut,
 {
-    pub(crate) fn new(
+    pub(crate) async fn new(
         uring: &'a ClientUring,
         target: &'a Target,
         buf: Buf,
@@ -184,8 +187,7 @@ where
             cancellation: None,
             cancel_done: false,
         };
-        let command = unsafe { op.build_command() };
-        uring.send(command, debug_event_tx);
+        uring.send(&mut op, debug_event_tx).await;
         op
     }
 }

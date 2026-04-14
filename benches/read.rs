@@ -12,6 +12,7 @@ async fn read_dev_zero_hybrid(client: &Client, size: usize) {
             OFlag::O_RDONLY | OFlag::O_CLOEXEC,
             Permissions::from_mode(0o666),
         )
+        .await
         .completion()
         .expect("no completion future returned")
         .await
@@ -23,6 +24,7 @@ async fn read_dev_zero_hybrid(client: &Client, size: usize) {
         let to_read = cmp::min(size, size_left);
         let bytes_read = client
             .read(&mut file, &mut buffer[..to_read])
+            .await
             .completion()
             .expect("no completion future returned")
             .await

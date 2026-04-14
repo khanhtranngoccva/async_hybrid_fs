@@ -23,12 +23,14 @@ async fn test_hybrid_create_and_read_write() {
         .write(true)
         .create(true)
         .open(temp_dir.path().join("test.txt"))
+        .await
         .completion()
         .expect("no completion future returned")
         .await
         .unwrap();
     file.hybrid_write_all(b"Hello, world!").await.unwrap();
     file.hybrid_flush()
+        .await
         .completion()
         .expect("no completion future returned")
         .await
@@ -37,6 +39,7 @@ async fn test_hybrid_create_and_read_write() {
     let mut file = OpenOptions::new()
         .read(true)
         .open(temp_dir.path().join("test.txt"))
+        .await
         .completion()
         .expect("no completion future returned")
         .await
@@ -53,12 +56,14 @@ async fn test_hybrid_seek() {
         .write(true)
         .create(true)
         .open(temp_dir.path().join("test.txt"))
+        .await
         .completion()
         .expect("no completion future returned")
         .await
         .unwrap();
     file.hybrid_write_all(b"Hello, world!").await.unwrap();
     file.hybrid_flush()
+        .await
         .completion()
         .expect("no completion future returned")
         .await
@@ -67,11 +72,13 @@ async fn test_hybrid_seek() {
     let mut file = OpenOptions::new()
         .read(true)
         .open(temp_dir.path().join("test.txt"))
+        .await
         .completion()
         .expect("no completion future returned")
         .await
         .unwrap();
     file.hybrid_seek(SeekFrom::Start(7))
+        .await
         .completion()
         .expect("no completion future returned")
         .await
@@ -88,17 +95,20 @@ async fn test_hybrid_set_len() {
         .write(true)
         .create(true)
         .open(temp_dir.path().join("test.txt"))
+        .await
         .completion()
         .expect("no completion future returned")
         .await
         .unwrap();
     file.hybrid_set_len(10)
+        .await
         .completion()
         .expect("no completion future returned")
         .await
         .unwrap();
     assert_eq!(
         file.hybrid_metadata()
+            .await
             .completion()
             .expect("no completion future returned")
             .await
@@ -115,6 +125,7 @@ async fn test_hybrid_set_times() {
         .write(true)
         .create(true)
         .open(temp_dir.path().join("test.txt"))
+        .await
         .completion()
         .expect("no completion future returned")
         .await
@@ -122,6 +133,7 @@ async fn test_hybrid_set_times() {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
     let tnow = TimeSpec::from_duration(now);
     file.set_times(Some(tnow), Some(tnow))
+        .await
         .completion()
         .expect("no completion future returned")
         .await
@@ -130,11 +142,13 @@ async fn test_hybrid_set_times() {
     let file = OpenOptions::new()
         .read(true)
         .open(temp_dir.path().join("test.txt"))
+        .await
         .completion()
         .expect("no completion future returned")
         .await
         .unwrap();
     let metadata = <File as HybridFile>::metadata(&file)
+        .await
         .completion()
         .expect("no completion future returned")
         .await
@@ -153,16 +167,19 @@ async fn test_hybrid_read_write_vectored() {
         .write(true)
         .create(true)
         .open(temp_dir.path().join("test.txt"))
+        .await
         .completion()
         .expect("no completion future returned")
         .await
         .unwrap();
     file.hybrid_write_vectored(&[IoSlice::new(b"Hello, world!")])
+        .await
         .completion()
         .expect("no completion future returned")
         .await
         .unwrap();
     file.hybrid_flush()
+        .await
         .completion()
         .expect("no completion future returned")
         .await
@@ -171,6 +188,7 @@ async fn test_hybrid_read_write_vectored() {
     let mut file = OpenOptions::new()
         .read(true)
         .open(temp_dir.path().join("test.txt"))
+        .await
         .completion()
         .expect("no completion future returned")
         .await
@@ -179,6 +197,7 @@ async fn test_hybrid_read_write_vectored() {
     let slice = IoSliceMut::new(&mut buffer);
     let bytes_read = file
         .hybrid_read_vectored(&mut [slice])
+        .await
         .completion()
         .expect("no completion future returned")
         .await

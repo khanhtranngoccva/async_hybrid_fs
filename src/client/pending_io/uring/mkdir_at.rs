@@ -139,7 +139,7 @@ impl<'a, DirTarget> UringMkdirAt<'a, DirTarget>
 where
     DirTarget: UringTarget + Sync + ?Sized,
 {
-    pub(crate) fn new(
+    pub(crate) async fn new(
         client: &'a ClientUring,
         dir: &'a DirTarget,
         path: CString,
@@ -161,8 +161,7 @@ where
             cancellation: None,
             cancel_done: false,
         };
-        let command = unsafe { op.build_command() };
-        client.send(command, debug_event_tx);
+        client.send(&mut op, debug_event_tx).await;
         op
     }
 }

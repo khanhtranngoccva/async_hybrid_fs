@@ -164,7 +164,7 @@ mod tests {
         let (pipe_read, _pipe_write) = pipe().expect("should be able to create a pipe");
         let mut buf = [0; 64];
         let mut pipe_read_fd = pipe_read.as_fd();
-        let chained_io = pipe_read_fd.hybrid_read(&mut buf).map(|_| {
+        let chained_io = pipe_read_fd.hybrid_read(&mut buf).await.map(|_| {
             let _ = tx.send(());
         });
         assert!(

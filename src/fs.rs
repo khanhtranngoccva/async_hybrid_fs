@@ -164,7 +164,7 @@ impl OpenOptions {
     /// Opens a file with the configured options.
     ///
     /// Returns a [`tokio::fs::File`] for async operations.
-    pub fn open<'a>(&'a self, path: impl AsRef<Path>) -> PendingIo<'a, io::Result<File>> {
+    pub async fn open<'a>(&'a self, path: impl AsRef<Path>) -> PendingIo<'a, io::Result<File>> {
         let flags = match self.get_flags() {
             Ok(flags) => flags,
             Err(e) => return PendingIo::new(FixedValuePendingIo::new(Err(e))),
@@ -172,6 +172,7 @@ impl OpenOptions {
         let mode = self.get_creation_permissions();
         default::default_client()
             .open_path(path.as_ref(), flags, mode)
+            .await
             .map(|result| result.map(|f| File::from_std(std::fs::File::from(f))))
     }
 
@@ -270,8 +271,8 @@ impl OpenOptions {
     }
 }
 
-pub fn canonicalize(path: impl AsRef<Path>) -> PendingIo<'static, io::Result<PathBuf>> {
-    default::default_client().canonicalize(path)
+pub async fn canonicalize(path: impl AsRef<Path>) -> PendingIo<'static, io::Result<PathBuf>> {
+    default::default_client().canonicalize(path).await
 }
 
 pub async fn copy(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> io::Result<u64> {
@@ -281,35 +282,35 @@ pub async fn copy(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> io::Result<u6
     tokio::task::spawn_blocking(move || std::fs::copy(source, destination)).await?
 }
 
-pub fn chown(
+pub async fn chown(
     path: impl AsRef<Path>,
     uid: Option<Uid>,
     gid: Option<Gid>,
 ) -> PendingIo<'static, io::Result<()>> {
-    default::default_client().chown(path, uid, gid)
+    default::default_client().chown(path, uid, gid).await
 }
 
-pub fn lchown(
+pub async fn lchown(
     path: impl AsRef<Path>,
     uid: Option<Uid>,
     gid: Option<Gid>,
 ) -> PendingIo<'static, io::Result<()>> {
-    default::default_client().lchown(path, uid, gid)
+    default::default_client().lchown(path, uid, gid).await
 }
 
-pub fn create_dir(path: impl AsRef<Path>) -> PendingIo<'static, io::Result<()>> {
-    default::default_client().create_dir(path)
+pub async fn create_dir(path: impl AsRef<Path>) -> PendingIo<'static, io::Result<()>> {
+    default::default_client().create_dir(path).await
 }
 
 pub async fn create_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
     default::default_client().create_dir_all(path).await
 }
 
-pub fn create_dir_with_permissions(
+pub async fn create_dir_with_permissions(
     path: impl AsRef<Path>,
     permissions: Permissions,
 ) -> PendingIo<'static, io::Result<()>> {
-    default::default_client().mkdir(path, permissions)
+    default::default_client().mkdir(path, permissions).await
 }
 
 pub async fn create_dir_all_with_permissions(
@@ -321,17 +322,20 @@ pub async fn create_dir_all_with_permissions(
         .await
 }
 
-pub fn create_node(
+pub async fn create_node(
     path: impl AsRef<Path>,
     kind: MknodType,
     permissions: Permissions,
 ) -> PendingIo<'static, io::Result<()>> {
-    default::default_client().mknod(path, kind, permissions)
+    default::default_client()
+        .mknod(path, kind, permissions)
+        .await
 }
 
-pub fn exists(path: impl AsRef<Path>) -> PendingIo<'static, io::Result<bool>> {
+pub async fn exists(path: impl AsRef<Path>) -> PendingIo<'static, io::Result<bool>> {
     default::default_client()
         .metadata_path(path)
+        .await
         .map(|result| match result {
             Ok(_) => Ok(true),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
@@ -339,19 +343,19 @@ pub fn exists(path: impl AsRef<Path>) -> PendingIo<'static, io::Result<bool>> {
         })
 }
 
-pub fn hard_link(
+pub async fn hard_link(
     src: impl AsRef<Path>,
     dst: impl AsRef<Path>,
 ) -> PendingIo<'static, io::Result<()>> {
-    default::default_client().hard_link(src, dst)
+    default::default_client().hard_link(src, dst).await
 }
 
-pub fn metadata(path: impl AsRef<Path>) -> PendingIo<'static, io::Result<Metadata>> {
-    default::default_client().metadata_path(path)
+pub async fn metadata(path: impl AsRef<Path>) -> PendingIo<'static, io::Result<Metadata>> {
+    default::default_client().metadata_path(path).await
 }
 
-pub fn symlink_metadata(path: impl AsRef<Path>) -> PendingIo<'static, io::Result<Metadata>> {
-    default::default_client().symlink_metadata_path(path)
+pub async fn symlink_metadata(path: impl AsRef<Path>) -> PendingIo<'static, io::Result<Metadata>> {
+    default::default_client().symlink_metadata_path(path).await
 }
 
 pub async fn read_dir(path: impl AsRef<Path>) -> io::Result<tokio::fs::ReadDir> {
@@ -359,14 +363,15 @@ pub async fn read_dir(path: impl AsRef<Path>) -> io::Result<tokio::fs::ReadDir> 
     tokio::fs::read_dir(path).await
 }
 
-pub fn read_link(path: impl AsRef<Path>) -> PendingIo<'static, io::Result<PathBuf>> {
-    default::default_client().read_link(path)
+pub async fn read_link(path: impl AsRef<Path>) -> PendingIo<'static, io::Result<PathBuf>> {
+    default::default_client().read_link(path).await
 }
 
 pub async fn read_to_string(path: impl AsRef<Path>) -> io::Result<String> {
     let mut file = OpenOptions::new()
         .read(true)
         .open(path)
+        .await
         .completion()
         .expect("no completion future returned")
         .await?;
@@ -377,14 +382,15 @@ pub async fn read_to_string(path: impl AsRef<Path>) -> io::Result<String> {
     Ok(buf)
 }
 
-pub fn remove_dir(path: impl AsRef<Path>) -> PendingIo<'static, io::Result<()>> {
-    default::default_client().rmdir(path)
+pub async fn remove_dir(path: impl AsRef<Path>) -> PendingIo<'static, io::Result<()>> {
+    default::default_client().rmdir(path).await
 }
 
 pub async fn remove_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
     let client = default::default_client();
     let metadata = client
         .metadata_path(path.as_ref())
+        .await
         .completion()
         .expect("no completion future returned")
         .await?;
@@ -392,6 +398,7 @@ pub async fn remove_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
     if filetype.is_symlink() {
         client
             .unlink(path)
+            .await
             .completion()
             .expect("no completion future returned")
             .await
@@ -421,6 +428,7 @@ async fn remove_dir_all_recursive(path: &Path) -> io::Result<()> {
             }
             Ok(_) => match client
                 .unlink(&child.path())
+                .await
                 .completion()
                 .expect("no completion future returned")
                 .await
@@ -435,6 +443,7 @@ async fn remove_dir_all_recursive(path: &Path) -> io::Result<()> {
     }
     match client
         .rmdir(path)
+        .await
         .completion()
         .expect("no completion future returned")
         .await
@@ -445,84 +454,85 @@ async fn remove_dir_all_recursive(path: &Path) -> io::Result<()> {
     }
 }
 
-pub fn remove_file(path: impl AsRef<Path>) -> PendingIo<'static, io::Result<()>> {
-    default::default_client().unlink(path)
+pub async fn remove_file(path: impl AsRef<Path>) -> PendingIo<'static, io::Result<()>> {
+    default::default_client().unlink(path).await
 }
 
-pub fn rename(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> PendingIo<'static, io::Result<()>> {
-    default::default_client().rename(src, dst)
+pub async fn rename(
+    src: impl AsRef<Path>,
+    dst: impl AsRef<Path>,
+) -> PendingIo<'static, io::Result<()>> {
+    default::default_client().rename(src, dst).await
 }
 
-pub fn set_owner(
+pub async fn set_owner(
     path: impl AsRef<Path>,
     uid: Option<Uid>,
     gid: Option<Gid>,
 ) -> PendingIo<'static, io::Result<()>> {
-    default::default_client().chown(path, uid, gid)
+    default::default_client().chown(path, uid, gid).await
 }
 
-pub fn set_owner_nofollow(
+pub async fn set_owner_nofollow(
     path: impl AsRef<Path>,
     uid: Option<Uid>,
     gid: Option<Gid>,
 ) -> PendingIo<'static, io::Result<()>> {
-    default::default_client().lchown(path, uid, gid)
+    default::default_client().lchown(path, uid, gid).await
 }
 
-pub fn set_permissions(
+pub async fn set_permissions(
     path: impl AsRef<Path>,
     permissions: Permissions,
 ) -> PendingIo<'static, io::Result<()>> {
-    default::default_client().chmod(path, permissions)
+    default::default_client().chmod(path, permissions).await
 }
 
-pub fn set_permissions_nofollow(
+pub async fn set_permissions_nofollow(
     path: impl AsRef<Path>,
     permissions: Permissions,
 ) -> PendingIo<'static, io::Result<()>> {
-    default::default_client().lchmod(path, permissions)
+    default::default_client().lchmod(path, permissions).await
 }
 
-pub fn set_times(
+pub async fn set_times(
     path: impl AsRef<Path>,
     atime: Option<TimeSpec>,
     mtime: Option<TimeSpec>,
 ) -> PendingIo<'static, io::Result<()>> {
-    default::default_client().utimens_at(
-        &AT_FDCWD,
-        path,
-        atime,
-        mtime,
-        UtimensatFlags::FollowSymlink,
-    )
+    default::default_client()
+        .utimens_at(&AT_FDCWD, path, atime, mtime, UtimensatFlags::FollowSymlink)
+        .await
 }
 
-pub fn set_times_nofollow(
+pub async fn set_times_nofollow(
     path: impl AsRef<Path>,
     atime: Option<TimeSpec>,
     mtime: Option<TimeSpec>,
 ) -> PendingIo<'static, io::Result<()>> {
-    default::default_client().utimens_at(
-        &AT_FDCWD,
-        path,
-        atime,
-        mtime,
-        UtimensatFlags::NoFollowSymlink,
-    )
+    default::default_client()
+        .utimens_at(
+            &AT_FDCWD,
+            path,
+            atime,
+            mtime,
+            UtimensatFlags::NoFollowSymlink,
+        )
+        .await
 }
 
-pub fn soft_link(
+pub async fn soft_link(
     target: impl AsRef<Path>,
     link: impl AsRef<Path>,
 ) -> PendingIo<'static, io::Result<()>> {
-    default::default_client().symlink(target, link)
+    default::default_client().symlink(target, link).await
 }
 
-pub fn symlink(
+pub async fn symlink(
     target: impl AsRef<Path>,
     link: impl AsRef<Path>,
 ) -> PendingIo<'static, io::Result<()>> {
-    default::default_client().symlink(target, link)
+    default::default_client().symlink(target, link).await
 }
 
 pub async fn write(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> io::Result<()> {
@@ -530,6 +540,7 @@ pub async fn write(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> io::Re
         .write(true)
         .create(true)
         .open(path)
+        .await
         .completion()
         .expect("no completion future returned")
         .await?;

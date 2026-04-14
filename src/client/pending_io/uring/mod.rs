@@ -57,7 +57,7 @@ mod tests {
                 let (pipe_read, _pipe_write) = pipe().expect("should be able to create a pipe");
                 let mut buf = [0; 64];
                 let mut pipe_read_fd = pipe_read.as_fd();
-                let mut pending_io = pipe_read_fd.hybrid_read(&mut buf).map(|_| {
+                let mut pending_io = pipe_read_fd.hybrid_read(&mut buf).await.map(|_| {
                     let _ = tx.send(());
                 });
                 let future = pending_io
@@ -102,7 +102,7 @@ mod tests {
                     .expect("should be able to set nonblocking");
                 let mut buf = [0; 64];
                 let mut pipe_read_fd = pipe_read.as_fd();
-                let mut pending_io = pipe_read_fd.hybrid_read(&mut buf).map(|_| {
+                let mut pending_io = pipe_read_fd.hybrid_read(&mut buf).await.map(|_| {
                     let _ = tx.send(());
                 });
                 let future = pending_io
@@ -141,7 +141,7 @@ mod tests {
                 let (pipe_read, _pipe_write) = pipe().expect("should be able to create a pipe");
                 let mut buf = [0; 64];
                 let mut pipe_read_fd = pipe_read.as_fd();
-                let mut pending_io = pipe_read_fd.hybrid_read(&mut buf).map(|_| {
+                let mut pending_io = pipe_read_fd.hybrid_read(&mut buf).await.map(|_| {
                     let _ = tx.send(());
                 });
                 let future = pending_io
@@ -179,13 +179,16 @@ mod tests {
         }
         let (pipe_read, _pipe_write) = pipe().expect("should be able to create a pipe");
         let mut buf = [0u8; 64];
-        let pending_io = PendingIo::new(UringReadIntoAt::new(
-            client.uring.as_ref().unwrap(),
-            &pipe_read,
-            buf.as_mut_slice(),
-            u64::MAX,
-            None,
-        ));
+        let pending_io = PendingIo::new(
+            UringReadIntoAt::new(
+                client.uring.as_ref().unwrap(),
+                &pipe_read,
+                buf.as_mut_slice(),
+                u64::MAX,
+                None,
+            )
+            .await,
+        );
         drop(pending_io);
     }
 
@@ -216,13 +219,16 @@ mod tests {
             async move {
                 let (reader_1, _writer_1) = pipe().expect("failed to create pipe");
                 let mut buf_1 = [0u8; 64];
-                let pending_io = PendingIo::new(UringReadIntoAt::new(
-                    client.uring.as_ref().unwrap(),
-                    &reader_1,
-                    buf_1.as_mut_slice(),
-                    u64::MAX,
-                    Some(first_ack_tx),
-                ));
+                let pending_io = PendingIo::new(
+                    UringReadIntoAt::new(
+                        client.uring.as_ref().unwrap(),
+                        &reader_1,
+                        buf_1.as_mut_slice(),
+                        u64::MAX,
+                        Some(first_ack_tx),
+                    )
+                    .await,
+                );
                 let event = second_wait_rx
                     .recv()
                     .await
@@ -244,13 +250,16 @@ mod tests {
                 assert_eq!(event, PendingIoDebuggingEvent::SubmissionTicketGranted);
                 // The backpressure thread for this operation will block, cancelling the previous pending I/O
                 // will unblock the backpressure thread.
-                let pending_io = PendingIo::new(UringReadIntoAt::new(
-                    client.uring.as_ref().unwrap(),
-                    &reader_2,
-                    buf_2.as_mut_slice(),
-                    u64::MAX,
-                    Some(second_wait_tx),
-                ));
+                let pending_io = PendingIo::new(
+                    UringReadIntoAt::new(
+                        client.uring.as_ref().unwrap(),
+                        &reader_2,
+                        buf_2.as_mut_slice(),
+                        u64::MAX,
+                        Some(second_wait_tx),
+                    )
+                    .await,
+                );
                 let _ = pending_io.cancel().await;
             }
         });

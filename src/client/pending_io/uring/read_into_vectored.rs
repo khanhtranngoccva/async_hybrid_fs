@@ -168,7 +168,7 @@ where
     Target: UringTarget + Sync + ?Sized,
     Buf: IoBufMut,
 {
-    pub(crate) fn new(
+    pub(crate) async fn new(
         uring: &'a ClientUring,
         target: &'a Target,
         mut bufs: Vec<Buf>,
@@ -198,8 +198,7 @@ where
             cancellation: None,
             cancel_done: false,
         };
-        let command = unsafe { op.build_command() };
-        uring.send(command, debug_event_tx);
+        uring.send(&mut op, debug_event_tx).await;
         op
     }
 }

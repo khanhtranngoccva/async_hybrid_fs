@@ -129,7 +129,7 @@ impl<'a, Target> UringSync<'a, Target>
 where
     Target: UringTarget + Sync + ?Sized,
 {
-    pub(crate) fn new(uring: &'a ClientUring, target: &'a Target, datasync: bool, debug_event_tx: Option<tokio::sync::mpsc::UnboundedSender<PendingIoDebuggingEvent>>) -> Self {
+    pub(crate) async fn new(uring: &'a ClientUring, target: &'a Target, datasync: bool, debug_event_tx: Option<tokio::sync::mpsc::UnboundedSender<PendingIoDebuggingEvent>>) -> Self {
         let (ack_tx, ack_rx) = oneshot::channel();
         let (result_tx, result_rx) = oneshot_async::channel();
         let mut op = Self {
@@ -144,8 +144,7 @@ where
             cancellation: None,
             cancel_done: false,
         };
-        let command = unsafe { op.build_command() };
-        uring.send(command, debug_event_tx);
+        uring.send(&mut op, debug_event_tx).await;
         op
     }
 }

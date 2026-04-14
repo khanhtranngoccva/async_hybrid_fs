@@ -50,6 +50,9 @@ pub(crate) struct ClientUring {
         Command,
         Option<tokio::sync::mpsc::UnboundedSender<PendingIoDebuggingEvent>>,
     )>,
+    direct_sender: crossbeam_channel::Sender<CommandWithTicket>,
+    normal_submission_ticket_queue: Arc<SubmissionTicketQueue>,
+    cancel_submission_ticket_queue: Arc<SubmissionTicketQueue>,
     normal_backpressure_thread: JoinHandle<()>,
     cancel_backpressure_thread: JoinHandle<()>,
     uring: Arc<IoUring>,
@@ -69,6 +72,7 @@ impl Drop for Client {
             // Drop the senders to prevent any more commands from being submitted.
             drop(uring.normal_sender);
             drop(uring.cancel_sender);
+            drop(uring.direct_sender);
             drop(uring.uring);
             // Join the backpressure threads.
             uring
@@ -264,8 +268,8 @@ impl Client {
                 op_ticket_queue_size,
                 cancel_ticket_queue_size,
             ]);
-            let cancel_submission_ticket_queue = ticket_queues.pop().unwrap();
-            let normal_submission_ticket_queue = ticket_queues.pop().unwrap();
+            let cancel_submission_ticket_queue = Arc::new(ticket_queues.pop().unwrap());
+            let normal_submission_ticket_queue = Arc::new(ticket_queues.pop().unwrap());
             let (completion_ticket_submitter, completion_ticket_queue) =
                 ticketing::completion_ticket_pair();
 
@@ -276,12 +280,14 @@ impl Client {
             let (cancel_sender, cancel_receiver) = crossbeam_channel::unbounded();
             let normal_backpressure_thread = thread::spawn({
                 let dispatch = sender.clone();
+                let normal_submission_ticket_queue = normal_submission_ticket_queue.clone();
                 move || {
                     backpressure_thread(normal_receiver, normal_submission_ticket_queue, dispatch)
                 }
             });
             let cancel_backpressure_thread = thread::spawn({
                 let dispatch = sender.clone();
+                let cancel_submission_ticket_queue = cancel_submission_ticket_queue.clone();
                 move || {
                     backpressure_thread(cancel_receiver, cancel_submission_ticket_queue, dispatch)
                 }
@@ -301,8 +307,11 @@ impl Client {
             client.uring = Some(ClientUring {
                 normal_sender,
                 cancel_sender,
+                direct_sender: sender,
                 uring: ring,
                 probe: probe,
+                normal_submission_ticket_queue,
+                cancel_submission_ticket_queue,
                 normal_backpressure_thread,
                 cancel_backpressure_thread,
                 uring_sthread: sthread,
@@ -322,22 +331,22 @@ fn backpressure_thread(
         Command,
         Option<tokio::sync::mpsc::UnboundedSender<PendingIoDebuggingEvent>>,
     )>,
-    ticket_queue: SubmissionTicketQueue,
+    ticket_queue: Arc<SubmissionTicketQueue>,
     dispatch: crossbeam_channel::Sender<CommandWithTicket>,
 ) {
-    loop {
-        let (command, debugging_event_tx) = match command_receiver.recv() {
-            Ok(item) => item,
-            Err(crossbeam_channel::RecvError) => break,
-        };
-        let ticket = ticket_queue.request_submission_ticket(debugging_event_tx.as_ref());
-        dispatch
-            .send(CommandWithTicket {
-                submission_ticket: ticket,
-                command,
-            })
-            .expect("main submission thread dead");
-    }
+    // loop {
+    //     let (command, debugging_event_tx) = match command_receiver.recv() {
+    //         Ok(item) => item,
+    //         Err(crossbeam_channel::RecvError) => break,
+    //     };
+    //     let ticket = ticket_queue.request_submission_ticket(debugging_event_tx.as_ref());
+    //     dispatch
+    //         .send(CommandWithTicket {
+    //             submission_ticket: ticket,
+    //             command,
+    //         })
+    //         .expect("main submission thread dead");
+    // }
 }
 
 /// Thread for aggregating events from backpressure threads and submitting them to the io_uring submission queue.

@@ -2,7 +2,11 @@ use super::{UringPendingIo, macros};
 use crate::client::ticketing::SubmissionTicketId;
 use crate::{
     ClientUring, UringTarget,
-    client::{command::Command, pending_io::{PendingIoDebuggingEvent, PendingIoImpl}, requests::OpenAtRequest},
+    client::{
+        command::Command,
+        pending_io::{PendingIoDebuggingEvent, PendingIoImpl},
+        requests::OpenAtRequest,
+    },
     runtime,
 };
 use nix::{fcntl::OFlag, sys::stat::Mode};
@@ -138,7 +142,7 @@ impl<'a, Target> UringOpenAt<'a, Target>
 where
     Target: UringTarget + Sync + ?Sized,
 {
-    pub(crate) fn new(
+    pub(crate) async fn new(
         uring: &'a ClientUring,
         dir_target: &'a Target,
         path: CString,
@@ -162,8 +166,7 @@ where
             cancellation: None,
             cancel_done: false,
         };
-        let command = unsafe { op.build_command() };
-        uring.send(command, debug_event_tx);
+        uring.send(&mut op, debug_event_tx).await;
         op
     }
 }

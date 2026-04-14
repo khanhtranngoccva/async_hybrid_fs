@@ -134,7 +134,7 @@ impl<'a, Target> UringFtruncate<'a, Target>
 where
     Target: UringTarget + Sync + ?Sized,
 {
-    pub(crate) fn new(
+    pub(crate) async fn new(
         client: &'a ClientUring,
         target: &'a Target,
         len: u64,
@@ -154,8 +154,7 @@ where
             cancellation: None,
             cancel_done: false,
         };
-        let command = unsafe { op.build_command() };
-        client.send(command, debug_event_tx);
+        client.send(&mut op, debug_event_tx).await;
         op
     }
 }

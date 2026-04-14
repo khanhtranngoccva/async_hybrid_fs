@@ -111,7 +111,7 @@ impl<'a, Target> UringClose<'a, Target>
 where
     Target: IntoRawFd + Sized + Send,
 {
-    pub(crate) fn new(
+    pub(crate) async fn new(
         client: &'a ClientUring,
         target: Target,
         debug_event_tx: Option<tokio::sync::mpsc::UnboundedSender<PendingIoDebuggingEvent>>,
@@ -124,8 +124,7 @@ where
             state: Some(CompletionState { result_rx }),
             _client: client,
         };
-        let command = unsafe { op.build_command() };
-        client.send(command, debug_event_tx);
+        client.send(&mut op, debug_event_tx).await;
         op
     }
 }

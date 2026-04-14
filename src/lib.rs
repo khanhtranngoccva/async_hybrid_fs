@@ -94,13 +94,13 @@ pub use iobuf::IoBufMut;
 pub trait HybridRead: UringTarget + Sync + Send {
     /// Asynchronous version of [`std::io::Read::read`].
     #[inline]
-    fn read<'a>(&'a mut self, buf: &'a mut [u8]) -> PendingIo<'a, io::Result<usize>> {
-        self.hybrid_read(buf)
+    async fn read<'a>(&'a mut self, buf: &'a mut [u8]) -> PendingIo<'a, io::Result<usize>> {
+        self.hybrid_read(buf).await
     }
 
     /// Alias for [`HybridRead::read`].
-    fn hybrid_read<'a>(&'a mut self, buf: &'a mut [u8]) -> PendingIo<'a, io::Result<usize>> {
-        default_client().read(self, buf)
+    async fn hybrid_read<'a>(&'a mut self, buf: &'a mut [u8]) -> PendingIo<'a, io::Result<usize>> {
+        default_client().read(self, buf).await
     }
 
     /// Asynchronous version of [`std::io::Read::read_to_end`].
@@ -138,21 +138,21 @@ pub trait HybridRead: UringTarget + Sync + Send {
 
     /// Asynchronous version of [`std::os::unix::fs::FileExt::read_at`].
     #[inline]
-    fn read_at<'a>(
+    async fn read_at<'a>(
         &'a self,
         buf: &'a mut [u8],
         offset: impl TryInto<u64> + Send,
     ) -> PendingIo<'a, io::Result<usize>> {
-        self.hybrid_read_at(buf, offset)
+        self.hybrid_read_at(buf, offset).await
     }
 
     /// Alias for [`HybridRead::read_at`].
-    fn hybrid_read_at<'a>(
+    async fn hybrid_read_at<'a>(
         &'a self,
         buf: &'a mut [u8],
         offset: impl TryInto<u64> + Send,
     ) -> PendingIo<'a, io::Result<usize>> {
-        default_client().read_at(self, buf, offset)
+        default_client().read_at(self, buf, offset).await
     }
 
     /// Asynchronous version of [`std::os::unix::fs::FileExt::read_exact_at`].
@@ -175,37 +175,37 @@ pub trait HybridRead: UringTarget + Sync + Send {
     }
 
     /// Asynchronous version of [`std::io::Read::read_vectored`].
-    fn read_vectored<'a>(
+    async fn read_vectored<'a>(
         &'a mut self,
         buf: &'a mut [IoSliceMut<'a>],
     ) -> PendingIo<'a, io::Result<usize>> {
-        self.hybrid_read_vectored(buf)
+        self.hybrid_read_vectored(buf).await
     }
 
     /// Alias for [`HybridRead::read_vectored`].
-    fn hybrid_read_vectored<'a>(
+    async fn hybrid_read_vectored<'a>(
         &'a mut self,
         buf: &'a mut [IoSliceMut<'a>],
     ) -> PendingIo<'a, io::Result<usize>> {
-        default_client().read_vectored(self, buf)
+        default_client().read_vectored(self, buf).await
     }
 
     /// Asynchronous version of [`std::os::unix::fs::FileExt::read_vectored_at`].
-    fn read_vectored_at<'a>(
+    async fn read_vectored_at<'a>(
         &'a self,
         buf: &'a mut [IoSliceMut<'a>],
         offset: impl TryInto<u64> + Send,
     ) -> PendingIo<'a, io::Result<usize>> {
-        self.hybrid_read_vectored_at(buf, offset)
+        self.hybrid_read_vectored_at(buf, offset).await
     }
 
     /// Alias for [`HybridRead::read_vectored_at`].
-    fn hybrid_read_vectored_at<'a>(
+    async fn hybrid_read_vectored_at<'a>(
         &'a self,
         buf: &'a mut [IoSliceMut<'a>],
         offset: impl TryInto<u64> + Send,
     ) -> PendingIo<'a, io::Result<usize>> {
-        default_client().read_vectored_at(self, buf, offset)
+        default_client().read_vectored_at(self, buf, offset).await
     }
 
     /// Standard library compatible method for creating a reference to the reader.
@@ -233,13 +233,13 @@ pub trait HybridRead: UringTarget + Sync + Send {
 pub trait HybridWrite: UringTarget + Sync + Send {
     /// Asynchronous version of [`std::io::Write::write`].
     #[inline]
-    fn write<'a>(&'a mut self, buf: &'a [u8]) -> PendingIo<'a, io::Result<usize>> {
-        self.hybrid_write(buf)
+    async fn write<'a>(&'a mut self, buf: &'a [u8]) -> PendingIo<'a, io::Result<usize>> {
+        self.hybrid_write(buf).await
     }
 
     /// Alias for [`HybridWrite::write`].
-    fn hybrid_write<'a>(&'a mut self, buf: &'a [u8]) -> PendingIo<'a, io::Result<usize>> {
-        default_client().write(self, buf)
+    async fn hybrid_write<'a>(&'a mut self, buf: &'a [u8]) -> PendingIo<'a, io::Result<usize>> {
+        default_client().write(self, buf).await
     }
 
     /// Asynchronous version of [`std::io::Write::write_all`].
@@ -270,66 +270,66 @@ pub trait HybridWrite: UringTarget + Sync + Send {
 
     /// Asynchronous version of [`std::io::Write::write_at`].
     #[inline]
-    fn write_at<'a>(
+    async fn write_at<'a>(
         &'a self,
         buf: &'a [u8],
         offset: impl TryInto<u64> + Send,
     ) -> PendingIo<'a, io::Result<usize>> {
-        self.hybrid_write_at(buf, offset)
+        self.hybrid_write_at(buf, offset).await
     }
 
     /// Alias for [`HybridWrite::write_at`].
-    fn hybrid_write_at<'a>(
+    async fn hybrid_write_at<'a>(
         &'a self,
         buf: &'a [u8],
         offset: impl TryInto<u64> + Send,
     ) -> PendingIo<'a, io::Result<usize>> {
-        default_client().write_at(self, buf, offset)
+        default_client().write_at(self, buf, offset).await
     }
 
     /// Asynchronous version of [`std::io::Write::write_vectored`].
-    fn write_vectored<'a>(
+    async fn write_vectored<'a>(
         &'a mut self,
         buf: &'a [IoSlice<'a>],
     ) -> PendingIo<'a, io::Result<usize>> {
-        self.hybrid_write_vectored(buf)
+        self.hybrid_write_vectored(buf).await
     }
 
     /// Alias for [`HybridWrite::write_vectored`].
-    fn hybrid_write_vectored<'a>(
+    async fn hybrid_write_vectored<'a>(
         &'a mut self,
         buf: &'a [IoSlice<'a>],
     ) -> PendingIo<'a, io::Result<usize>> {
-        default_client().write_vectored(self, buf)
+        default_client().write_vectored(self, buf).await
     }
 
     /// Asynchronous version of [`std::os::unix::fs::FileExt::write_vectored_at`].
-    fn write_vectored_at<'a>(
+    async fn write_vectored_at<'a>(
         &'a self,
         buf: &'a [IoSlice<'a>],
         offset: impl TryInto<u64> + Send,
     ) -> PendingIo<'a, io::Result<usize>> {
-        self.hybrid_write_vectored_at(buf, offset)
+        self.hybrid_write_vectored_at(buf, offset).await
     }
 
     /// Alias for [`HybridWrite::write_vectored_at`].
-    fn hybrid_write_vectored_at<'a>(
+    async fn hybrid_write_vectored_at<'a>(
         &'a self,
         buf: &'a [IoSlice<'a>],
         offset: impl TryInto<u64> + Send,
     ) -> PendingIo<'a, io::Result<usize>> {
-        default_client().write_vectored_at(self, buf, offset)
+        default_client().write_vectored_at(self, buf, offset).await
     }
 
     /// Asynchronous version of [`std::io::Write::flush`].
     #[inline]
-    fn flush<'a>(&'a mut self) -> PendingIo<'a, io::Result<()>> {
-        self.hybrid_flush()
+    async fn flush<'a>(&'a mut self) -> PendingIo<'a, io::Result<()>> {
+        self.hybrid_flush().await
     }
 
     /// Alias for [`HybridWrite::flush`].
-    fn hybrid_flush<'a>(&'a mut self) -> PendingIo<'a, io::Result<()>> {
-        default_client().flush(self)
+    async fn hybrid_flush<'a>(&'a mut self) -> PendingIo<'a, io::Result<()>> {
+        default_client().flush(self).await
     }
 
     /// Standard library compatible method for creating a reference to the writer.
@@ -355,160 +355,169 @@ pub trait HybridWrite: UringTarget + Sync + Send {
 pub trait HybridSeek: UringTarget + Sync + Send {
     /// Asynchronous version of [`std::io::Seek::seek`].
     #[inline]
-    fn seek<'a>(&'a mut self, offset: SeekFrom) -> PendingIo<'a, io::Result<u64>> {
-        self.hybrid_seek(offset)
+    async fn seek<'a>(&'a mut self, offset: SeekFrom) -> PendingIo<'a, io::Result<u64>> {
+        self.hybrid_seek(offset).await
     }
 
     /// Alias for [`HybridSeek::seek`].
-    fn hybrid_seek<'a>(&'a mut self, offset: SeekFrom) -> PendingIo<'a, io::Result<u64>> {
-        default_client().seek(self, offset)
+    async fn hybrid_seek<'a>(&'a mut self, offset: SeekFrom) -> PendingIo<'a, io::Result<u64>> {
+        default_client().seek(self, offset).await
     }
 
     /// Low-level method for seeking to a specific offset in the file.
     #[inline]
-    fn seek_ll<'a>(
+    async fn seek_ll<'a>(
         &'a mut self,
         whence: nix::unistd::Whence,
         offset: impl TryInto<i64> + Send,
     ) -> PendingIo<'a, io::Result<u64>> {
-        self.hybrid_seek_ll(whence, offset)
+        self.hybrid_seek_ll(whence, offset).await
     }
 
     /// Alias for [`HybridSeek::seek_ll`].
-    fn hybrid_seek_ll<'a>(
+    async fn hybrid_seek_ll<'a>(
         &'a mut self,
         whence: nix::unistd::Whence,
         offset: impl TryInto<i64> + Send,
     ) -> PendingIo<'a, io::Result<u64>> {
-        default_client().seek_ll(self, whence, offset)
+        default_client().seek_ll(self, whence, offset).await
     }
 }
 
 #[async_trait::async_trait]
 pub trait HybridFile: UringTarget + Sync + Send {
-    fn close<'a>(self) -> PendingIo<'a, io::Result<()>>
+    async fn close<'a>(self) -> PendingIo<'a, io::Result<()>>
     where
         Self: IntoRawFd + Sized + Send + 'a,
     {
-        default_client().close(self)
+        default_client().close(self).await
     }
 
     /// Asynchronous version of [`std::io::File::metadata`].
     #[inline]
-    fn metadata<'a>(&'a self) -> PendingIo<'a, io::Result<Metadata>> {
-        self.hybrid_metadata()
+    async fn metadata<'a>(&'a self) -> PendingIo<'a, io::Result<Metadata>> {
+        self.hybrid_metadata().await
     }
 
     /// Alias for [`HybridFile::metadata`].
-    fn hybrid_metadata<'a>(&'a self) -> PendingIo<'a, io::Result<Metadata>> {
-        default_client().metadata(self)
+    async fn hybrid_metadata<'a>(&'a self) -> PendingIo<'a, io::Result<Metadata>> {
+        default_client().metadata(self).await
     }
 
     /// Asynchronous version of [`std::io::File::set_len`].
     #[inline]
-    fn set_len<'a>(&'a self, size: u64) -> PendingIo<'a, io::Result<()>> {
-        self.hybrid_set_len(size)
+    async fn set_len<'a>(&'a self, size: u64) -> PendingIo<'a, io::Result<()>> {
+        self.hybrid_set_len(size).await
     }
 
     /// Alias for [`HybridFile::set_len`].
-    fn hybrid_set_len<'a>(&'a self, size: u64) -> PendingIo<'a, io::Result<()>> {
-        default_client().ftruncate(self, size)
+    async fn hybrid_set_len<'a>(&'a self, size: u64) -> PendingIo<'a, io::Result<()>> {
+        default_client().ftruncate(self, size).await
     }
 
     /// Asynchronous version of [`std::io::File::set_times`].
     #[inline]
-    fn set_times<'a>(
+    async fn set_times<'a>(
         &'a self,
         atime: Option<TimeSpec>,
         mtime: Option<TimeSpec>,
     ) -> PendingIo<'a, io::Result<()>> {
-        self.hybrid_set_times(atime, mtime)
+        self.hybrid_set_times(atime, mtime).await
     }
 
     /// Alias for [`HybridFile::set_times`].
-    fn hybrid_set_times<'a>(
+    async fn hybrid_set_times<'a>(
         &'a self,
         atime: Option<TimeSpec>,
         mtime: Option<TimeSpec>,
     ) -> PendingIo<'a, io::Result<()>> {
-        default_client().futimens(self, atime, mtime)
+        default_client().futimens(self, atime, mtime).await
     }
 
     /// Asynchronous version of [`std::io::File::set_permissions`].
     #[inline]
-    fn set_permissions<'a>(&'a self, permissions: Permissions) -> PendingIo<'a, io::Result<()>> {
-        self.hybrid_set_permissions(permissions)
-    }
-
-    /// Alias for [`HybridFile::set_permissions`].
-    fn hybrid_set_permissions<'a>(
+    async fn set_permissions<'a>(
         &'a self,
         permissions: Permissions,
     ) -> PendingIo<'a, io::Result<()>> {
-        default_client().fchmod(self, permissions)
+        self.hybrid_set_permissions(permissions).await
+    }
+
+    /// Alias for [`HybridFile::set_permissions`].
+    async fn hybrid_set_permissions<'a>(
+        &'a self,
+        permissions: Permissions,
+    ) -> PendingIo<'a, io::Result<()>> {
+        default_client().fchmod(self, permissions).await
     }
 
     /// Asynchronous version of [`std::os::unix::fs::fchown`].
     #[inline]
-    fn set_owner<'a>(
+    async fn set_owner<'a>(
         &'a self,
         uid: Option<Uid>,
         gid: Option<Gid>,
     ) -> PendingIo<'a, io::Result<()>> {
-        self.hybrid_set_owner(uid, gid)
+        self.hybrid_set_owner(uid, gid).await
     }
 
     /// Alias for [`HybridFile::set_owner`].    
-    fn hybrid_set_owner<'a>(
+    async fn hybrid_set_owner<'a>(
         &'a self,
         uid: Option<Uid>,
         gid: Option<Gid>,
     ) -> PendingIo<'a, io::Result<()>> {
-        default_client().fchown(self, uid, gid)
+        default_client().fchown(self, uid, gid).await
     }
 
     /// Method for creating a hard link to the file at the specified path.
     #[inline]
-    fn hard_link<'a>(&'a self, new_path: impl AsRef<Path>) -> PendingIo<'a, io::Result<()>> {
-        self.hybrid_hard_link(new_path)
+    async fn hard_link<'a>(
+        &'a self,
+        new_path: impl AsRef<Path> + Send,
+    ) -> PendingIo<'a, io::Result<()>> {
+        self.hybrid_hard_link(new_path).await
     }
 
     /// Alias for [`HybridFile::hard_link`].
-    fn hybrid_hard_link<'a>(&'a self, new_path: impl AsRef<Path>) -> PendingIo<'a, io::Result<()>> {
-        default_client().hard_link_file(self, new_path)
+    async fn hybrid_hard_link<'a>(
+        &'a self,
+        new_path: impl AsRef<Path> + Send,
+    ) -> PendingIo<'a, io::Result<()>> {
+        default_client().hard_link_file(self, new_path).await
     }
 
     /// Method for reading the target of the symlink file descriptor (requires opening via [`OFlag::O_PATH`] and [`OFlag::O_NOFOLLOW`]).
     #[inline]
-    fn read_link<'a>(&'a self) -> PendingIo<'a, io::Result<PathBuf>> {
-        self.hybrid_read_link()
+    async fn read_link<'a>(&'a self) -> PendingIo<'a, io::Result<PathBuf>> {
+        self.hybrid_read_link().await
     }
 
     /// Alias for [`HybridFile::read_link`].
-    fn hybrid_read_link<'a>(&'a self) -> PendingIo<'a, io::Result<PathBuf>> {
-        default_client().read_link_file(self)
+    async fn hybrid_read_link<'a>(&'a self) -> PendingIo<'a, io::Result<PathBuf>> {
+        default_client().read_link_file(self).await
     }
 
     /// Method for syncing the metadata and data of a file.
     #[inline]
-    fn sync_all<'a>(&'a self) -> PendingIo<'a, io::Result<()>> {
-        self.hybrid_sync_all()
+    async fn sync_all<'a>(&'a self) -> PendingIo<'a, io::Result<()>> {
+        self.hybrid_sync_all().await
     }
 
     /// Alias for [`HybridFile::sync_all`].
-    fn hybrid_sync_all<'a>(&'a self) -> PendingIo<'a, io::Result<()>> {
-        default_client().sync_all(self)
+    async fn hybrid_sync_all<'a>(&'a self) -> PendingIo<'a, io::Result<()>> {
+        default_client().sync_all(self).await
     }
 
     /// Method for syncing the data of a file.
     #[inline]
-    fn sync_data<'a>(&'a self) -> PendingIo<'a, io::Result<()>> {
-        self.hybrid_sync_data()
+    async fn sync_data<'a>(&'a self) -> PendingIo<'a, io::Result<()>> {
+        self.hybrid_sync_data().await
     }
 
     /// Alias for [`HybridFile::sync_data`].
-    fn hybrid_sync_data<'a>(&'a self) -> PendingIo<'a, io::Result<()>> {
-        default_client().sync_data(self)
+    async fn hybrid_sync_data<'a>(&'a self) -> PendingIo<'a, io::Result<()>> {
+        default_client().sync_data(self).await
     }
 
     #[inline]
@@ -522,46 +531,52 @@ pub trait HybridFile: UringTarget + Sync + Send {
     }
 
     #[inline]
-    fn get_status_flags<'a>(&'a mut self) -> PendingIo<'a, io::Result<OFlag>> {
-        self.hybrid_get_status_flags()
+    async fn get_status_flags<'a>(&'a mut self) -> PendingIo<'a, io::Result<OFlag>> {
+        self.hybrid_get_status_flags().await
     }
 
     /// Alias for [`HybridFd::get_flags`].
-    fn hybrid_get_status_flags<'a>(&'a mut self) -> PendingIo<'a, io::Result<OFlag>> {
-        default_client().get_status_flags(self)
+    async fn hybrid_get_status_flags<'a>(&'a mut self) -> PendingIo<'a, io::Result<OFlag>> {
+        default_client().get_status_flags(self).await
     }
 
     #[inline]
-    fn set_status_flags<'a>(&'a mut self, flags: OFlag) -> PendingIo<'a, io::Result<()>> {
-        self.hybrid_set_status_flags(flags)
+    async fn set_status_flags<'a>(&'a mut self, flags: OFlag) -> PendingIo<'a, io::Result<()>> {
+        self.hybrid_set_status_flags(flags).await
     }
 
     /// Alias for [`HybridFd::set_flags`].
-    fn hybrid_set_status_flags<'a>(&'a mut self, flags: OFlag) -> PendingIo<'a, io::Result<()>> {
-        default_client().set_status_flags(self, flags)
+    async fn hybrid_set_status_flags<'a>(
+        &'a mut self,
+        flags: OFlag,
+    ) -> PendingIo<'a, io::Result<()>> {
+        default_client().set_status_flags(self, flags).await
     }
 
     #[inline]
-    fn get_descriptor_flags<'a>(&'a mut self) -> PendingIo<'a, io::Result<FdFlag>> {
-        self.hybrid_get_descriptor_flags()
+    async fn get_descriptor_flags<'a>(&'a mut self) -> PendingIo<'a, io::Result<FdFlag>> {
+        self.hybrid_get_descriptor_flags().await
     }
 
     /// Alias for [`HybridFd::get_descriptor_flags`].
-    fn hybrid_get_descriptor_flags<'a>(&'a mut self) -> PendingIo<'a, io::Result<FdFlag>> {
-        default_client().get_descriptor_flags(self)
+    async fn hybrid_get_descriptor_flags<'a>(&'a mut self) -> PendingIo<'a, io::Result<FdFlag>> {
+        default_client().get_descriptor_flags(self).await
     }
 
     #[inline]
-    fn set_descriptor_flags<'a>(&'a mut self, flags: FdFlag) -> PendingIo<'a, io::Result<()>> {
-        self.hybrid_set_descriptor_flags(flags)
-    }
-
-    /// Alias for [`HybridFd::set_descriptor_flags`].
-    fn hybrid_set_descriptor_flags<'a>(
+    async fn set_descriptor_flags<'a>(
         &'a mut self,
         flags: FdFlag,
     ) -> PendingIo<'a, io::Result<()>> {
-        default_client().set_descriptor_flags(self, flags)
+        self.hybrid_set_descriptor_flags(flags).await
+    }
+
+    /// Alias for [`HybridFd::set_descriptor_flags`].
+    async fn hybrid_set_descriptor_flags<'a>(
+        &'a mut self,
+        flags: FdFlag,
+    ) -> PendingIo<'a, io::Result<()>> {
+        default_client().set_descriptor_flags(self, flags).await
     }
 
     #[inline]
@@ -597,127 +612,151 @@ pub trait HybridFile: UringTarget + Sync + Send {
 pub trait HybridDir: UringTarget + Sync {
     /// Method for creating a hard link to the file at the specified path relative to the specified directory fd.
     #[inline]
-    fn hard_link_at<'a>(
+    async fn hard_link_at<'a>(
         &'a self,
-        old_path: impl AsRef<Path>,
+        old_path: impl AsRef<Path> + Send,
         new_dir_fd: &'a (impl UringTarget + Sync + ?Sized),
-        new_path: impl AsRef<Path>,
+        new_path: impl AsRef<Path> + Send,
         flags: LinkatFlags,
     ) -> PendingIo<'a, io::Result<()>> {
         self.hybrid_hard_link_at(old_path, new_dir_fd, new_path, flags)
+            .await
     }
 
     /// Alias for [`HybridFile::hard_link_at`].
-    fn hybrid_hard_link_at<'a>(
+    async fn hybrid_hard_link_at<'a>(
         &'a self,
-        old_path: impl AsRef<Path>,
+        old_path: impl AsRef<Path> + Send,
         new_dir_fd: &'a (impl UringTarget + Sync + ?Sized),
-        new_path: impl AsRef<Path>,
+        new_path: impl AsRef<Path> + Send,
         flags: LinkatFlags,
     ) -> PendingIo<'a, io::Result<()>> {
-        default_client().hard_link_at(self, old_path, new_dir_fd, new_path, flags)
+        default_client()
+            .hard_link_at(self, old_path, new_dir_fd, new_path, flags)
+            .await
     }
 
     /// Method for unlinking a file at the specified path relative to the specified directory fd.
     #[inline]
-    fn unlink_at<'a>(&'a self, path: impl AsRef<Path>) -> PendingIo<'a, io::Result<()>> {
-        self.hybrid_unlink_at(path)
+    async fn unlink_at<'a>(
+        &'a self,
+        path: impl AsRef<Path> + Send,
+    ) -> PendingIo<'a, io::Result<()>> {
+        self.hybrid_unlink_at(path).await
     }
 
     /// Alias for [`HybridDir::unlink_at`].
-    fn hybrid_unlink_at<'a>(&'a self, path: impl AsRef<Path>) -> PendingIo<'a, io::Result<()>> {
-        default_client().unlink_at(self, path, UnlinkatFlags::NoRemoveDir)
+    async fn hybrid_unlink_at<'a>(
+        &'a self,
+        path: impl AsRef<Path> + Send,
+    ) -> PendingIo<'a, io::Result<()>> {
+        default_client()
+            .unlink_at(self, path, UnlinkatFlags::NoRemoveDir)
+            .await
     }
 
     /// Method for unlinking a directory at the specified path relative to the specified directory fd.
     #[inline]
-    fn remove_dir_at<'a>(&'a self, path: impl AsRef<Path>) -> PendingIo<'a, io::Result<()>> {
-        self.hybrid_remove_dir_at(path)
+    async fn remove_dir_at<'a>(
+        &'a self,
+        path: impl AsRef<Path> + Send,
+    ) -> PendingIo<'a, io::Result<()>> {
+        self.hybrid_remove_dir_at(path).await
     }
 
     /// Alias for [`HybridDir::remove_dir_at`].
-    fn hybrid_remove_dir_at<'a>(&'a self, path: impl AsRef<Path>) -> PendingIo<'a, io::Result<()>> {
-        default_client().unlink_at(self, path, UnlinkatFlags::RemoveDir)
+    async fn hybrid_remove_dir_at<'a>(
+        &'a self,
+        path: impl AsRef<Path> + Send,
+    ) -> PendingIo<'a, io::Result<()>> {
+        default_client()
+            .unlink_at(self, path, UnlinkatFlags::RemoveDir)
+            .await
     }
 
     /// Method for creating a symbolic link at the specified path relative to the specified directory fd.
     #[inline]
-    fn symlink_at<'a>(
+    async fn symlink_at<'a>(
         &'a self,
-        target: impl AsRef<Path>,
-        link_path: impl AsRef<Path>,
+        target: impl AsRef<Path> + Send,
+        link_path: impl AsRef<Path> + Send,
     ) -> PendingIo<'a, io::Result<()>> {
-        default_client().symlink_at(target, self, link_path)
+        self.hybrid_symlink_at(target, link_path).await
     }
 
     /// Alias for [`HybridDir::symlink_at`].
-    fn hybrid_symlink_at<'a>(
+    async fn hybrid_symlink_at<'a>(
         &'a self,
-        target: impl AsRef<Path>,
-        link_path: impl AsRef<Path>,
+        target: impl AsRef<Path> + Send,
+        link_path: impl AsRef<Path> + Send,
     ) -> PendingIo<'a, io::Result<()>> {
-        default_client().symlink_at(target, self, link_path)
+        default_client().symlink_at(target, self, link_path).await
     }
 
     /// Method for renaming a file at the specified path relative to the specified directory fd.
     #[inline]
-    fn rename_at<'a>(
+    async fn rename_at<'a>(
         &'a self,
-        old_path: impl AsRef<Path>,
+        old_path: impl AsRef<Path> + Send,
         new_dir_fd: &'a (impl UringTarget + Sync + ?Sized),
-        new_path: impl AsRef<Path>,
+        new_path: impl AsRef<Path> + Send,
         flags: RenameFlags,
     ) -> PendingIo<'a, io::Result<()>> {
         self.hybrid_rename_at(old_path, new_dir_fd, new_path, flags)
+            .await
     }
 
     /// Alias for [`HybridDir::rename_at`].
-    fn hybrid_rename_at<'a>(
+    async fn hybrid_rename_at<'a>(
         &'a self,
-        old_path: impl AsRef<Path>,
+        old_path: impl AsRef<Path> + Send,
         new_dir_fd: &'a (impl UringTarget + Sync + ?Sized),
-        new_path: impl AsRef<Path>,
+        new_path: impl AsRef<Path> + Send,
         flags: RenameFlags,
     ) -> PendingIo<'a, io::Result<()>> {
-        default_client().rename_at(self, old_path, new_dir_fd, new_path, flags)
+        default_client()
+            .rename_at(self, old_path, new_dir_fd, new_path, flags)
+            .await
     }
 
     /// Method for renaming a file at the specified path to a location pointed to by new_path.
     #[inline]
-    fn rename<'a>(
+    async fn rename<'a>(
         &'a self,
-        old_path: impl AsRef<Path>,
-        new_path: impl AsRef<Path>,
+        old_path: impl AsRef<Path> + Send,
+        new_path: impl AsRef<Path> + Send,
         flags: RenameFlags,
     ) -> PendingIo<'a, io::Result<()>> {
-        self.hybrid_rename(old_path, new_path, flags)
+        self.hybrid_rename(old_path, new_path, flags).await
     }
 
     /// Alias for [`HybridDir::rename`].
-    fn hybrid_rename<'a>(
+    async fn hybrid_rename<'a>(
         &'a self,
-        old_path: impl AsRef<Path>,
-        new_path: impl AsRef<Path>,
+        old_path: impl AsRef<Path> + Send,
+        new_path: impl AsRef<Path> + Send,
         flags: RenameFlags,
     ) -> PendingIo<'a, io::Result<()>> {
-        default_client().rename_at(self, old_path, &AT_FDCWD, new_path, flags)
+        default_client()
+            .rename_at(self, old_path, &AT_FDCWD, new_path, flags)
+            .await
     }
 
     /// Method for opening a file from a relative path to the directory fd.
     /// Unlike the client methods, this method always returns a [`tokio::fs::File`].
     #[inline]
-    fn open_at<'a>(
+    async fn open_at<'a>(
         &'a self,
-        path: impl AsRef<Path>,
+        path: impl AsRef<Path> + Send,
         options: &OpenOptions,
     ) -> PendingIo<'a, io::Result<File>> {
-        self.hybrid_open_at(path, options)
+        self.hybrid_open_at(path, options).await
     }
 
     /// Alias for [`HybridDir::open_at`].
-    fn hybrid_open_at<'a>(
+    async fn hybrid_open_at<'a>(
         &'a self,
-        path: impl AsRef<Path>,
+        path: impl AsRef<Path> + Send,
         options: &OpenOptions,
     ) -> PendingIo<'a, io::Result<File>> {
         let flags = match options.get_flags() {
@@ -726,108 +765,114 @@ pub trait HybridDir: UringTarget + Sync {
         };
         default_client()
             .open_at(self, path, flags, options.get_creation_permissions())
+            .await
             .map(|r| r.map(|f| File::from_std(std::fs::File::from(f))))
     }
 
     /// Method for creating a file using a relative path to the directory fd.
     /// Unlike the client methods, this method always returns a [`tokio::fs::File`].
     #[inline]
-    fn create_at<'a>(
+    async fn create_at<'a>(
         &'a self,
-        path: impl AsRef<Path>,
+        path: impl AsRef<Path> + Send,
         options: &OpenOptions,
     ) -> PendingIo<'a, io::Result<File>> {
-        self.hybrid_create_at(path, options)
+        self.hybrid_create_at(path, options).await
     }
 
     /// Alias for [`HybridDir::create_at`].
-    fn hybrid_create_at<'a>(
+    async fn hybrid_create_at<'a>(
         &'a self,
-        path: impl AsRef<Path>,
+        path: impl AsRef<Path> + Send,
         options: &OpenOptions,
     ) -> PendingIo<'a, io::Result<File>> {
         let mut options = options.clone();
         options.create(true);
-        self.hybrid_open_at(path, &options)
+        self.hybrid_open_at(path, &options).await
     }
 
     /// Method for creating a file using a relative path to the directory fd,
     /// ensuring that the file is always created or an error is returned.
     /// Unlike the client methods, this method always returns a [`tokio::fs::File`].
     #[inline]
-    fn create_new_at<'a>(
+    async fn create_new_at<'a>(
         &'a self,
-        path: impl AsRef<Path>,
+        path: impl AsRef<Path> + Send,
         options: &OpenOptions,
     ) -> PendingIo<'a, io::Result<File>> {
-        self.hybrid_create_new_at(path, options)
+        self.hybrid_create_new_at(path, options).await
     }
 
     /// Alias method for [`HybridDir::create_new_at`].
-    fn hybrid_create_new_at<'a>(
+    async fn hybrid_create_new_at<'a>(
         &'a self,
-        path: impl AsRef<Path>,
+        path: impl AsRef<Path> + Send,
         options: &OpenOptions,
     ) -> PendingIo<'a, io::Result<File>> {
         let mut options = options.clone();
         options.create_new(true);
         options.create(true);
-        self.hybrid_open_at(path, &options)
+        self.hybrid_open_at(path, &options).await
     }
 
     /// Method for creating a directory using a relative path to the directory fd.
     #[inline]
-    fn create_dir_at<'a>(
+    async fn create_dir_at<'a>(
         &'a self,
-        path: impl AsRef<Path>,
+        path: impl AsRef<Path> + Send,
         permissions: Permissions,
     ) -> PendingIo<'a, io::Result<()>> {
-        self.hybrid_create_dir_at(path, permissions)
+        self.hybrid_create_dir_at(path, permissions).await
     }
 
     /// Alias for [`HybridDir::create_dir_at`].
-    fn hybrid_create_dir_at<'a>(
+    async fn hybrid_create_dir_at<'a>(
         &'a self,
-        path: impl AsRef<Path>,
+        path: impl AsRef<Path> + Send,
         permissions: Permissions,
     ) -> PendingIo<'a, io::Result<()>> {
-        default_client().mkdir_at(self, path, permissions)
+        default_client().mkdir_at(self, path, permissions).await
     }
 
     /// Method for creating a node at a relative path to the directory fd.
     #[inline]
-    fn create_node_at<'a>(
+    async fn create_node_at<'a>(
         &'a self,
-        path: impl AsRef<Path>,
+        path: impl AsRef<Path> + Send,
         kind: MknodType,
         permissions: Permissions,
     ) -> PendingIo<'a, io::Result<()>> {
-        self.hybrid_create_node_at(path, kind, permissions)
+        self.hybrid_create_node_at(path, kind, permissions).await
     }
 
     /// Alias for [`HybridDir::create_node_at`].
-    fn hybrid_create_node_at<'a>(
+    async fn hybrid_create_node_at<'a>(
         &'a self,
-        path: impl AsRef<Path>,
+        path: impl AsRef<Path> + Send,
         kind: MknodType,
         permissions: Permissions,
     ) -> PendingIo<'a, io::Result<()>> {
-        default_client().mknod_at(self, path, kind, permissions)
+        default_client()
+            .mknod_at(self, path, kind, permissions)
+            .await
     }
 
     /// Method for reading the target of the symlink at the specified path relative to the specified directory fd.
     /// If the path is empty, the call is identical to [`HybridFile::read_link`].
     #[inline]
-    fn read_link_at<'a>(&'a self, path: impl AsRef<Path>) -> PendingIo<'a, io::Result<PathBuf>> {
-        default_client().read_link_at(self, path)
+    async fn read_link_at<'a>(
+        &'a self,
+        path: impl AsRef<Path> + Send,
+    ) -> PendingIo<'a, io::Result<PathBuf>> {
+        default_client().read_link_at(self, path).await
     }
 
     /// Alias for [`HybridFile::read_link_at`].
-    fn hybrid_read_link_at<'a>(
+    async fn hybrid_read_link_at<'a>(
         &'a self,
-        path: impl AsRef<Path>,
+        path: impl AsRef<Path> + Send,
     ) -> PendingIo<'a, io::Result<PathBuf>> {
-        default_client().read_link_at(self, path)
+        default_client().read_link_at(self, path).await
     }
 }
 

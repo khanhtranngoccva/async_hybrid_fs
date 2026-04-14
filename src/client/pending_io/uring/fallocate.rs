@@ -141,7 +141,7 @@ impl<'a, Target> UringFallocate<'a, Target>
 where
     Target: UringTarget + Sync + ?Sized,
 {
-    pub(crate) fn new(
+    pub(crate) async fn new(
         client: &'a ClientUring,
         target: &'a Target,
         mode: FallocateFlags,
@@ -165,8 +165,7 @@ where
             cancellation: None,
             cancel_done: false,
         };
-        let command = unsafe { op.build_command() };
-        client.send(command, debug_event_tx);
+        client.send(&mut op, debug_event_tx).await;
         op
     }
 }

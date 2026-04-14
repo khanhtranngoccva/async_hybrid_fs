@@ -1,4 +1,4 @@
-use crate::client::pending_io::PendingIoDebuggingEvent;
+use crate::{client::pending_io::PendingIoDebuggingEvent, runtime};
 use std::sync::{Arc, Condvar, Mutex};
 
 /// The submission ticket ID, which may be used as the user_data field/entry ID.
@@ -11,8 +11,8 @@ pub(crate) struct SubmissionTicketId(pub(crate) u64);
 #[derive(Debug)]
 pub(crate) struct SubmissionTicket {
     id: SubmissionTicketId,
-    tickets: Arc<Mutex<Vec<SubmissionTicketId>>>,
-    condvar: Arc<Condvar>,
+    tickets: Arc<tokio::sync::Mutex<Vec<SubmissionTicketId>>>,
+    condvar: Arc<async_condvar_fair::Condvar>,
 }
 
 impl SubmissionTicket {
@@ -23,9 +23,11 @@ impl SubmissionTicket {
 
 impl Drop for SubmissionTicket {
     fn drop(&mut self) {
-        let mut tickets = self.tickets.lock().unwrap();
-        tickets.push(self.id.clone());
-        self.condvar.notify_one();
+        runtime::execute_future_from_sync(async move {
+            let mut tickets = self.tickets.lock().await;
+            tickets.push(self.id.clone());
+            self.condvar.notify_one();
+        })
     }
 }
 
@@ -33,21 +35,21 @@ impl Drop for SubmissionTicket {
 #[derive(Debug)]
 pub(crate) struct SubmissionTicketQueue {
     /// Queue of submission tickets.
-    tickets: Arc<Mutex<Vec<SubmissionTicketId>>>,
+    tickets: Arc<tokio::sync::Mutex<Vec<SubmissionTicketId>>>,
     /// Condvar for notifying that a ticket is available.
-    condvar: Arc<Condvar>,
+    condvar: Arc<async_condvar_fair::Condvar>,
 }
 
 impl SubmissionTicketQueue {
     fn new(size: usize, starting_id: u64) -> Self {
-        let tickets = Mutex::new(
+        let tickets = tokio::sync::Mutex::new(
             (starting_id..starting_id + size as u64)
                 .map(SubmissionTicketId)
                 .collect(),
         );
         Self {
             tickets: Arc::new(tickets),
-            condvar: Arc::new(Condvar::new()),
+            condvar: Arc::new(async_condvar_fair::Condvar::new()),
         }
     }
 
@@ -65,28 +67,28 @@ impl SubmissionTicketQueue {
     }
 
     /// Request a submission ticket from the queue.
-    pub(crate) fn request_submission_ticket(
+    pub(crate) async fn request_submission_ticket_async(
         &self,
         debug_event_tx: Option<&tokio::sync::mpsc::UnboundedSender<PendingIoDebuggingEvent>>,
     ) -> SubmissionTicket {
-        let mut tickets = self.tickets.lock().unwrap();
+        let mut tickets = self.tickets.lock().await;
         let mut wait_event_sent = false;
         while tickets.is_empty() {
             if !wait_event_sent {
                 if let Some(debug_event_tx) = debug_event_tx {
-                    debug_event_tx
-                        .send(PendingIoDebuggingEvent::NeedWaitForSubmissionTicket)
-                        .unwrap();
+                    let _ =
+                        debug_event_tx.send(PendingIoDebuggingEvent::NeedWaitForSubmissionTicket);
                 }
                 wait_event_sent = true;
             }
-            tickets = self.condvar.wait(tickets).unwrap();
+            (tickets, _) = self
+                .condvar
+                .wait_baton((tickets, self.tickets.as_ref()))
+                .await;
         }
         let id = tickets.pop().unwrap();
         if let Some(debug_event_tx) = debug_event_tx {
-            debug_event_tx
-                .send(PendingIoDebuggingEvent::SubmissionTicketGranted)
-                .unwrap();
+            let _ = debug_event_tx.send(PendingIoDebuggingEvent::SubmissionTicketGranted);
         }
         SubmissionTicket {
             id,

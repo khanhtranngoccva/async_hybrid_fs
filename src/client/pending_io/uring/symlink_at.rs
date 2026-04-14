@@ -165,7 +165,7 @@ impl<'a, DirTarget> UringSymlinkAt<'a, DirTarget>
 where
     DirTarget: UringTarget + Sync + ?Sized,
 {
-    pub(crate) fn new(
+    pub(crate) async fn new(
         uring: &'a ClientUring,
         new_dir: &'a DirTarget,
         target: CString,
@@ -187,8 +187,7 @@ where
             cancellation: None,
             cancel_done: false,
         };
-        let command = unsafe { op.build_command() };
-        uring.send(command, debug_event_tx);
+        uring.send(&mut op, debug_event_tx).await;
         op
     }
 }

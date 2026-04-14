@@ -4,15 +4,16 @@ use crate::{
     borrowed_buf::BorrowedBuf,
     client::{
         Client, ClientUring, URING_LEN_MAX, UringTarget,
+        command::CommandWithTicket,
         completion::{ReadResult, ReadvResult, WriteResult, WritevResult},
         pending_io::{
             PendingIoDebuggingEvent,
             fallback::TokioScopedPendingIo,
             fixed_value::FixedValuePendingIo,
             uring::{
-                close::UringClose, fadvise::UringFadvise, fallocate::UringFallocate,
-                ftruncate::UringFtruncate, link_at::UringLinkAt, mkdir_at::UringMkdirAt,
-                open_at::UringOpenAt, read_into::UringReadIntoAt,
+                UringPendingIo, close::UringClose, fadvise::UringFadvise,
+                fallocate::UringFallocate, ftruncate::UringFtruncate, link_at::UringLinkAt,
+                mkdir_at::UringMkdirAt, open_at::UringOpenAt, read_into::UringReadIntoAt,
                 read_into_vectored::UringReadIntoVectoredAt, rename_at::UringRenameAt,
                 statx::UringStatx, statx_path::UringStatxPath, symlink_at::UringSymlinkAt,
                 sync::UringSync, unlink_at::UringUnlinkAt, write_from::UringWriteFromAt,
@@ -24,7 +25,7 @@ use crate::{
     },
     helpers,
     iobuf::{IoBuf, IoBufMut},
-    metadata::{Metadata, MknodType, Permissions},
+    metadata::{Metadata, MknodType, Permissions}, runtime,
 };
 use core::fmt;
 use io_uring::opcode;
@@ -47,27 +48,60 @@ use std::{
 };
 
 impl ClientUring {
-    pub(crate) fn send(
+    pub(crate) async fn send<T>(
         &self,
-        command: Command,
+        pending_io: &mut dyn UringPendingIo<T>,
         debug_event_tx: Option<tokio::sync::mpsc::UnboundedSender<PendingIoDebuggingEvent>>,
     ) {
-        self.normal_sender
-            .send((command, debug_event_tx))
-            .expect("normal submission thread dead");
+        // Implementation 1: send to a separate thread.
+        // self.normal_sender
+        //     .send((command, debug_event_tx))
+        //     .expect("normal submission thread dead");
+
+        // Implementation 2: use async on the submission ticket queue and send to the direct channel directly.
+        let ticket = self
+            .normal_submission_ticket_queue
+            .request_submission_ticket_async(debug_event_tx.as_ref())
+            .await;
+        // When build_command is run, there should be no more await points and the command should be sent.
+        let command = unsafe { pending_io.build_command() };
+        self.direct_sender
+            .send(CommandWithTicket {
+                command,
+                submission_ticket: ticket,
+            })
+            .expect("direct submission channel dead");
     }
 
     fn send_cancel(&self, ticket_id: SubmissionTicketId) -> oneshot::Receiver<io::Result<()>> {
         let (tx, rx) = oneshot::channel();
-        self.cancel_sender
-            .send((
-                Command::Cancel {
+
+        // Implementation 1: send to a separate thread.
+        // self.cancel_sender
+        //     .send((
+        //         Command::Cancel {
+        //             req: CancelRequest { id: ticket_id },
+        //             res: tx,
+        //         },
+        //         None,
+        //     ))
+        //     .expect("cancel submission thread dead");
+
+        // Implementation 2: block on the submission ticket queue and send to the direct channel directly.
+        let ticket = runtime::execute_future_from_sync(async {
+            self.cancel_submission_ticket_queue
+                .request_submission_ticket_async(None)
+                .await
+        });
+        self.direct_sender
+            .send(CommandWithTicket {
+                command: Command::Cancel {
                     req: CancelRequest { id: ticket_id },
                     res: tx,
                 },
-                None,
-            ))
-            .expect("cancel submission thread dead");
+                submission_ticket: ticket,
+            })
+            .expect("direct submission channel dead");
         rx
     }
 
@@ -118,6 +152,7 @@ impl Client {
     ) -> Option<usize> {
         let size = self
             .metadata(&file.as_file_descriptor())
+            .await
             .completion()
             .expect("no completion future returned")
             .await
@@ -125,6 +160,7 @@ impl Client {
             .size();
         let pos = self
             .seek(&mut file.as_file_descriptor(), SeekFrom::Current(0))
+            .await
             .completion()
             .expect("no completion future returned")
             .await
@@ -139,7 +175,7 @@ impl Client {
     /// The buffer is returned along with the number of bytes read. This allows buffer reuse and supports custom allocators (e.g., aligned buffers for O_DIRECT).
     ///
     /// Note that the read data may reside in the spare capacity of the buffer if the specified buffer's capacity is greater than its reported length, so it might be necessary to use a [`Vec::set_len()`] call to force the buffer to resize. It is usually safer to use the [`Self::read_at`] method insteaed.
-    pub fn read_into_at<'a, B: IoBufMut + 'a>(
+    pub async fn read_into_at<'a, B: IoBufMut + 'a>(
         &'a self,
         file: &'a (impl UringTarget + Sync + ?Sized),
         mut buf: B,
@@ -165,7 +201,7 @@ impl Client {
             && self.is_uring_operation_supported(opcode::Read::CODE)
         {
             let uring = self.uring.as_ref().expect("uring must be Some");
-            PendingIo::new(UringReadIntoAt::new(uring, file, buf, offset, None))
+            PendingIo::new(UringReadIntoAt::new(uring, file, buf, offset, None).await)
         } else {
             PendingIo::new(TokioScopedPendingIo::new(
                 move || -> io::Result<ReadResult<B>> {
@@ -184,7 +220,7 @@ impl Client {
     }
 
     /// Standard-library compatible method for reading from a file at the specified offset using a zero-copy buffer.
-    pub fn read_at<'a>(
+    pub async fn read_at<'a>(
         &'a self,
         file: &'a (impl UringTarget + Sync + ?Sized),
         buf: &'a mut [u8],
@@ -193,6 +229,7 @@ impl Client {
         match <u32>::try_from(buf.len()) {
             Ok(_) => self
                 .read_into_at(file, buf, offset)
+                .await
                 .map(|result| result.map(|result| result.bytes_read)),
             Err(_) => {
                 return PendingIo::new(FixedValuePendingIo::new(Err(io::Error::new(
@@ -206,7 +243,7 @@ impl Client {
     /// Read into multiple user-provided buffers at the specified offset. This is the primitive read operation that accepts any buffer type implementing [`IoBufMut`].
     ///
     /// The buffer is returned along with the number of bytes read. This allows buffer reuse and supports custom allocators (e.g., aligned buffers for O_DIRECT).
-    pub fn read_into_vectored_at<'a, B: IoBufMut + 'a>(
+    pub async fn read_into_vectored_at<'a, B: IoBufMut + 'a>(
         &'a self,
         file: &'a (impl UringTarget + Sync + ?Sized),
         mut bufs: Vec<B>,
@@ -241,9 +278,7 @@ impl Client {
             && self.is_uring_operation_supported(opcode::Readv::CODE)
         {
             let uring = self.uring.as_ref().expect("uring must be Some");
-            PendingIo::new(UringReadIntoVectoredAt::new(
-                uring, file, bufs, offset, None,
-            ))
+            PendingIo::new(UringReadIntoVectoredAt::new(uring, file, bufs, offset, None).await)
         } else {
             PendingIo::new(TokioScopedPendingIo::new(
                 move || -> io::Result<ReadvResult<B>> {
@@ -280,7 +315,7 @@ impl Client {
     /// Read into multiple user-provided buffers at the internal seek cursor and advance the seek position. This is the primitive read operation that accepts any buffer type implementing [`IoBufMut`].
     ///
     /// The buffer is returned along with the number of bytes read. This allows buffer reuse and supports custom allocators (e.g., aligned buffers for O_DIRECT).
-    pub fn read_into_vectored<'a, B: IoBufMut + 'a>(
+    pub async fn read_into_vectored<'a, B: IoBufMut + 'a>(
         &'a self,
         file: &'a mut (impl UringTarget + Sync + ?Sized),
         mut bufs: Vec<B>,
@@ -298,13 +333,9 @@ impl Client {
             && self.is_uring_operation_supported(opcode::Readv::CODE)
         {
             let uring = self.uring.as_ref().expect("uring must be Some");
-            PendingIo::new(UringReadIntoVectoredAt::new(
-                uring,
-                file,
-                bufs,
-                (-1i64) as u64,
-                None,
-            ))
+            PendingIo::new(
+                UringReadIntoVectoredAt::new(uring, file, bufs, (-1i64) as u64, None).await,
+            )
         } else {
             PendingIo::new(TokioScopedPendingIo::new(
                 || -> io::Result<ReadvResult<B>> {
@@ -349,6 +380,7 @@ impl Client {
         while !buf.is_empty() {
             let res = self
                 .read_at(file, buf, offset)
+                .await
                 .completion()
                 .expect("no completion future returned")
                 .await;
@@ -376,7 +408,7 @@ impl Client {
     /// Read into a user-provided buffer using the file's internal seek cursor. This is the primitive read operation that accepts any buffertype implementing [`IoBufMut`].
     ///
     /// The buffer is returned along with the number of bytes read. This allows buffer reuse and supports custom allocators (e.g., aligned buffers for O_DIRECT).
-    pub fn read_into<'a, B: IoBufMut + 'a>(
+    pub async fn read_into<'a, B: IoBufMut + 'a>(
         &'a self,
         file: &'a mut (impl UringTarget + Sync + Send + ?Sized),
         mut buf: B,
@@ -385,7 +417,7 @@ impl Client {
             && self.is_uring_operation_supported(opcode::Read::CODE)
         {
             let uring = self.uring.as_ref().expect("uring must be Some");
-            PendingIo::new(UringReadIntoAt::new(uring, file, buf, (-1i64) as u64, None))
+            PendingIo::new(UringReadIntoAt::new(uring, file, buf, (-1i64) as u64, None).await)
         } else {
             PendingIo::new(TokioScopedPendingIo::new(
                 move || -> io::Result<ReadResult<B>> {
@@ -402,7 +434,7 @@ impl Client {
     }
 
     /// Standard library compatible method for reading from a file using a zero-copy buffer and the file's internal seek cursor.
-    pub fn read<'a>(
+    pub async fn read<'a>(
         &'a self,
         file: &'a mut (impl UringTarget + Sync + Send + ?Sized),
         buf: &'a mut [u8],
@@ -410,6 +442,7 @@ impl Client {
         match <u32>::try_from(buf.len()) {
             Ok(_) => self
                 .read_into(file, buf)
+                .await
                 .map(|result| result.map(|result| result.bytes_read)),
             Err(_) => PendingIo::new(FixedValuePendingIo::new(Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -419,7 +452,7 @@ impl Client {
     }
 
     /// Standard library compatible method for reading from a file into a vector of buffers.
-    pub fn read_vectored<'a>(
+    pub async fn read_vectored<'a>(
         &'a self,
         file: &'a mut (impl UringTarget + Sync + Send + ?Sized),
         bufs: &'a mut [IoSliceMut<'a>],
@@ -429,11 +462,12 @@ impl Client {
             .map(|buf| IoSliceMut::new(unsafe { buf.as_mut_slice_with_uninit().assume_init_mut() }))
             .collect();
         self.read_into_vectored(file, transformed)
+            .await
             .map(|result| result.map(|result| result.bytes_read))
     }
 
     /// Standard library compatible method for reading from a file into a vector of buffers at a specified offset.
-    pub fn read_vectored_at<'a>(
+    pub async fn read_vectored_at<'a>(
         &'a self,
         file: &'a (impl UringTarget + Sync + ?Sized),
         bufs: &'a mut [IoSliceMut<'a>],
@@ -444,6 +478,7 @@ impl Client {
             .map(|buf| IoSliceMut::new(unsafe { buf.as_mut_slice_with_uninit().assume_init_mut() }))
             .collect();
         self.read_into_vectored_at(file, transformed, offset)
+            .await
             .map(|result| result.map(|result| result.bytes_read))
     }
 
@@ -483,6 +518,7 @@ impl Client {
             loop {
                 let res = instance
                     .read(file, &mut probe)
+                    .await
                     .completion()
                     .expect("no completion future returned")
                     .await;
@@ -545,6 +581,7 @@ impl Client {
             let result = loop {
                 let res = self
                     .read(file, cursor.reborrow().ensure_init().init_mut())
+                    .await
                     .completion()
                     .expect("no completion future returned")
                     .await;
@@ -625,6 +662,7 @@ impl Client {
         while !buf.is_empty() {
             let res = self
                 .read(file, buf)
+                .await
                 .completion()
                 .expect("no completion future returned")
                 .await;
@@ -650,7 +688,7 @@ impl Client {
     /// Write a buffer to a file at the specified offset. Accepts any buffer type implementing [`IoBuf`].
     ///
     /// The buffer is returned along with the number of bytes written. This allows buffer reuse and supports custom allocators.
-    pub fn write_from_at<'a, B: IoBuf + 'a>(
+    pub async fn write_from_at<'a, B: IoBuf + 'a>(
         &'a self,
         file: &'a (impl UringTarget + Sync + ?Sized),
         buf: B,
@@ -677,7 +715,7 @@ impl Client {
             && self.is_uring_operation_supported(opcode::Write::CODE)
         {
             let uring = self.uring.as_ref().expect("uring must be Some");
-            PendingIo::new(UringWriteFromAt::new(uring, file, buf, offset, None))
+            PendingIo::new(UringWriteFromAt::new(uring, file, buf, offset, None).await)
         } else {
             PendingIo::new(TokioScopedPendingIo::new(
                 move || -> io::Result<WriteResult<B>> {
@@ -698,7 +736,7 @@ impl Client {
     /// Write multiple buffers to a file at the specified offset. Accepts any buffer type implementing [`IoBuf`].
     ///
     /// The buffer is returned along with the number of bytes written. This allows buffer reuse and supports custom allocators.
-    pub fn write_from_vectored_at<'a, B: IoBuf + 'a>(
+    pub async fn write_from_vectored_at<'a, B: IoBuf + 'a>(
         &'a self,
         file: &'a (impl UringTarget + Sync + ?Sized),
         mut bufs: Vec<B>,
@@ -733,9 +771,7 @@ impl Client {
             && self.is_uring_operation_supported(opcode::Writev::CODE)
         {
             let uring = self.uring.as_ref().expect("uring must be Some");
-            PendingIo::new(UringWriteFromVectoredAt::new(
-                uring, file, bufs, offset, None,
-            ))
+            PendingIo::new(UringWriteFromVectoredAt::new(uring, file, bufs, offset, None).await)
         } else {
             PendingIo::new(TokioScopedPendingIo::new(
                 move || -> io::Result<WritevResult<B>> {
@@ -755,7 +791,7 @@ impl Client {
     }
 
     /// Standard library compatible method for writing to a file using a zero-copy buffer and an offset.
-    pub fn write_at<'a>(
+    pub async fn write_at<'a>(
         &'a self,
         file: &'a (impl UringTarget + Sync + ?Sized),
         buf: &'a [u8],
@@ -771,6 +807,7 @@ impl Client {
             }
         }
         self.write_from_at(file, buf, offset)
+            .await
             .map(|result| match result {
                 Ok(result) => Ok(result.bytes_written),
                 Err(e) => return Err(e),
@@ -778,7 +815,7 @@ impl Client {
     }
 
     /// Standard library compatible method for writing multiple buffers to a file at the specified offset.
-    pub fn write_vectored_at<'a>(
+    pub async fn write_vectored_at<'a>(
         &'a self,
         file: &'a (impl UringTarget + Sync + ?Sized),
         bufs: &'a [IoSlice<'a>],
@@ -789,6 +826,7 @@ impl Client {
             .map(|buf| IoSlice::new(buf.as_slice()))
             .collect::<Vec<_>>();
         self.write_from_vectored_at(file, transformed, offset)
+            .await
             .map(|result| result.map(|result| result.bytes_written))
     }
 
@@ -805,6 +843,7 @@ impl Client {
         while !buf.is_empty() {
             let res = self
                 .write_at(file, buf, offset)
+                .await
                 .completion()
                 .expect("no completion future returned")
                 .await;
@@ -829,7 +868,7 @@ impl Client {
     /// Write a buffer to a file using the file's internal seek cursor. Accepts any buffer type implementing [`IoBuf`].
     ///
     /// The buffer is returned along with the number of bytes written. This allows buffer reuse and supports custom allocators.
-    pub fn write_from<'a, B: IoBuf + 'a>(
+    pub async fn write_from<'a, B: IoBuf + 'a>(
         &'a self,
         file: &'a mut (impl UringTarget + Sync + Send + ?Sized),
         buf: B,
@@ -838,13 +877,7 @@ impl Client {
             && self.is_uring_operation_supported(opcode::Write::CODE)
         {
             let uring = self.uring.as_ref().expect("uring must be Some");
-            PendingIo::new(UringWriteFromAt::new(
-                uring,
-                file,
-                buf,
-                (-1i64) as u64,
-                None,
-            ))
+            PendingIo::new(UringWriteFromAt::new(uring, file, buf, (-1i64) as u64, None).await)
         } else {
             PendingIo::new(TokioScopedPendingIo::new(
                 move || -> io::Result<WriteResult<B>> {
@@ -859,7 +892,7 @@ impl Client {
     /// Write multiple buffers to a file using the file's internal seek cursor. Accepts any buffer type implementing [`IoBuf`].
     ///
     /// The buffers are returned along with the number of bytes written. This allows buffer reuse and supports custom allocators.
-    pub fn write_from_vectored<'a, B: IoBuf + 'a>(
+    pub async fn write_from_vectored<'a, B: IoBuf + 'a>(
         &'a self,
         file: &'a mut (impl UringTarget + Sync + Send + ?Sized),
         bufs: Vec<B>,
@@ -877,13 +910,9 @@ impl Client {
             && self.is_uring_operation_supported(opcode::Writev::CODE)
         {
             let uring = self.uring.as_ref().expect("uring must be Some");
-            PendingIo::new(UringWriteFromVectoredAt::new(
-                uring,
-                file,
-                bufs,
-                (-1i64) as u64,
-                None,
-            ))
+            PendingIo::new(
+                UringWriteFromVectoredAt::new(uring, file, bufs, (-1i64) as u64, None).await,
+            )
         } else {
             PendingIo::new(TokioScopedPendingIo::new(
                 move || -> io::Result<WritevResult<B>> {
@@ -902,17 +931,18 @@ impl Client {
     }
 
     /// Standard library compatible method for writing a single buffer to a file.
-    pub fn write<'a>(
+    pub async fn write<'a>(
         &'a self,
         file: &'a mut (impl UringTarget + Sync + Send + ?Sized),
         buf: &'a [u8],
     ) -> PendingIo<'a, io::Result<usize>> {
         self.write_from(file, buf)
+            .await
             .map(|result| result.map(|result| result.bytes_written))
     }
 
     /// Standard library compatible method for writing multiple buffers to a file.
-    pub fn write_vectored<'a>(
+    pub async fn write_vectored<'a>(
         &'a self,
         file: &'a mut (impl UringTarget + Sync + Send + ?Sized),
         bufs: &'a [IoSlice<'a>],
@@ -922,6 +952,7 @@ impl Client {
             .map(|buf| IoSlice::new(buf.as_slice()))
             .collect::<Vec<_>>();
         self.write_from_vectored(file, transformed)
+            .await
             .map(|result| result.map(|result| result.bytes_written))
     }
 
@@ -934,6 +965,7 @@ impl Client {
         while !buf.is_empty() {
             let res = self
                 .write(file, buf)
+                .await
                 .completion()
                 .expect("no completion future returned")
                 .await;
@@ -962,7 +994,7 @@ impl Client {
     }
 
     /// Standard library compatible method for flushing the file.
-    pub fn flush<'a>(
+    pub async fn flush<'a>(
         &'a self,
         _file: &'a mut (impl UringTarget + Send + ?Sized),
     ) -> PendingIo<'a, io::Result<()>> {
@@ -971,7 +1003,7 @@ impl Client {
 
     /// A more low-level flexible method for seeking to a specific offset in the file, which uses the [`nix`] crate.
     /// This is useful if SEEK_HOLE or SEEK_END is needed.
-    pub fn seek_ll<'a>(
+    pub async fn seek_ll<'a>(
         &'a self,
         file: &'a mut (impl UringTarget + Send + ?Sized),
         whence: nix::unistd::Whence,
@@ -992,7 +1024,7 @@ impl Client {
     }
 
     /// Standard library compatible method for seeking to a specific offset in the file.
-    pub fn seek<'a>(
+    pub async fn seek<'a>(
         &'a self,
         file: &'a mut (impl UringTarget + Send + ?Sized),
         seek: SeekFrom,
@@ -1013,13 +1045,13 @@ impl Client {
             SeekFrom::End(offset) => (nix::unistd::Whence::SeekEnd, offset),
             SeekFrom::Current(offset) => (nix::unistd::Whence::SeekCur, offset),
         };
-        self.seek_ll(file, whence, offset)
+        self.seek_ll(file, whence, offset).await
     }
 
     /// Synchronize file data and metadata to disk (fsync). This ensures that all data and metadata modifications are flushed to the underlying storage device. Even when using direct I/O, this is necessary to ensure the device itself has flushed any internal caches.
     ///
     /// **Note on ordering**: io_uring does not guarantee ordering between operations. If you need to ensure writes complete before fsync, you should await the write first, then call fsync.
-    pub fn sync_all<'a>(
+    pub async fn sync_all<'a>(
         &'a self,
         file: &'a (impl UringTarget + Sync + ?Sized),
     ) -> PendingIo<'a, io::Result<()>> {
@@ -1027,7 +1059,7 @@ impl Client {
             && self.is_uring_operation_supported(opcode::Fsync::CODE)
         {
             let uring = self.uring.as_ref().expect("uring must be Some");
-            PendingIo::new(UringSync::new(uring, file, false, None))
+            PendingIo::new(UringSync::new(uring, file, false, None).await)
         } else {
             PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
                 nix::unistd::fsync(file.as_file_descriptor())?;
@@ -1037,7 +1069,7 @@ impl Client {
     }
 
     /// Synchronize file data to disk (fdatasync). This ensures that only data modifications are flushed to the underlying storage device. This is useful for ensuring that data is written but not metadata.
-    pub fn sync_data<'a>(
+    pub async fn sync_data<'a>(
         &'a self,
         file: &'a (impl UringTarget + Sync + ?Sized),
     ) -> PendingIo<'a, io::Result<()>> {
@@ -1045,7 +1077,7 @@ impl Client {
             && self.is_uring_operation_supported(opcode::Fsync::CODE)
         {
             let uring = self.uring.as_ref().expect("uring must be Some");
-            PendingIo::new(UringSync::new(uring, file, true, None))
+            PendingIo::new(UringSync::new(uring, file, true, None).await)
         } else {
             PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
                 nix::unistd::fsync(file.as_file_descriptor())?;
@@ -1055,7 +1087,7 @@ impl Client {
     }
 
     /// Standard library compatible method for getting metadata of an open file handle (statx). This is the io_uring equivalent of the low-level [`libc::statx()`] or [`std::fs::File::metadata`] functions.
-    pub fn metadata<'a>(
+    pub async fn metadata<'a>(
         &'a self,
         file: &'a (impl UringTarget + Sync + ?Sized),
     ) -> PendingIo<'a, io::Result<Metadata>> {
@@ -1064,7 +1096,7 @@ impl Client {
             && self.is_uring_operation_supported(opcode::Statx::CODE)
         {
             let uring = self.uring.as_ref().expect("uring must be Some");
-            PendingIo::new(UringStatx::new(uring, file, None))
+            PendingIo::new(UringStatx::new(uring, file, None).await)
         } else {
             PendingIo::new(TokioScopedPendingIo::new(
                 move || -> io::Result<Metadata> {
@@ -1084,7 +1116,7 @@ impl Client {
     }
 
     /// Retrieves metadata from a file with the path relative to the specified directory file descriptor.
-    pub fn statx_at<'a>(
+    pub async fn statx_at<'a>(
         &'a self,
         fd: &'a (impl UringTarget + Sync + ?Sized),
         path: impl AsRef<Path>,
@@ -1101,7 +1133,7 @@ impl Client {
             && self.is_uring_operation_supported(opcode::Statx::CODE)
         {
             let uring = self.uring.as_ref().expect("uring must be Some");
-            PendingIo::new(UringStatxPath::new(uring, fd, path_cstr, flags, None))
+            PendingIo::new(UringStatxPath::new(uring, fd, path_cstr, flags, None).await)
         } else {
             PendingIo::new(TokioScopedPendingIo::new(
                 move || -> io::Result<Metadata> {
@@ -1121,15 +1153,16 @@ impl Client {
     }
 
     /// Standard library compatible method for getting metadata of a file path after following all symlinks, equivalent to [`std::fs::metadata`].
-    pub fn metadata_path<'a>(
+    pub async fn metadata_path<'a>(
         &'a self,
         path: impl AsRef<Path>,
     ) -> PendingIo<'a, io::Result<Metadata>> {
         self.statx_at(&Self::AT_FDCWD, path, AtFlags::AT_EMPTY_PATH)
+            .await
     }
 
     /// Standard library compatible method for getting metadata of a file path without following any symlinks, equivalent to [`std::fs::symlink_metadata`].
-    pub fn symlink_metadata_path<'a>(
+    pub async fn symlink_metadata_path<'a>(
         &'a self,
         path: impl AsRef<Path>,
     ) -> PendingIo<'a, io::Result<Metadata>> {
@@ -1138,10 +1171,11 @@ impl Client {
             path,
             AtFlags::AT_SYMLINK_NOFOLLOW | AtFlags::AT_EMPTY_PATH,
         )
+        .await
     }
 
     /// Pre-allocate or deallocate space for a file (fallocate). This can be used to pre-allocate space to avoid fragmentation, punch holes in sparse files, or zero-fill regions. Use `libc::FALLOC_FL_*` constants for mode flags.
-    pub fn fallocate<'a>(
+    pub async fn fallocate<'a>(
         &'a self,
         file: &'a (impl UringTarget + Sync + ?Sized),
         mode: FallocateFlags,
@@ -1182,7 +1216,7 @@ impl Client {
             && self.is_uring_operation_supported(opcode::Fallocate::CODE)
         {
             let uring = self.uring.as_ref().expect("uring must be Some");
-            PendingIo::new(UringFallocate::new(uring, file, mode, offset, len, None))
+            PendingIo::new(UringFallocate::new(uring, file, mode, offset, len, None).await)
         } else {
             PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
                 nix::fcntl::fallocate(
@@ -1197,7 +1231,7 @@ impl Client {
     }
 
     /// Advise the kernel about expected file access patterns (fadvise). This is a hint to the kernel about how you intend to access a file region. The kernel may use this to optimize readahead, caching, etc. Use `libc::POSIX_FADV_*` constants for advice values.
-    pub fn fadvise<'a>(
+    pub async fn fadvise<'a>(
         &'a self,
         file: &'a (impl UringTarget + Sync + ?Sized),
         offset: impl TryInto<u64>,
@@ -1238,9 +1272,7 @@ impl Client {
             && self.is_uring_operation_supported(opcode::Fadvise::CODE)
         {
             let uring = self.uring.as_ref().expect("uring must be Some");
-            PendingIo::new(UringFadvise::new(
-                uring, file, advice, offset, len as i64, None,
-            ))
+            PendingIo::new(UringFadvise::new(uring, file, advice, offset, len as i64, None).await)
         } else {
             PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
                 nix::fcntl::posix_fadvise(
@@ -1255,7 +1287,7 @@ impl Client {
     }
 
     /// Truncate a file to a specified length (ftruncate). If the file is larger than the specified length, the extra data is lost. If the file is smaller, it is extended and the extended part reads as zeros.
-    pub fn ftruncate<'a>(
+    pub async fn ftruncate<'a>(
         &'a self,
         file: &'a (impl UringTarget + Sync + ?Sized),
         len: impl TryInto<u64>,
@@ -1279,7 +1311,7 @@ impl Client {
             && self.is_uring_operation_supported(opcode::Ftruncate::CODE)
         {
             let uring = self.uring.as_ref().expect("uring must be Some");
-            PendingIo::new(UringFtruncate::new(uring, file, len, None))
+            PendingIo::new(UringFtruncate::new(uring, file, len, None).await)
         } else {
             PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
                 nix::unistd::ftruncate(file.as_file_descriptor(), len as i64)?;
@@ -1299,7 +1331,7 @@ impl Client {
     ///
     /// # Notes
     /// - This low-level function does not provide the `O_CLOEXEC` flag by default. This may cause file descriptor leaks, so it is recommended to use [`Self::open_at`].
-    pub fn open_at_ll<'a>(
+    pub async fn open_at_ll<'a>(
         &'a self,
         dir_fd: &'a (impl UringTarget + Sync + ?Sized),
         path: impl AsRef<Path>,
@@ -1316,14 +1348,17 @@ impl Client {
                 }
             };
             let uring = self.uring.as_ref().expect("uring must be Some");
-            PendingIo::new(UringOpenAt::new(
-                uring,
-                dir_fd,
-                path,
-                flags,
-                Mode::from_bits_retain(permissions.mode()),
-                None,
-            ))
+            PendingIo::new(
+                UringOpenAt::new(
+                    uring,
+                    dir_fd,
+                    path,
+                    flags,
+                    Mode::from_bits_retain(permissions.mode()),
+                    None,
+                )
+                .await,
+            )
         } else {
             let path_owned = path.as_ref().to_owned();
             PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<OwnedFd> {
@@ -1351,17 +1386,18 @@ impl Client {
     ///
     /// # Notes
     /// - This low-level function does not provide the `O_CLOEXEC` flag by default. This may cause file descriptor leaks, so it is recommended to use [`Self::open_path`].
-    pub fn open_path_ll<'a>(
+    pub async fn open_path_ll<'a>(
         &'a self,
         path: impl AsRef<Path>,
         flags: OFlag,
         permissions: Permissions,
     ) -> PendingIo<'a, io::Result<OwnedFd>> {
         self.open_at_ll(&Self::AT_FDCWD, path, flags, permissions)
+            .await
     }
 
     /// Open a file relative to a directory fd similar to [`Self::open_at_ll`], but with [`O_CLOEXEC`](libc::O_CLOEXEC) flag.
-    pub fn open_at<'a>(
+    pub async fn open_at<'a>(
         &'a self,
         dir_fd: &'a (impl UringTarget + Sync + ?Sized),
         path: impl AsRef<Path>,
@@ -1369,47 +1405,58 @@ impl Client {
         permissions: Permissions,
     ) -> PendingIo<'a, io::Result<OwnedFd>> {
         self.open_at_ll(dir_fd, path, flags | OFlag::O_CLOEXEC, permissions)
+            .await
     }
 
     /// Open a file using path syntax similar to [`Self::open_at_ll`]. This provides a convenient interface close to the standard library's [`std::fs::OpenOptions`] object, which includes the [`O_CLOEXEC`](libc::O_CLOEXEC) flag to prevent fd leaks.
-    pub fn open_path<'a>(
+    pub async fn open_path<'a>(
         &'a self,
         path: impl AsRef<Path>,
         flags: OFlag,
         permissions: Permissions,
     ) -> PendingIo<'a, io::Result<OwnedFd>> {
         self.open_at_ll(&Self::AT_FDCWD, path, flags | OFlag::O_CLOEXEC, permissions)
+            .await
     }
 
     /// Standard library compatible method for opening a file, equivalent to [`std::fs::File::open`] (read-only open API),
     /// which also includes the `O_CLOEXEC` flag to provide parity with the library.
-    pub fn open<'a>(&'a self, path: impl AsRef<Path>) -> PendingIo<'a, io::Result<OwnedFd>> {
+    pub async fn open<'a>(&'a self, path: impl AsRef<Path>) -> PendingIo<'a, io::Result<OwnedFd>> {
         self.open_at_ll(
             &Self::AT_FDCWD,
             path,
             OFlag::O_RDONLY | OFlag::O_CLOEXEC,
             Permissions::from_mode(0o666),
         )
+        .await
     }
 
     /// Standard library compatible method for creating a file or truncate an already existing file, equivalent to [`std::fs::File::create`], which also includes the [`O_CLOEXEC`](libc::O_CLOEXEC) flag to provide parity with the library.
-    pub fn create<'a>(&'a self, path: impl AsRef<Path>) -> PendingIo<'a, io::Result<OwnedFd>> {
+    pub async fn create<'a>(
+        &'a self,
+        path: impl AsRef<Path>,
+    ) -> PendingIo<'a, io::Result<OwnedFd>> {
         self.open_at_ll(
             &Self::AT_FDCWD,
             path,
             OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_TRUNC | OFlag::O_CLOEXEC,
             Permissions::from_mode(0o666),
         )
+        .await
     }
 
     /// Standard library compatible method for creating a file and failing if the file already exists, equivalent to [`std::fs::File::create_new`], which also includes the [`O_CLOEXEC`](libc::O_CLOEXEC) flag to provide parity with the library.
-    pub fn create_new<'a>(&'a self, path: impl AsRef<Path>) -> PendingIo<'a, io::Result<OwnedFd>> {
+    pub async fn create_new<'a>(
+        &'a self,
+        path: impl AsRef<Path>,
+    ) -> PendingIo<'a, io::Result<OwnedFd>> {
         self.open_at_ll(
             &Self::AT_FDCWD,
             path,
             OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_CLOEXEC,
             Permissions::from_mode(0o666),
         )
+        .await
     }
 
     /// Close a file descriptor asynchronously. This is the io_uring equivalent of `close(2)`
@@ -1418,7 +1465,7 @@ impl Client {
     /// - Handle close errors (which are silently ignored by `OwnedFd::drop`)
     /// - Batch close operations with other io_uring operations
     /// - Avoid blocking the async runtime on close
-    pub fn close<'a>(
+    pub async fn close<'a>(
         &'a self,
         fd: impl IntoRawFd + Sized + Send + 'a,
     ) -> PendingIo<'a, io::Result<()>> {
@@ -1426,7 +1473,7 @@ impl Client {
             && self.is_uring_operation_supported(opcode::Close::CODE)
         {
             let uring = self.uring.as_ref().expect("uring must be Some");
-            PendingIo::new(UringClose::new(uring, fd, None))
+            PendingIo::new(UringClose::new(uring, fd, None).await)
         } else {
             let raw_fd = fd.into_raw_fd();
             let owned_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
@@ -1440,7 +1487,7 @@ impl Client {
     /// Rename a file relative to directory fds. This is the io_uring equivalent of `renameat2(2)`.
     ///
     /// Flags can include [`RenameFlags`](nix::fcntl::RenameFlags) constants.
-    pub fn rename_at<'a>(
+    pub async fn rename_at<'a>(
         &'a self,
         old_dir_fd: &'a (impl UringTarget + Sync + ?Sized),
         old_path: impl AsRef<Path>,
@@ -1464,9 +1511,12 @@ impl Client {
                 }
             };
             let uring = self.uring.as_ref().expect("uring must be Some");
-            PendingIo::new(UringRenameAt::new(
-                uring, old_dir_fd, old_path, new_dir_fd, new_path, flags, None,
-            ))
+            PendingIo::new(
+                UringRenameAt::new(
+                    uring, old_dir_fd, old_path, new_dir_fd, new_path, flags, None,
+                )
+                .await,
+            )
         } else {
             let old_path_owned = old_path.as_ref().to_owned();
             let new_path_owned = new_path.as_ref().to_owned();
@@ -1484,7 +1534,7 @@ impl Client {
     }
 
     /// Rename a file asynchronously. This is the io_uring equivalent of `rename(2)`.
-    pub fn rename<'a>(
+    pub async fn rename<'a>(
         &'a self,
         old_path: impl AsRef<Path>,
         new_path: impl AsRef<Path>,
@@ -1496,12 +1546,13 @@ impl Client {
             new_path,
             RenameFlags::empty(),
         )
+        .await
     }
 
     /// Delete a file or directory relative to a directory fd. This is the io_uring equivalent of `unlinkat(2)`.
     ///
     /// Use [`UnlinkatFlags::RemoveDir`](nix::unistd::UnlinkatFlags::RemoveDir) flag to remove directories.
-    pub fn unlink_at<'a>(
+    pub async fn unlink_at<'a>(
         &'a self,
         dir_fd: &'a (impl UringTarget + Sync + ?Sized),
         path: impl AsRef<Path>,
@@ -1517,7 +1568,7 @@ impl Client {
                 }
             };
             let uring = self.uring.as_ref().expect("uring must be Some");
-            PendingIo::new(UringUnlinkAt::new(uring, dir_fd, path, flags, None))
+            PendingIo::new(UringUnlinkAt::new(uring, dir_fd, path, flags, None).await)
         } else {
             let path_owned = path.as_ref().to_owned();
             PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
@@ -1528,23 +1579,25 @@ impl Client {
     }
 
     /// Delete a file or empty directory. This is the io_uring equivalent of `unlink(2)`.
-    pub fn unlink<'a>(&'a self, path: impl AsRef<Path>) -> PendingIo<'a, io::Result<()>> {
+    pub async fn unlink<'a>(&'a self, path: impl AsRef<Path>) -> PendingIo<'a, io::Result<()>> {
         self.unlink_at(&Self::AT_FDCWD, path, UnlinkatFlags::NoRemoveDir)
+            .await
     }
 
     /// Delete a directory. This is the io_uring equivalent of `rmdir(2)`.
-    pub fn rmdir<'a>(&'a self, path: impl AsRef<Path>) -> PendingIo<'a, io::Result<()>> {
+    pub async fn rmdir<'a>(&'a self, path: impl AsRef<Path>) -> PendingIo<'a, io::Result<()>> {
         self.unlink_at(&Self::AT_FDCWD, path, UnlinkatFlags::RemoveDir)
+            .await
     }
 
     /// Delete a directory. Alias for [`Self::rmdir`].
     #[inline]
-    pub fn remove_dir<'a>(&'a self, path: impl AsRef<Path>) -> PendingIo<'a, io::Result<()>> {
-        self.rmdir(path)
+    pub async fn remove_dir<'a>(&'a self, path: impl AsRef<Path>) -> PendingIo<'a, io::Result<()>> {
+        self.rmdir(path).await
     }
 
     /// Create a directory relative to a directory fd. This is the io_uring equivalent of `mkdirat(2)`.
-    pub fn mkdir_at<'a>(
+    pub async fn mkdir_at<'a>(
         &'a self,
         dir_fd: &'a (impl UringTarget + Sync + ?Sized),
         path: impl AsRef<Path>,
@@ -1560,13 +1613,16 @@ impl Client {
                 }
             };
             let uring = self.uring.as_ref().expect("uring must be Some");
-            PendingIo::new(UringMkdirAt::new(
-                uring,
-                dir_fd,
-                path,
-                Mode::from_bits_retain(permissions.mode()),
-                None,
-            ))
+            PendingIo::new(
+                UringMkdirAt::new(
+                    uring,
+                    dir_fd,
+                    path,
+                    Mode::from_bits_retain(permissions.mode()),
+                    None,
+                )
+                .await,
+            )
         } else {
             let path_owned = path.as_ref().to_owned();
             PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
@@ -1581,17 +1637,18 @@ impl Client {
     }
 
     /// Create a directory using path syntax. This is the io_uring equivalent of `mkdir(2)`.
-    pub fn mkdir<'a>(
+    pub async fn mkdir<'a>(
         &'a self,
         path: impl AsRef<Path>,
         permissions: Permissions,
     ) -> PendingIo<'a, io::Result<()>> {
-        self.mkdir_at(&Self::AT_FDCWD, path, permissions)
+        self.mkdir_at(&Self::AT_FDCWD, path, permissions).await
     }
 
     /// Standard library compatible method for creating a directory, equivalent to [`std::fs::create_dir`].
-    pub fn create_dir<'a>(&'a self, path: impl AsRef<Path>) -> PendingIo<'a, io::Result<()>> {
+    pub async fn create_dir<'a>(&'a self, path: impl AsRef<Path>) -> PendingIo<'a, io::Result<()>> {
         self.mkdir_at(&Self::AT_FDCWD, path, Permissions::from_mode(0o777))
+            .await
     }
 
     /// Standard library compatible method for ensuring that a directory exists by creating it and all missing parent directories,
@@ -1604,6 +1661,7 @@ impl Client {
 
         match self
             .create_dir(path)
+            .await
             .completion()
             .expect("no completion")
             .await
@@ -1624,6 +1682,7 @@ impl Client {
         }
         match self
             .create_dir(path)
+            .await
             .completion()
             .expect("no completion")
             .await
@@ -1647,6 +1706,7 @@ impl Client {
 
         match self
             .mkdir(path, permissions)
+            .await
             .completion()
             .expect("no completion")
             .await
@@ -1667,6 +1727,7 @@ impl Client {
         }
         match self
             .mkdir(path, permissions)
+            .await
             .completion()
             .expect("no completion")
             .await
@@ -1678,7 +1739,7 @@ impl Client {
     }
 
     /// Create a symbolic link relative to a directory fd. This is the io_uring equivalent of `symlinkat(2)`.
-    pub fn symlink_at<'a>(
+    pub async fn symlink_at<'a>(
         &'a self,
         target: impl AsRef<Path>,
         new_dir_fd: &'a (impl UringTarget + Sync + ?Sized),
@@ -1700,9 +1761,7 @@ impl Client {
                 }
             };
             let uring = self.uring.as_ref().expect("uring must be Some");
-            PendingIo::new(UringSymlinkAt::new(
-                uring, new_dir_fd, target, link_path, None,
-            ))
+            PendingIo::new(UringSymlinkAt::new(uring, new_dir_fd, target, link_path, None).await)
         } else {
             let target_owned = target.as_ref().to_owned();
             let link_path_owned = link_path.as_ref().to_owned();
@@ -1718,16 +1777,16 @@ impl Client {
     }
 
     /// Standard library compatible method for creating a symbolic link, equivalent to [`std::os::unix::fs::symlink`] or `symlink(2)`.
-    pub fn symlink<'a>(
+    pub async fn symlink<'a>(
         &'a self,
         target: impl AsRef<Path>,
         link_path: impl AsRef<Path>,
     ) -> PendingIo<'a, io::Result<()>> {
-        self.symlink_at(target, &Self::AT_FDCWD, link_path)
+        self.symlink_at(target, &Self::AT_FDCWD, link_path).await
     }
 
     /// Create a hard link to the location relative to the target directory at a location relative to the specified directory fd. This is the io_uring equivalent of `linkat(2)`.
-    pub fn hard_link_at<'a>(
+    pub async fn hard_link_at<'a>(
         &'a self,
         old_dir_fd: &'a (impl UringTarget + Sync + ?Sized),
         old_path: impl AsRef<Path>,
@@ -1751,9 +1810,12 @@ impl Client {
                 }
             };
             let uring = self.uring.as_ref().expect("uring must be Some");
-            PendingIo::new(UringLinkAt::new(
-                uring, old_dir_fd, old_path, new_dir_fd, new_path, flags, None,
-            ))
+            PendingIo::new(
+                UringLinkAt::new(
+                    uring, old_dir_fd, old_path, new_dir_fd, new_path, flags, None,
+                )
+                .await,
+            )
         } else {
             let old_path_owned = old_path.as_ref().to_owned();
             let new_path_owned = new_path.as_ref().to_owned();
@@ -1771,7 +1833,7 @@ impl Client {
     }
 
     /// Create a hard link to the open file handle at a location relative to the specified directory fd.
-    pub fn hard_link_file_at<'a>(
+    pub async fn hard_link_file_at<'a>(
         &'a self,
         file: &'a (impl UringTarget + Sync + ?Sized),
         new_dir_fd: &'a (impl UringTarget + Sync + ?Sized),
@@ -1785,10 +1847,11 @@ impl Client {
             // Points to the target file.
             LinkatFlags::AT_EMPTY_PATH,
         )
+        .await
     }
 
     /// Create a hard link to the open file handle at the specified path.
-    pub fn hard_link_file<'a>(
+    pub async fn hard_link_file<'a>(
         &'a self,
         file: &'a (impl UringTarget + Sync + ?Sized),
         new_path: impl AsRef<Path>,
@@ -1800,10 +1863,11 @@ impl Client {
             new_path,
             LinkatFlags::empty(),
         )
+        .await
     }
 
     /// Standard library compatible method for creating a hard link using path syntax. This is the io_uring equivalent of `link(2)`.
-    pub fn hard_link<'a>(
+    pub async fn hard_link<'a>(
         &'a self,
         old_path: impl AsRef<Path>,
         new_path: impl AsRef<Path>,
@@ -1815,20 +1879,21 @@ impl Client {
             new_path,
             LinkatFlags::empty(),
         )
+        .await
     }
 
     /// Alias for [`Self::fchmod`].
     #[inline]
-    pub fn set_permissions<'a>(
+    pub async fn set_permissions<'a>(
         &'a self,
         fd: &'a (impl UringTarget + Sync + ?Sized),
         permissions: Permissions,
     ) -> PendingIo<'a, io::Result<()>> {
-        self.fchmod(fd, permissions)
+        self.fchmod(fd, permissions).await
     }
 
     /// Set the permissions of an open handle to a file or directory, which is equivalent to [`std::fs::File::set_permissions`] or `fchmod(2)`.
-    pub fn fchmod<'a>(
+    pub async fn fchmod<'a>(
         &'a self,
         fd: &'a (impl UringTarget + Sync + ?Sized),
         permissions: Permissions,
@@ -1843,7 +1908,7 @@ impl Client {
     }
 
     /// Set the permissions of a file or directory relative to a directory fd, which is equivalent to `fchmodat(2)`.
-    pub fn fchmod_at<'a>(
+    pub async fn fchmod_at<'a>(
         &'a self,
         fd: &'a (impl UringTarget + Sync + ?Sized),
         path: impl AsRef<Path>,
@@ -1863,7 +1928,7 @@ impl Client {
     }
 
     /// Set the permissions of a file or directory using path syntax, equivalent to `chmod(2)`.
-    pub fn chmod<'a>(
+    pub async fn chmod<'a>(
         &'a self,
         path: impl AsRef<Path>,
         permissions: Permissions,
@@ -1874,10 +1939,11 @@ impl Client {
             permissions,
             FchmodatFlags::FollowSymlink,
         )
+        .await
     }
 
     /// Set the permissions of a file or directory using path syntax, but can target a symlink.
-    pub fn lchmod<'a>(
+    pub async fn lchmod<'a>(
         &'a self,
         path: impl AsRef<Path>,
         permissions: Permissions,
@@ -1888,10 +1954,11 @@ impl Client {
             permissions,
             FchmodatFlags::NoFollowSymlink,
         )
+        .await
     }
 
     /// Set the user and/or group ownership of an open handle to a file or directory, which is equivalent to `fchown(2)`.
-    pub fn fchown<'a>(
+    pub async fn fchown<'a>(
         &'a self,
         fd: &'a (impl UringTarget + Sync + ?Sized),
         uid: Option<Uid>,
@@ -1904,7 +1971,7 @@ impl Client {
     }
 
     /// Set the user and/or group ownership of a file or directory relative to a directory fd, which is equivalent to `fchownat(2)`.
-    pub fn fchown_at<'a>(
+    pub async fn fchown_at<'a>(
         &'a self,
         fd: &'a (impl UringTarget + Sync + ?Sized),
         path: impl AsRef<Path>,
@@ -1920,7 +1987,7 @@ impl Client {
     }
 
     /// Set the user and/or group ownership of a file or directory using path syntax, which is equivalent to `chown(2)`.
-    pub fn chown<'a>(
+    pub async fn chown<'a>(
         &'a self,
         path: impl AsRef<Path>,
         uid: Option<Uid>,
@@ -1933,10 +2000,11 @@ impl Client {
             gid,
             FchownatFlags::AT_EMPTY_PATH,
         )
+        .await
     }
 
     /// Set the user and/ or group ownership of a file or directory using path syntax, but can target a symlink.
-    pub fn lchown<'a>(
+    pub async fn lchown<'a>(
         &'a self,
         path: impl AsRef<Path>,
         uid: Option<Uid>,
@@ -1949,21 +2017,22 @@ impl Client {
             gid,
             FchownatFlags::AT_EMPTY_PATH | FchownatFlags::AT_SYMLINK_NOFOLLOW,
         )
+        .await
     }
 
     /// Alias for [`Self::futimens`].
     #[inline]
-    pub fn set_times<'a>(
+    pub async fn set_times<'a>(
         &'a self,
         fd: &'a (impl UringTarget + Sync + ?Sized),
         atime: Option<TimeSpec>,
         mtime: Option<TimeSpec>,
     ) -> PendingIo<'a, io::Result<()>> {
-        self.futimens(fd, atime, mtime)
+        self.futimens(fd, atime, mtime).await
     }
 
     /// Set file times of an open handle to a file or directory, which is equivalent to [`std::fs::File::set_times`] or `futimens(2)`.
-    pub fn futimens<'a>(
+    pub async fn futimens<'a>(
         &'a self,
         fd: &'a (impl UringTarget + Sync + ?Sized),
         atime: Option<TimeSpec>,
@@ -1980,7 +2049,7 @@ impl Client {
     }
 
     /// Set file times of a file or directory using a path relative to a directory fd, which is equivalent to `utimensat(2)`.
-    pub fn utimens_at<'a>(
+    pub async fn utimens_at<'a>(
         &'a self,
         dir_fd: &'a (impl UringTarget + Sync + ?Sized),
         path: impl AsRef<Path>,
@@ -2002,7 +2071,7 @@ impl Client {
     }
 
     /// Canonicalize a path. This is equivalent to `realpath(3)`.
-    pub fn canonicalize<'a>(
+    pub async fn canonicalize<'a>(
         &'a self,
         path: impl AsRef<Path>,
     ) -> PendingIo<'a, io::Result<PathBuf>> {
@@ -2013,12 +2082,15 @@ impl Client {
     }
 
     /// Read a symbolic link. This is equivalent to `readlink(2)`.
-    pub fn read_link<'a>(&'a self, path: impl AsRef<Path>) -> PendingIo<'a, io::Result<PathBuf>> {
-        self.read_link_at(&Self::AT_FDCWD, path)
+    pub async fn read_link<'a>(
+        &'a self,
+        path: impl AsRef<Path>,
+    ) -> PendingIo<'a, io::Result<PathBuf>> {
+        self.read_link_at(&Self::AT_FDCWD, path).await
     }
 
     /// Read a symbolic link at a relative path to a directory fd, which is equivalent to `readlinkat(2)`.
-    pub fn read_link_at<'a>(
+    pub async fn read_link_at<'a>(
         &'a self,
         dir_fd: &'a (impl UringTarget + Sync + ?Sized),
         path: impl AsRef<Path>,
@@ -2033,15 +2105,15 @@ impl Client {
     }
 
     /// Read a symbolic link at a file descriptor opened with [`OFlag::O_PATH`] and [`OFlag::O_NOFOLLOW`].
-    pub fn read_link_file<'a>(
+    pub async fn read_link_file<'a>(
         &'a self,
         fd: &'a (impl UringTarget + Sync + ?Sized),
     ) -> PendingIo<'a, io::Result<PathBuf>> {
-        self.read_link_at(fd, Path::new(""))
+        self.read_link_at(fd, Path::new("")).await
     }
 
     /// Create a device node at a relative path to a directory fd, which is equivalent to `mknodat(2)`.
-    pub fn mknod_at<'a>(
+    pub async fn mknod_at<'a>(
         &'a self,
         dir_fd: &'a (impl UringTarget + Sync + ?Sized),
         path: impl AsRef<Path>,
@@ -2063,17 +2135,18 @@ impl Client {
     }
 
     /// Create a device node using path syntax, which is equivalent to `mknod(2)`.
-    pub fn mknod<'a>(
+    pub async fn mknod<'a>(
         &'a self,
         path: impl AsRef<Path>,
         kind: MknodType,
         permissions: Permissions,
     ) -> PendingIo<'a, io::Result<()>> {
         self.mknod_at(&Self::AT_FDCWD, path, kind, permissions)
+            .await
     }
 
     /// Perform a `fcntl` syscall on a file descriptor, which is equivalent to `fcntl(2)`.
-    pub fn fcntl<'a>(
+    pub async fn fcntl<'a>(
         &'a self,
         fd: &'a (impl UringTarget + Sync + ?Sized),
         cmd: FcntlArg<'a>,
@@ -2085,40 +2158,44 @@ impl Client {
     }
 
     /// Set the status flags of a file descriptor, which is equivalent to `F_SETFL(2)`.
-    pub fn set_status_flags<'a>(
+    pub async fn set_status_flags<'a>(
         &'a self,
         fd: &'a mut (impl UringTarget + Sync + Send + ?Sized),
         flags: OFlag,
     ) -> PendingIo<'a, io::Result<()>> {
         self.fcntl(fd, FcntlArg::F_SETFL(flags))
+            .await
             .map(|r| r.map(|_| ()))
     }
 
     /// Get the status flags of a file descriptor, which is equivalent to `F_GETFL(2)`.
-    pub fn get_status_flags<'a>(
+    pub async fn get_status_flags<'a>(
         &'a self,
         fd: &'a (impl UringTarget + Sync + ?Sized),
     ) -> PendingIo<'a, io::Result<OFlag>> {
         self.fcntl(fd, FcntlArg::F_GETFL)
+            .await
             .map(|r| r.map(|flags| OFlag::from_bits_retain(flags)))
     }
 
     /// Set the descriptor flags of a file descriptor, which is equivalent to `F_SETFD(2)`.
-    pub fn set_descriptor_flags<'a>(
+    pub async fn set_descriptor_flags<'a>(
         &'a self,
         fd: &'a mut (impl UringTarget + Sync + Send + ?Sized),
         flags: FdFlag,
     ) -> PendingIo<'a, io::Result<()>> {
         self.fcntl(fd, FcntlArg::F_SETFD(flags))
+            .await
             .map(|r| r.map(|_| ()))
     }
 
     /// Get the descriptor flags of a file descriptor, which is equivalent to `F_GETFD(2)`.
-    pub fn get_descriptor_flags<'a>(
+    pub async fn get_descriptor_flags<'a>(
         &'a self,
         fd: &'a (impl UringTarget + Sync + ?Sized),
     ) -> PendingIo<'a, io::Result<FdFlag>> {
         self.fcntl(fd, FcntlArg::F_GETFD)
+            .await
             .map(|r| r.map(|flags| FdFlag::from_bits_retain(flags)))
     }
 
@@ -2130,6 +2207,7 @@ impl Client {
     ) -> io::Result<()> {
         let old_flags = self
             .get_status_flags(fd)
+            .await
             .completion()
             .expect("no completion future returned")
             .await?;
@@ -2139,6 +2217,7 @@ impl Client {
             old_flags & !OFlag::O_NONBLOCK
         };
         self.set_status_flags(fd, new_flags)
+            .await
             .completion()
             .expect("no completion future returned")
             .await?;
@@ -2153,6 +2232,7 @@ impl Client {
     ) -> io::Result<()> {
         let old_flags = self
             .get_descriptor_flags(fd)
+            .await
             .completion()
             .expect("no completion future returned")
             .await?;
@@ -2162,6 +2242,7 @@ impl Client {
             old_flags & !FdFlag::FD_CLOEXEC
         };
         self.set_descriptor_flags(fd, new_flags)
+            .await
             .completion()
             .expect("no completion future returned")
             .await?;
