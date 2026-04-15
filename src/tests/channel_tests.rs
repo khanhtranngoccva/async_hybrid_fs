@@ -81,21 +81,16 @@ async fn test_architecture_blocking_latency() {
             SubmissionTicket,
         ),
     >::new());
-    let (tx_1, rx_1) =
+    let (submission_tx, submission_rx) =
         crossbeam_channel::unbounded::<(Instant, tokio::sync::oneshot::Sender<Instant>)>();
-    let (tx_2, rx_2) = crossbeam_channel::bounded::<(
-        Instant,
-        tokio::sync::oneshot::Sender<Instant>,
-        SubmissionTicket,
-    )>(16384);
     // This channel signals the completion queue.
     let (completion_ticket_submitter, completion_ticket_queue) = completion_ticket_pair();
     // This channel simulates the io_uring processor.
-    let (tx_3, rx_3) = crossbeam_channel::bounded::<SubmissionTicketId>(16384);
-    let queue = SubmissionTicketQueue::new_multiple(&[16384]).pop().unwrap();
+    let (completion_tx, completion_rx) = crossbeam_channel::bounded::<SubmissionTicketId>(16384);
+    let queue = Arc::new(SubmissionTicketQueue::new_multiple(&[16384]).pop().unwrap());
 
     // Represents the completion thread
-    let thread_3 = tokio::task::spawn_blocking({
+    let completion_thread = tokio::task::spawn_blocking({
         let mapping = mapping.clone();
         move || {
             loop {
@@ -105,7 +100,7 @@ async fn test_architecture_blocking_latency() {
                     Some(count) => count,
                 };
                 for _ in 0..count {
-                    let id = match rx_3.recv() {
+                    let id = match completion_rx.recv() {
                         Ok(msg) => msg,
                         Err(crossbeam_channel::RecvError) => break,
                     };
@@ -116,41 +111,33 @@ async fn test_architecture_blocking_latency() {
         }
     });
     // Represents the submission thread.
-    let thread_2 = tokio::task::spawn_blocking(move || {
+    let submission_thread = tokio::task::spawn_blocking(move || {
         loop {
-            let msg = match rx_2.recv() {
-                Ok(msg) => msg,
-                Err(crossbeam_channel::RecvError) => break,
-            };
-            let id = msg.2.id();
-            mapping.insert(id, msg);
-            completion_ticket_submitter.grant_completion_ticket();
-            tx_3.send(id).unwrap();
-        }
-    });
-    // Represents the backpressure thread
-    let thread_1 = tokio::task::spawn_blocking(move || {
-        loop {
-            let (start_time, final_tx) = match rx_1.recv() {
+            let msg = match submission_rx.recv() {
                 Ok(msg) => msg,
                 Err(crossbeam_channel::RecvError) => break,
             };
             let ticket = queue.request_submission_ticket(None);
-            tx_2.send((start_time, final_tx, ticket)).unwrap();
+            let ticket_id = ticket.id();
+            mapping.insert(ticket_id, (msg.0, msg.1, ticket));
+            completion_ticket_submitter.grant_completion_ticket();
+            completion_tx.send(ticket_id).unwrap();
         }
     });
+
     for _ in 0..2000 {
         let (final_tx, final_rx) = tokio::sync::oneshot::channel::<Instant>();
-        tx_1.send((Instant::now(), final_tx)).unwrap();
+        // Implementation with ticketing and mutex in the submission thread (skip the backpressure thread, but blocks)
+        let start_time = Instant::now();
+        submission_tx.send((start_time, final_tx)).unwrap();
         let instant = final_rx.await.unwrap();
         let duration = instant.elapsed();
         durations.push(duration);
     }
-    drop(tx_1);
+    drop(submission_tx);
 
-    thread_1.await.unwrap();
-    thread_2.await.unwrap();
-    thread_3.await.unwrap();
+    submission_thread.await.unwrap();
+    completion_thread.await.unwrap();
 
     let lowest = durations
         .iter()
