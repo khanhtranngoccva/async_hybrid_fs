@@ -80,12 +80,3 @@ mod pending_io_futures {
         }
     }
 }
-
-/// Events that can be emitted by the pending I/O implementation from optional channels to help with testing. For example, flaky tests due to blocking behavior can be mitigated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PendingIoDebuggingEvent {
-    /// Operation has been sent, but there is no submission ticket available yet.
-    NeedWaitForSubmissionTicket,
-    /// Submission ticket has been granted.
-    SubmissionTicketGranted,
-}

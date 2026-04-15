@@ -17,8 +17,10 @@ pub(crate) mod unlink_at;
 pub(crate) mod write_from;
 pub(crate) mod write_from_vectored;
 
+use std::{pin::Pin, task::Poll};
+
 use super::PendingIoImpl;
-use crate::client::command::Command;
+use crate::client::{command::Command, ticketing::SubmissionTicketId};
 
 /// Trait for cancellable pending io operations done via io_uring.
 // "Send" is required for compatibility with [`async_trait`] and any application crates using [`async_trait`].
@@ -36,8 +38,7 @@ pub(crate) trait UringPendingIo<T>: PendingIoImpl<T> {
 mod tests {
     use crate::{
         Client, HybridFile, HybridRead, PendingIo, UringCfg,
-        client::pending_io::{PendingIoDebuggingEvent, uring::read_into::UringReadIntoAt},
-        default_client,
+        client::pending_io::uring::read_into::UringReadIntoAt, default_client,
     };
     use std::{io::pipe, os::fd::AsFd, sync::Arc, time::Duration, u64};
     use tokio::runtime::{Handle, RuntimeFlavor};
@@ -184,7 +185,6 @@ mod tests {
             &pipe_read,
             buf.as_mut_slice(),
             u64::MAX,
-            None,
         ));
         drop(pending_io);
     }
@@ -208,27 +208,31 @@ mod tests {
             log::warn!("uring is not available, skipping test");
             return;
         }
-        let (first_ack_tx, mut first_ack_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (second_wait_tx, mut second_wait_rx) = tokio::sync::mpsc::unbounded_channel();
-
+        let (first_pending_created_tx, first_pending_created_rx) = tokio::sync::oneshot::channel();
         let task_1 = tokio::task::spawn({
             let client = client.clone();
             async move {
                 let (reader_1, _writer_1) = pipe().expect("failed to create pipe");
                 let mut buf_1 = [0u8; 64];
+                log::info!("first pending I/O object creating");
                 let pending_io = PendingIo::new(UringReadIntoAt::new(
                     client.uring.as_ref().unwrap(),
                     &reader_1,
                     buf_1.as_mut_slice(),
                     u64::MAX,
-                    Some(first_ack_tx),
                 ));
-                let event = second_wait_rx
-                    .recv()
-                    .await
-                    .expect("failed to receive from blocking channel");
-                assert_eq!(event, PendingIoDebuggingEvent::NeedWaitForSubmissionTicket);
+                log::info!("first pending I/O object created");
+                // Flaky wait here is the only option because we are batching for multiple tickets at once while submission tickets are granted for operations indiscriminately.
+                // An I/O uring request is expected to be acknowledged within this time window.
+                tokio::time::sleep(Duration::from_secs_f64(0.1)).await;
+                first_pending_created_tx
+                    .send(())
+                    .expect("failed to send first pending created");
+                // The second I/O uring request should be tried and blocked within this time window.
+                tokio::time::sleep(Duration::from_secs_f64(0.1)).await;
+                log::info!("cancelling first pending I/O object");
                 let _ = pending_io.cancel().await;
+                log::info!("first pending I/O object cancelled");
             }
         });
         let task_2 = tokio::task::spawn({
@@ -236,21 +240,21 @@ mod tests {
             async move {
                 let (reader_2, _writer_2) = pipe().expect("failed to create pipe");
                 let mut buf_2 = [0u8; 64];
-                // The first operation must be running first.
-                let event = first_ack_rx
-                    .recv()
+                first_pending_created_rx
                     .await
-                    .expect("failed to receive from first ack channel - required to guarantee that the following operation will be stuck");
-                assert_eq!(event, PendingIoDebuggingEvent::SubmissionTicketGranted);
-                // The backpressure thread for this operation will block, cancelling the previous pending I/O
-                // will unblock the backpressure thread.
+                    .expect("failed to wait for the first pending I/O object to be created");
+                log::info!("second pending I/O object creating");
                 let pending_io = PendingIo::new(UringReadIntoAt::new(
                     client.uring.as_ref().unwrap(),
                     &reader_2,
                     buf_2.as_mut_slice(),
                     u64::MAX,
-                    Some(second_wait_tx),
                 ));
+                log::info!("second pending I/O object created");
+                // The submission thread for this operation will block, cancelling the previous pending I/O
+                // will unblock the submission thread and allowing the operation to be cancelled.
+                log::info!("cancelling second pending I/O object");
+                // FIXME: this cancel() blocks the runtime.
                 let _ = pending_io.cancel().await;
             }
         });
@@ -259,3 +263,32 @@ mod tests {
         task_2.await.expect("task 2 should not panic");
     }
 }
+
+struct CancellableAckRecv<'a> {
+    receiver: &'a mut oneshot::AsyncReceiver<SubmissionTicketId>,
+}
+
+impl<'a> CancellableAckRecv<'a> {
+    fn new(receiver: &'a mut oneshot::AsyncReceiver<SubmissionTicketId>) -> Self {
+        Self { receiver }
+    }
+}
+
+impl<'a> Future for CancellableAckRecv<'a> {
+    type Output = Result<SubmissionTicketId, oneshot::RecvError>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let inner = self.get_mut();
+        let mut channel = &mut inner.receiver;
+        match Pin::new(&mut channel).poll(cx) {
+            Poll::Ready(Ok(id)) => Poll::Ready(Ok(id)),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<'a> Unpin for CancellableAckRecv<'a> {}

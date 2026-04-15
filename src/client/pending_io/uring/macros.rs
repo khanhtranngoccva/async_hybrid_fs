@@ -6,18 +6,15 @@ macro_rules! uring_cancel_impl {
             // There is nothing to cancel, the operation is already done or cancelled
             return None;
         }
-        let cancellation_id = {
-            if $item.cancellation.is_none() {
-                let id = $item
-                    .ack_rx
-                    .take()
-                    .expect("ack_rx must be Some")
-                    .recv()
-                    .expect("ack_rx must be received to avoid a dangling pointer issue");
-                $item.cancellation = Some(id);
-            }
-            $item.cancellation.unwrap()
-        };
+        if $item.cancellation.is_none() {
+            use super::CancellableAckRecv;
+            let ack_rx_ref = $item.ack_rx.as_mut().unwrap();
+            let ack_recv = CancellableAckRecv::new(ack_rx_ref);
+            let id = ack_recv.await.expect("ack_rx must be received to avoid a dangling pointer issue");
+            $item.cancellation = Some(id);
+        }
+        let cancellation_id = $item.cancellation.unwrap();
+        // Blocking operation, but always completes in a finite amount of time.
         let res = $item.client.cancel_uring(cancellation_id);
         $item.cancel_done = true;
         match res {
@@ -33,7 +30,7 @@ macro_rules! uring_cancel_impl {
             // Only happens in case of a logic error
             Err(e) => panic!("failed to cancel operation: {}", e),
         }
-    }};
+    }}
 }
 
 pub(crate) use uring_cancel_impl;

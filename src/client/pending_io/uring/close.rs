@@ -1,11 +1,7 @@
 use super::UringPendingIo;
 use crate::{
     ClientUring,
-    client::{
-        command::Command,
-        pending_io::{PendingIoDebuggingEvent, PendingIoImpl},
-        requests::CloseRequest,
-    },
+    client::{command::Command, pending_io::PendingIoImpl, requests::CloseRequest},
 };
 use std::{io, os::fd::IntoRawFd, pin::Pin, sync::Arc, task::Poll};
 use tokio::sync::oneshot::{self, Receiver, Sender};
@@ -111,11 +107,7 @@ impl<'a, Target> UringClose<'a, Target>
 where
     Target: IntoRawFd + Sized + Send,
 {
-    pub(crate) fn new(
-        client: &'a ClientUring,
-        target: Target,
-        debug_event_tx: Option<tokio::sync::mpsc::UnboundedSender<PendingIoDebuggingEvent>>,
-    ) -> Self {
+    pub(crate) fn new(client: &'a ClientUring, target: Target) -> Self {
         let (result_tx, result_rx) = oneshot::channel();
         let mut op = Self {
             target: Some(target),
@@ -125,7 +117,7 @@ where
             _client: client,
         };
         let command = unsafe { op.build_command() };
-        client.send(command, debug_event_tx);
+        client.send(command);
         op
     }
 }

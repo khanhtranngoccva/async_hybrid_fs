@@ -3,7 +3,7 @@ use crate::runtime;
 use crate::{
     ClientUring, Metadata, UringTarget,
     client::ticketing::SubmissionTicketId,
-    client::{command::Command, pending_io::{PendingIoDebuggingEvent, PendingIoImpl}, requests::StatxRequest},
+    client::{command::Command, pending_io::PendingIoImpl, requests::StatxRequest},
 };
 use std::mem::MaybeUninit;
 use std::{io, pin::Pin, sync::Arc, task::Poll};
@@ -85,7 +85,7 @@ where
     /// Channel for sending operation IDs.
     ack_tx: Option<oneshot::Sender<SubmissionTicketId>>,
     /// Channel for receiving confirmation that the operation has been submitted. The ID must be received before the operation could be cancelled; otherwise, the future might drop before the operation even starts, leading to an operation with dangling pointers. We do not need the ID for any other purpose.
-    ack_rx: Option<oneshot::Receiver<SubmissionTicketId>>,
+    ack_rx: Option<oneshot::AsyncReceiver<SubmissionTicketId>>,
     /// Channel for sending operation results.
     result_tx: Option<oneshot_async::Sender<io::Result<Metadata>>>,
     /// Completion state, containing the result channel.
@@ -150,8 +150,8 @@ impl<'a, Target> UringStatx<'a, Target>
 where
     Target: UringTarget + Sync + ?Sized,
 {
-    pub(crate) fn new(uring: &'a ClientUring, target: &'a Target, debug_event_tx: Option<tokio::sync::mpsc::UnboundedSender<PendingIoDebuggingEvent>>) -> Self {
-        let (ack_tx, ack_rx) = oneshot::channel();
+    pub(crate) fn new(uring: &'a ClientUring, target: &'a Target) -> Self {
+        let (ack_tx, ack_rx) = oneshot::async_channel();
         let (result_tx, result_rx) = oneshot_async::channel();
         let mut op = Self {
             target,
@@ -165,7 +165,7 @@ where
             cancel_done: false,
         };
         let command = unsafe { op.build_command() };
-        uring.send(command, debug_event_tx);
+        uring.send(command);
         op
     }
 }

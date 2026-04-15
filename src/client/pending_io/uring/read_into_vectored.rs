@@ -1,5 +1,5 @@
 use super::{UringPendingIo, macros};
-use crate::client::pending_io::{PendingIoDebuggingEvent, PendingIoImpl};
+use crate::client::pending_io::PendingIoImpl;
 use crate::client::requests::IovecArray;
 use crate::client::ticketing::SubmissionTicketId;
 use crate::runtime;
@@ -118,7 +118,7 @@ where
     /// Channel for sending operation IDs.
     ack_tx: Option<oneshot::Sender<SubmissionTicketId>>,
     /// Channel for receiving confirmation that the operation has been submitted. The ID must be received before the operation could be cancelled; otherwise, the future might drop before the operation even starts, leading to an operation with dangling pointers. We do not need the ID for any other purpose.
-    ack_rx: Option<oneshot::Receiver<SubmissionTicketId>>,
+    ack_rx: Option<oneshot::AsyncReceiver<SubmissionTicketId>>,
     /// Channel for sending operation results.
     result_tx: Option<oneshot_async::Sender<io::Result<u32>>>,
     /// Completion state for the operation.
@@ -173,9 +173,8 @@ where
         target: &'a Target,
         mut bufs: Vec<Buf>,
         offset: u64,
-        debug_event_tx: Option<tokio::sync::mpsc::UnboundedSender<PendingIoDebuggingEvent>>,
     ) -> Self {
-        let (ack_tx, ack_rx) = oneshot::channel();
+        let (ack_tx, ack_rx) = oneshot::async_channel();
         let (result_tx, result_rx) = oneshot_async::channel();
         let mut op = Self {
             target,
@@ -199,7 +198,7 @@ where
             cancel_done: false,
         };
         let command = unsafe { op.build_command() };
-        uring.send(command, debug_event_tx);
+        uring.send(command);
         op
     }
 }

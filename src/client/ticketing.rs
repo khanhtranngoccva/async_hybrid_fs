@@ -1,4 +1,3 @@
-use crate::client::pending_io::PendingIoDebuggingEvent;
 use std::sync::{Arc, Condvar, Mutex};
 
 /// The submission ticket ID, which may be used as the user_data field/entry ID.
@@ -32,6 +31,8 @@ impl Drop for SubmissionTicket {
 /// A queue of submission tickets.
 #[derive(Debug)]
 pub(crate) struct SubmissionTicketQueue {
+    /// Original capacity of the queue.
+    capacity: usize,
     /// Queue of submission tickets.
     tickets: Arc<Mutex<Vec<SubmissionTicketId>>>,
     /// Condvar for notifying that a ticket is available.
@@ -46,9 +47,14 @@ impl SubmissionTicketQueue {
                 .collect(),
         );
         Self {
+            capacity: size,
             tickets: Arc::new(tickets),
             condvar: Arc::new(Condvar::new()),
         }
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        self.capacity
     }
 
     /// Create new submission ticket queues with the given sizes. The queues are pre-populated with the given number of tickets starting with 1,
@@ -64,35 +70,21 @@ impl SubmissionTicketQueue {
         queues
     }
 
-    /// Request a submission ticket from the queue.
-    pub(crate) fn request_submission_ticket(
-        &self,
-        debug_event_tx: Option<&tokio::sync::mpsc::UnboundedSender<PendingIoDebuggingEvent>>,
-    ) -> SubmissionTicket {
+    /// Request at least one and up to `count` submission tickets.
+    pub(crate) fn request_submission_tickets(&self, count: usize) -> Vec<SubmissionTicket> {
         let mut tickets = self.tickets.lock().unwrap();
-        let mut wait_event_sent = false;
         while tickets.is_empty() {
-            if !wait_event_sent {
-                if let Some(debug_event_tx) = debug_event_tx {
-                    debug_event_tx
-                        .send(PendingIoDebuggingEvent::NeedWaitForSubmissionTicket)
-                        .unwrap();
-                }
-                wait_event_sent = true;
-            }
             tickets = self.condvar.wait(tickets).unwrap();
         }
-        let id = tickets.pop().unwrap();
-        if let Some(debug_event_tx) = debug_event_tx {
-            debug_event_tx
-                .send(PendingIoDebuggingEvent::SubmissionTicketGranted)
-                .unwrap();
-        }
-        SubmissionTicket {
-            id,
-            tickets: self.tickets.clone(),
-            condvar: self.condvar.clone(),
-        }
+        let remaining_length = tickets.len().saturating_sub(count);
+        tickets
+            .drain(remaining_length..)
+            .map(|id| SubmissionTicket {
+                id,
+                tickets: self.tickets.clone(),
+                condvar: self.condvar.clone(),
+            })
+            .collect()
     }
 }
 
@@ -109,10 +101,10 @@ pub(crate) struct CompletionTicketSubmitter {
 }
 
 impl CompletionTicketSubmitter {
-    pub(crate) fn grant_completion_ticket(&self) {
+    pub(crate) fn grant_completion_tickets(&self, count: usize) {
         let mut completion_ticket_state = self.completion_tickets.lock().unwrap();
-        completion_ticket_state.completion_tickets += 1;
-        self.condvar.notify_one();
+        completion_ticket_state.completion_tickets += count;
+        self.condvar.notify_all();
     }
 }
 
