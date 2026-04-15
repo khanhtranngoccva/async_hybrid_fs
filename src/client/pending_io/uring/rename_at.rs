@@ -4,7 +4,7 @@ use crate::{
     client::ticketing::SubmissionTicketId,
     client::{
         command::Command,
-        pending_io::{PendingIoDebuggingEvent, PendingIoImpl},
+        pending_io::PendingIoImpl,
         requests::RenameAtRequest,
     },
     runtime,
@@ -108,7 +108,7 @@ where
     /// Channel for sending operation IDs.
     ack_tx: Option<oneshot::Sender<SubmissionTicketId>>,
     /// Channel for receiving confirmation that the operation has been submitted. The ID must be received before the operation could be cancelled; otherwise, the future might drop before the operation even starts, leading to an operation with dangling pointers. We do not need the ID for any other purpose.
-    ack_rx: Option<oneshot::Receiver<SubmissionTicketId>>,
+    ack_rx: Option<oneshot::AsyncReceiver<SubmissionTicketId>>,
     /// Channel for sending operation results.
     result_tx: Option<oneshot_async::Sender<io::Result<()>>>,
     /// Completion state, containing the result channel.
@@ -161,9 +161,8 @@ where
         new_dir: &'a NewDir,
         new_path: CString,
         flags: RenameFlags,
-        debug_event_tx: Option<tokio::sync::mpsc::UnboundedSender<PendingIoDebuggingEvent>>,
     ) -> Self {
-        let (ack_tx, ack_rx) = oneshot::channel();
+        let (ack_tx, ack_rx) = oneshot::async_channel();
         let (result_tx, result_rx) = oneshot_async::channel();
         let mut op = Self {
             old_dir,
@@ -181,7 +180,7 @@ where
             cancel_done: false,
         };
         let command = unsafe { op.build_command() };
-        uring.send(command, debug_event_tx);
+        uring.send(command);
         op
     }
 }
