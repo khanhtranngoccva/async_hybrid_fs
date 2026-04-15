@@ -1,4 +1,5 @@
 mod channel_tests;
+mod scoped_tests;
 
 use crate::{HybridFile, HybridRead, HybridSeek, HybridWrite, fs::OpenOptions};
 use nix::sys::time::TimeSpec;
