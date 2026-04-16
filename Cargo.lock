@@ -233,6 +233,7 @@ dependencies = [
  "criterion",
  "crossbeam-channel",
  "dashmap",
+ "futures",
  "io-uring",
  "lazy_static",
  "libc",

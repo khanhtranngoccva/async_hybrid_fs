@@ -18,28 +18,27 @@ use crate::client::ticketing::{
 
 #[test_log::test]
 fn test_crossbeam_channel_blocking_latency() {
-    let mut durations = Vec::new();
-
-    for _ in 0..100 {
-        let (tx, rx) = crossbeam_channel::bounded::<Instant>(1);
-        let thread_2 = thread::spawn(move || {
-            let start_time = rx.recv().unwrap();
-            let duration = start_time.elapsed();
-            duration
-        });
-        let thread_1 = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(20));
-            let start_time = Instant::now();
-            tx.send(start_time).unwrap();
-        });
-        thread_1.join().unwrap();
-        let duration = thread_2.join().unwrap();
-        durations.push(duration);
-    }
-    log::info!(
-        "crossbeam channel average latency: {:?}",
-        durations.iter().sum::<Duration>() / durations.len() as u32
-    );
+    let start = Instant::now();
+    let (tx, rx) = crossbeam_channel::unbounded::<Instant>();
+    let thread_1 = thread::spawn(move || {
+        for _ in 0..2000 {
+            tx.send(Instant::now()).unwrap();
+        }
+    });
+    let thread_2 = thread::spawn(move || {
+        loop {
+            match rx.recv() {
+                Ok(_) => (),
+                Err(crossbeam_channel::RecvError) => break,
+            };
+        }
+    });
+    thread_1.join().unwrap();
+    thread_2.join().unwrap();
+    let duration = start.elapsed();
+    log::info!("crossbeam channel blocking latency: {:?}", duration);
+    let average_latency = duration / 2000;
+    log::info!("crossbeam channel average latency: {:?}", average_latency);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
