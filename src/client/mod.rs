@@ -380,57 +380,60 @@ fn submission_thread(
             queue.push_back(command);
         }
 
-        let tickets = ticket_queue.request_submission_tickets(queue.len());
-        // Indicates how many tickets were granted, never greater than number of items in the deque nor greater than the io_uring submission queue capacity.
-        let ticket_count = tickets.len();
+        // Queue must be drained
+        while !queue.is_empty() {
+            let tickets = ticket_queue.request_submission_tickets(queue.len());
+            // Indicates how many tickets were granted, never greater than number of items in the deque nor greater than the io_uring submission queue capacity.
+            let ticket_count = tickets.len();
 
-        // How the io_uring submission queue works:
-        // - The buffer is shared between the kernel and userspace.
-        // - There are atomic head and tail indices that allow them to be shared mutably between kernel and userspace safely.
-        // - The Rust library we're using abstracts over this by caching the head and tail as local values. Once we've made our inserts, we update the atomic tail and then tell the kernel to consume some of the queue. When we update the atomic tail, we also check the atomic head and update our local cached value; some entries may have been consumed by the kernel in some other thread since we last checked and we may actually have more free space than we thought.
-        for ticket in tickets {
-            let command = queue.pop_front().unwrap();
-            let mut command_with_ticket = CommandWithTicket {
-                submission_ticket: ticket,
-                command,
-            };
-            let io_uring_entry = command::build_io_uring_entry(&command_with_ticket);
-            let ack = command::take_command_ack(&mut command_with_ticket.command);
-            let id = command_with_ticket.submission_ticket.id();
-            let insertion_res = pending.insert(id, command_with_ticket);
-            assert!(
-                insertion_res.is_none(),
-                "command with id {} already exists in pending map",
-                id.0
-            );
-            let guard = PendingEntryGuard::new(pending.clone(), id);
-            batched_guards.push(guard);
-            batched_requests.push(io_uring_entry);
-            batched_acks.push((ack, id));
-        }
+            // How the io_uring submission queue works:
+            // - The buffer is shared between the kernel and userspace.
+            // - There are atomic head and tail indices that allow them to be shared mutably between kernel and userspace safely.
+            // - The Rust library we're using abstracts over this by caching the head and tail as local values. Once we've made our inserts, we update the atomic tail and then tell the kernel to consume some of the queue. When we update the atomic tail, we also check the atomic head and update our local cached value; some entries may have been consumed by the kernel in some other thread since we last checked and we may actually have more free space than we thought.
+            for ticket in tickets {
+                let command = queue.pop_front().unwrap();
+                let mut command_with_ticket = CommandWithTicket {
+                    submission_ticket: ticket,
+                    command,
+                };
+                let io_uring_entry = command::build_io_uring_entry(&command_with_ticket);
+                let ack = command::take_command_ack(&mut command_with_ticket.command);
+                let id = command_with_ticket.submission_ticket.id();
+                let insertion_res = pending.insert(id, command_with_ticket);
+                assert!(
+                    insertion_res.is_none(),
+                    "command with id {} already exists in pending map",
+                    id.0
+                );
+                let guard = PendingEntryGuard::new(pending.clone(), id);
+                batched_guards.push(guard);
+                batched_requests.push(io_uring_entry);
+                batched_acks.push((ack, id));
+            }
 
-        // Lock on the submission queue for as little time as possible.
-        // SAFETY: The submission entry references memory owned by the caller's future, which is awaiting completion.
-        with_submission_queue(&ring, &submission_lock, |mut submission| {
-            for entry in batched_requests.drain(..) {
-                unsafe {submission.push(&entry)}.expect("submission queue should always have enough space for the number of requests indicated by ticket count");
+            // Lock on the submission queue for as little time as possible.
+            // SAFETY: The submission entry references memory owned by the caller's future, which is awaiting completion.
+            with_submission_queue(&ring, &submission_lock, |mut submission| {
+                for entry in batched_requests.drain(..) {
+                    unsafe {submission.push(&entry)}.expect("submission queue should always have enough space for the number of requests indicated by ticket count");
+                }
+                submission.sync();
+            });
+            // This is still necessary even with sqpoll, as our kernel thread may have gone to sleep.
+            ring.submit().unwrap();
+            // Disarm the pending entry guards because the submission is successful.
+            for mut guard in batched_guards.drain(..) {
+                guard.disarm();
             }
-            submission.sync();
-        });
-        // This is still necessary even with sqpoll, as our kernel thread may have gone to sleep.
-        ring.submit().unwrap();
-        // Disarm the pending entry guards because the submission is successful.
-        for mut guard in batched_guards.drain(..) {
-            guard.disarm();
-        }
-        // Send the operation IDs to the pending I/O objects to allow them to be cancelled.
-        for (ack, id) in batched_acks.drain(..) {
-            if let Some(ack) = ack {
-                let _ = ack.send(id);
+            // Send the operation IDs to the pending I/O objects to allow them to be cancelled.
+            for (ack, id) in batched_acks.drain(..) {
+                if let Some(ack) = ack {
+                    let _ = ack.send(id);
+                }
             }
+            // Send wait permits to the completion thread to indicate that it can now perform a blocking read of the next completion entry.
+            completion_ticket_submitter.grant_completion_tickets(ticket_count);
         }
-        // Send wait permits to the completion thread to indicate that it can now perform a blocking read of the next completion entry.
-        completion_ticket_submitter.grant_completion_tickets(ticket_count);
     }
 }
 
