@@ -59,8 +59,26 @@ async fn read_tokio_batched(path: impl AsRef<Path>, size: usize, count: usize) {
 }
 
 fn read_blocking_batched(path: impl AsRef<Path>, size: usize, count: usize) {
-    for _ in 0..count {
-        read_blocking(path.as_ref(), size);
+    let mut threads = Vec::new();
+    const NUM_THREADS: usize = 4;
+    let num_ops = count / NUM_THREADS;
+    let mut num_ops_per_thread = Vec::new();
+    for _ in 0..(NUM_THREADS - 1) {
+        num_ops_per_thread.push(num_ops);
+    }
+    num_ops_per_thread.push(count - num_ops_per_thread.iter().sum::<usize>());
+
+    for num_ops in num_ops_per_thread {
+        let path_owned = path.as_ref().to_owned();
+        threads.push(std::thread::spawn(move || {
+            for _ in 0..num_ops {
+                read_blocking(&path_owned, size);
+            }
+        }));
+    }
+
+    for thread in threads {
+        thread.join().expect("failed to join thread");
     }
 }
 
@@ -113,14 +131,14 @@ fn read_dev_zero_batched_benchmark(c: &mut Criterion) {
     let client = Client::build(UringCfg::default()).expect("failed to build client");
     c.bench_function("read::dev_zero::batched::hybrid", |b| {
         b.to_async(Runtime::new().unwrap())
-            .iter(|| read_hybrid_batched(&client, "/dev/urandom", 1024, 2000))
+            .iter(|| read_hybrid_batched(&client, "/dev/urandom", 1024, 4000))
     });
     c.bench_function("read::dev_zero::batched::tokio", |b| {
         b.to_async(Runtime::new().unwrap())
-            .iter(|| read_tokio_batched("/dev/urandom", 1024, 2000))
+            .iter(|| read_tokio_batched("/dev/urandom", 1024, 4000))
     });
     c.bench_function("read::dev_zero::batched::blocking", |b| {
-        b.iter(|| read_blocking_batched("/dev/urandom", 1024, 2000))
+        b.iter(|| read_blocking_batched("/dev/urandom", 1024, 4000))
     });
 }
 
@@ -128,14 +146,14 @@ fn read_dev_urandom_batched_benchmark(c: &mut Criterion) {
     let client = Client::build(UringCfg::default()).expect("failed to build client");
     c.bench_function("read::dev_urandom::batched::hybrid", |b| {
         b.to_async(Runtime::new().unwrap())
-            .iter(|| read_hybrid_batched(&client, "/dev/urandom", 1024, 2000))
+            .iter(|| read_hybrid_batched(&client, "/dev/urandom", 1024, 4000))
     });
     c.bench_function("read::dev_urandom::batched::tokio", |b| {
         b.to_async(Runtime::new().unwrap())
-            .iter(|| read_tokio_batched("/dev/urandom", 1024, 2000))
+            .iter(|| read_tokio_batched("/dev/urandom", 1024, 4000))
     });
     c.bench_function("read::dev_urandom::batched::blocking", |b| {
-        b.iter(|| read_blocking_batched("/dev/urandom", 1024, 2000))
+        b.iter(|| read_blocking_batched("/dev/urandom", 1024, 4000))
     });
 }
 
