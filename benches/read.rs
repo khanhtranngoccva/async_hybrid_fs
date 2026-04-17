@@ -1,4 +1,4 @@
-use async_hybrid_fs::{Client, Permissions, UringCfg};
+use async_hybrid_fs::{Client, Permissions, UringCfg, default_client};
 use criterion::{Criterion, criterion_group, criterion_main};
 use nix::fcntl::OFlag;
 use std::cmp;
@@ -85,6 +85,15 @@ async fn read_hybrid_multi(clients: &[Client], path: impl AsRef<Path>, size: usi
     for future in futures {
         future.expect("future failed to join");
     }
+}
+
+async fn read_hybrid_default_round_robin(path: impl AsRef<Path>, size: usize, count: usize) {
+    let mut futures = Vec::new();
+    for _ in 0..count {
+        let future = read_hybrid(default_client(), path.as_ref(), size);
+        futures.push(future);
+    }
+    futures::future::join_all(futures).await;
 }
 
 async fn read_tokio_batched(path: impl AsRef<Path>, size: usize, count: usize) {
@@ -225,6 +234,24 @@ fn read_dev_zero_with_contention_benchmark(c: &mut Criterion) {
             criterion::BatchSize::NumIterations(1),
         )
     });
+    c.bench_function(
+        "read::dev_zero::with_contention::hybrid::default_round_robin",
+        |b| {
+            b.to_async(
+                runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .worker_threads(multiclients.len())
+                    .build()
+                    .unwrap(),
+            )
+            .iter_batched(
+                || {},
+                |_| read_hybrid_default_round_robin("/dev/zero", 1024, 100000),
+                // Avoid file descriptor exhaustion
+                criterion::BatchSize::NumIterations(1),
+            )
+        },
+    );
 }
 
 criterion_group!(

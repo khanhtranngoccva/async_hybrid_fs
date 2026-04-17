@@ -5,7 +5,7 @@
 //! Unlike other `io_uring` crates which primarily target servers, this library is primarily targeted at applications that can benefit from fewer syscalls and run on end-user/consumer devices like a custom filesystem, on which support for `io_uring` is not guaranteed or `io_uring` is restricted by policy.
 //!
 //! # Feature comparison
-//! This crate is directly based on the `uring_file`(https://docs.rs/uring-file/latest/uring_file) crate by [wilsonzlin](https://github.com/wilsonzlin), but with some modifications:
+//! This crate is directly based on the `uring_file`(https://docs.rs/uring-file/latest/uring_file) crate by [wilsonzlin](https://github.com/wilsonzlin) and `rio`(https://docs.rs/rio/latest/rio) crate by [spacejam](https://github.com/spacejam), but with some modifications:
 //! - Features a more complete set of filesystem APIs, which is a superset of [`std::fs`]. This includes race-free APIs like the "*at" syscall family, as well as the vectored I/O APIs.
 //! - Dynamically detects whether `io_uring` is available on the system supported for the operation, and falls back to the async runtime's methods when it is not.
 //!     - The user may prevent unintentional use of fallback implementations in custom io_uring instances by setting [`UringCfg::allow_fallback`] to `false` if they are running in environments that should guarantee `io_uring`. Doing that will result in an error being returned when `io_uring` is not available, allowing for diagnosis.
@@ -28,12 +28,12 @@
 //! ```toml
 //! tokio = { version = "1", features = ["rt", "macros"] }
 //! ```
-//! # Architecture
-//! - If io_uring is available, the client consists of 4 main threads:
-//!     - Two collection threads with custom backpressure, one for normal operations and one for cancel operations. These two threads ensure the submission queue never overflows and prevents a non-cancelable io_uring_enter call.
-//!     - One submitter thread for aggregating commands from collection threads and submitting to io_uring.
-//!     - One reaper thread for handling completions from the completion queue.
 //!
+//! # Architecture
+//! - If io_uring is available, each client consists of 3 main threads:
+//!     - Two submitter threads for submitting commands to io_uring, one for normal operations and one for cancel operations.
+//!     - One reaper thread for handling completions from the completion queue.
+//! - For the default operation mode ([`default_client`] and [`HybridExt`] trait), the library sets up a number of clients equal to the number of logical CPU cores. It then attempts to evenly distribute the operations across the clients in a round-robin mode. This mitigates tail latency from idle clients and reduces the chance for a client's processing queues to overflow.
 #![cfg(unix)]
 mod borrowed_buf;
 pub mod client;
