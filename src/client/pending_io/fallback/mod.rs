@@ -124,6 +124,11 @@ where
     T: Send,
 {
     fn drop(&mut self) {
+        // Hot path: There is generally no point in waiting for the operation if it is
+        // already completed or has not been submitted yet, executing the future costs more time.
+        if self.task.is_none() {
+            return;
+        }
         runtime::execute_future_from_sync(self._cancel());
     }
 }

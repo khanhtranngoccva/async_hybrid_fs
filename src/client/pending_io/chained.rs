@@ -140,6 +140,10 @@ where
     Out: Send,
 {
     fn drop(&mut self) {
+        // Hot path: If the processor is removed, the operation is already completed or cancelled.
+        if self.processor.is_none() {
+            return;
+        }
         // Must run cancel() on outer structure instead of the inner structure because we want
         // inner operations to be performed
         runtime::execute_future_from_sync(self._cancel());

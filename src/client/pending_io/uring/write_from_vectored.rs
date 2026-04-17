@@ -5,10 +5,7 @@ use crate::runtime;
 use crate::{
     ClientUring, UringTarget,
     client::ticketing::SubmissionTicketId,
-    client::{
-        command::Command, completion::WritevResult,
-        requests::WritevRequest,
-    },
+    client::{command::Command, completion::WritevResult, requests::WritevRequest},
     iobuf::IoBuf,
 };
 use std::{io, pin::Pin, sync::Arc, task::Poll};
@@ -238,6 +235,12 @@ where
     Buf: IoBuf,
 {
     fn drop(&mut self) {
+        // Hot path: There is generally no point in cancelling the operation if it is
+        // already completed or has not been submitted yet, executing the cancellation
+        // function costs more time.
+        if self.completion_state.is_none() {
+            return;
+        }
         runtime::execute_future_from_sync(self._cancel());
     }
 }

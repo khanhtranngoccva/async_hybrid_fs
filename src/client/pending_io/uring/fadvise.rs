@@ -188,6 +188,12 @@ where
     Target: UringTarget + Sync + ?Sized,
 {
     fn drop(&mut self) {
+        // Hot path: There is generally no point in cancelling the operation if it is
+        // already completed or has not been submitted yet, executing the cancellation
+        // function costs more time.
+        if self.completion_state.is_none() {
+            return;
+        }
         runtime::execute_future_from_sync(self._cancel());
     }
 }

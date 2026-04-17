@@ -4,7 +4,10 @@ use nix::fcntl::OFlag;
 use std::cmp;
 use std::io::Read;
 use std::path::Path;
-use tokio::{fs::File, runtime::Runtime};
+use tokio::{
+    fs::File,
+    runtime::{self, Runtime},
+};
 
 async fn read_hybrid(client: &Client, path: impl AsRef<Path>, size: usize) {
     let fd = client
@@ -41,12 +44,47 @@ async fn read_tokio(path: impl AsRef<Path>, size: usize) {
 }
 
 async fn read_hybrid_batched(client: &Client, path: impl AsRef<Path>, size: usize, count: usize) {
-    let mut futures = Vec::new();
-    for _ in 0..count {
-        let future = read_hybrid(client, path.as_ref(), size);
-        futures.push(future);
+    let mut current_count = count;
+    let batch_size = size;
+    // let batch_size = 16384 - 512usize;
+    while current_count > 0 {
+        let current_batch = current_count.min(batch_size);
+        let mut futures = Vec::new();
+        for _ in 0..current_batch {
+            let future = read_hybrid(client, path.as_ref(), size);
+            futures.push(future);
+        }
+        futures::future::join_all(futures).await;
+        current_count -= current_batch;
     }
-    futures::future::join_all(futures).await;
+}
+
+async fn read_hybrid_multi(clients: &[Client], path: impl AsRef<Path>, size: usize, count: usize) {
+    let even_thread_count = count / clients.len();
+    let extra_count = even_thread_count + 1;
+    let remainder = count % clients.len();
+    let (_, futures) = unsafe {
+        async_scoped::TokioScope::scope_and_collect(move |scope| {
+            for idx in 0..clients.len() {
+                let client = &clients[idx];
+                let path_owned = path.as_ref().to_owned();
+                scope.spawn(read_hybrid_batched(
+                    client,
+                    path_owned,
+                    size,
+                    if idx < remainder {
+                        extra_count
+                    } else {
+                        even_thread_count
+                    },
+                ));
+            }
+        })
+    }
+    .await;
+    for future in futures {
+        future.expect("future failed to join");
+    }
 }
 
 async fn read_tokio_batched(path: impl AsRef<Path>, size: usize, count: usize) {
@@ -157,11 +195,44 @@ fn read_dev_urandom_batched_benchmark(c: &mut Criterion) {
     });
 }
 
+fn read_dev_zero_with_contention_benchmark(c: &mut Criterion) {
+    let client = Client::build(UringCfg::default()).expect("failed to build client");
+    c.bench_function("read::dev_zero::with_contention::hybrid", |b| {
+        b.to_async(Runtime::new().unwrap()).iter_batched(
+            || {},
+            // This should lead to queue overflowing
+            |_| read_hybrid_batched(&client, "/dev/zero", 1024, 100000),
+            // Avoid file descriptor exhaustion
+            criterion::BatchSize::NumIterations(1),
+        )
+    });
+    let multiclients = (0..12)
+        .map(|_| Client::build(UringCfg::default()).expect("failed to build client"))
+        .collect::<Vec<_>>();
+    c.bench_function("read::dev_zero::with_contention::hybrid::multi", |b| {
+        b.to_async(
+            runtime::Builder::new_multi_thread()
+                .enable_all()
+                .worker_threads(multiclients.len())
+                .build()
+                .unwrap(),
+        )
+        .iter_batched(
+            || {},
+            // This should lead to queue overflowing
+            |_| read_hybrid_multi(&multiclients, "/dev/zero", 1024, 100000),
+            // Avoid file descriptor exhaustion
+            criterion::BatchSize::NumIterations(1),
+        )
+    });
+}
+
 criterion_group!(
     benches,
     read_dev_zero_benchmark,
     read_dev_urandom_benchmark,
     read_dev_zero_batched_benchmark,
     read_dev_urandom_batched_benchmark,
+    read_dev_zero_with_contention_benchmark,
 );
 criterion_main!(benches);

@@ -1,6 +1,10 @@
 use tokio::runtime::{Builder, Handle, RuntimeFlavor};
 
-/// Attempts to execute a future on a temporary runtime (based on async_scoped's TokioScope implementation).
+/// Attempts to execute a future on a temporary runtime (based on async_scoped's TokioScope implementation). This is generally used to facilitate drops of pending I/O operations.
+///
+/// # Note
+/// - On current-thread runtimes, this function blocks the runtime and any non-blocking tasks or futures driven by it. Make sure the future in question does not await anything that is driven by the runtime, or you will risk a deadlock.
+/// -
 pub(crate) fn execute_future_from_sync<F>(future: F) -> F::Output
 where
     F::Output: Send,
