@@ -75,6 +75,7 @@ where
 
 /// Cancellation-correct future for io_uring mode of [`Client::hard_link_at`].
 /// When the future is dropped, the operation is cancelled synchronously via an internal method.
+#[allow(unused)]
 pub struct UringLinkAt<'a, Target, NewDirTarget>
 where
     Target: UringTarget + Sync + ?Sized,

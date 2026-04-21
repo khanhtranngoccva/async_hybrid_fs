@@ -98,6 +98,7 @@ where
 
 /// Cancellation-correct future for io_uring mode of [`Client::read_into_vectored`] and [`Client::read_into_vectored_at`].
 /// When the future is dropped, the operation is cancelled synchronously via an internal method.
+#[allow(unused)]
 pub struct UringReadIntoVectoredAt<'a, Target, Buf>
 where
     Target: UringTarget + Sync + ?Sized,

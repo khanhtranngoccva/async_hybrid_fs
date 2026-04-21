@@ -86,6 +86,7 @@ where
 
 /// Cancellation-correct pending I/O object for io_uring mode of [`Client::write_from`] and [`Client::write_from_at`].
 /// When the object is dropped, the operation is cancelled synchronously via an internal method.
+#[allow(unused)]
 pub struct UringWriteFromAt<'a, Target, Buf>
 where
     Target: UringTarget + Sync + ?Sized,

@@ -74,6 +74,7 @@ impl SubmissionTicketQueue {
         }
     }
 
+    #[allow(unused)]
     pub(crate) fn capacity(&self) -> usize {
         self.capacity
     }

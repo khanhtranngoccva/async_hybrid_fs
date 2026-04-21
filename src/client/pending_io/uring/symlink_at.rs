@@ -70,6 +70,7 @@ where
 
 /// Cancellation-correct future for io_uring mode of [`Client::symlink_at`].
 /// When the future is dropped, the operation is cancelled synchronously via an internal method.
+#[allow(unused)]
 pub struct UringSymlinkAt<'a, DirTarget>
 where
     DirTarget: UringTarget + Sync + ?Sized,

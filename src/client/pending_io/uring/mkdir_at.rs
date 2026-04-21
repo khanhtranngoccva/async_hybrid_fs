@@ -69,6 +69,7 @@ where
 
 /// Cancellation-correct future for io_uring mode of [`Client::mkdir_at`].
 /// When the future is dropped, the operation is cancelled synchronously via an internal method.
+#[allow(unused)]
 pub struct UringMkdirAt<'a, DirTarget>
 where
     DirTarget: UringTarget + Sync + ?Sized,

@@ -21,7 +21,7 @@ use std::{
     io,
     pin::Pin,
     sync::Arc,
-    task::{Poll, Wake, Waker},
+    task::{Poll, Waker},
 };
 
 use io_uring::squeue;

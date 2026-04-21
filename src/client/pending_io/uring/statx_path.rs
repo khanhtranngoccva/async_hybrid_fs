@@ -74,6 +74,7 @@ where
 
 /// Cancellation-correct future for io_uring mode of [`Client::metadata_path`] and [`Client::statx_at`].
 /// When the future is dropped, the operation is cancelled synchronously via an internal method.
+#[allow(unused)]
 pub struct UringStatxPath<'a, Target>
 where
     Target: UringTarget + Sync + ?Sized,

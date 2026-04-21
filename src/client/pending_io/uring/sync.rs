@@ -67,6 +67,7 @@ where
 
 /// Cancellation-correct future for io_uring mode of [`Client::sync_all`] and [`Client::sync_data`].
 /// When the future is dropped, the operation is cancelled synchronously via an internal method.
+#[allow(unused)]
 pub struct UringSync<'a, Target>
 where
     Target: UringTarget + Sync + ?Sized,
