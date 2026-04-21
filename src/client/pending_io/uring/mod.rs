@@ -21,7 +21,7 @@ use std::{
     io,
     pin::Pin,
     sync::Arc,
-    task::{Poll, Waker},
+    task::{Poll, Wake, Waker},
 };
 
 use io_uring::squeue;
@@ -127,9 +127,11 @@ impl UringPendingIoFiller {
     pub(crate) fn fill(self, result: io::Result<i32>) {
         let mut state = self.state.lock();
         state.status = UringPendingIoStatus::Done;
-        state.submission_ticket.take();
+        // Do not remove the ticket here to avoid blocking the reaper thread.
+        // state.submission_ticket.take();
         state.result = Some(result);
-        state.waker.wake_by_ref();
+        let waker = core::mem::replace(&mut state.waker, Waker::noop().clone());
+        waker.wake();
         self.done_cv.notify_all();
     }
 }
@@ -186,11 +188,8 @@ impl<'lifetime> Future for UringPendingIoObj<'lifetime> {
                 Poll::Pending
             }
             UringPendingIoStatus::Done => {
-                // The operation is done, return the result.
-                assert!(
-                    state.submission_ticket.is_none(),
-                    "submission ticket should not remain in the slot after the operation is done"
-                );
+                // The operation is done, remove the ticket and return the result.
+                state.submission_ticket.take();
                 Poll::Ready(
                     state.result.take().expect(
                         "result should be Some - future should not be polled multiple times",
@@ -289,6 +288,7 @@ impl<'lifetime> UringPendingIoObj<'lifetime> {
                     self.done_cv.wait(&mut state);
                 }
                 UringPendingIoStatus::Done => {
+                    state.submission_ticket.take();
                     return state.result.take();
                 }
             }
@@ -308,6 +308,9 @@ impl<'lifetime> UringPendingIoObj<'lifetime> {
             }
             UringPendingIoStatus::Submitted => {}
             UringPendingIoStatus::Done => {
+                // Must remove the submission ticket here because the operation may be polled midway,
+                // marked as done, and then reach this point with a ticket.
+                state.submission_ticket.take();
                 return CancelResult::WaitDone(state.result.take());
             }
         };
