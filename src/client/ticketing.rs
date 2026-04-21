@@ -8,6 +8,10 @@ use std::{
 #[repr(transparent)]
 pub(crate) struct SubmissionTicketId(pub(crate) u64);
 
+impl SubmissionTicketId {
+    pub(crate) const POISON: Self = Self(u64::MAX);
+}
+
 /// A submission ticket represents a permit to submit an operation to the io_uring submission queue, acting as a backpressure mechanism to prevent having to block using `io_uring_enter`.
 /// The ticket must be held for the duration of the operation, as when it is dropped, the ticket is returned to the submission queue. Since it is used as the user_data field for cancelling, it must not be given to outside code until the kernel has acknowledged the operation.
 #[derive(Debug)]
@@ -25,6 +29,9 @@ impl SubmissionTicket {
 
 impl Drop for SubmissionTicket {
     fn drop(&mut self) {
+        if self.id == SubmissionTicketId::POISON {
+            return;
+        }
         let mut tickets = self.state.lock().unwrap();
         tickets.ids.push(self.id.clone());
         tickets.wake_all();
@@ -82,6 +89,10 @@ impl SubmissionTicketQueue {
     /// and the total number of tickets across all ticket queues must not exceed the length of the io_uring submission queue.
     /// Panics if the total number of tickets exceeds numeric bounds.
     pub(crate) fn new_multiple(sizes: &[usize]) -> Vec<Self> {
+        let total_size = sizes.iter().map(|s| *s as u64).sum::<u64>();
+        if total_size > SubmissionTicketId::POISON.0 - 1 as u64 {
+            panic!("total size of submission ticket queues exceeds numeric bounds");
+        }
         let mut starting_id = 0u64;
         let mut queues = Vec::with_capacity(sizes.len());
         for size in sizes {
@@ -121,6 +132,15 @@ impl SubmissionTicketQueue {
             state: self.state.clone(),
             condvar: self.condvar.clone(),
         })
+    }
+
+    /// Create a poison ticket that terminates the reaper thread immediately. This can only be called if there are no pending operations left.
+    pub(crate) fn create_poison(&self) -> SubmissionTicket {
+        SubmissionTicket {
+            id: SubmissionTicketId::POISON,
+            state: self.state.clone(),
+            condvar: self.condvar.clone(),
+        }
     }
 }
 

@@ -48,8 +48,10 @@ async fn test_hybrid_create_and_read_write() {
 }
 
 #[tokio::test]
+#[test_log::test]
 async fn test_hybrid_seek() {
     let temp_dir = tempfile::TempDir::new().unwrap();
+    log::info!("created temp dir");
     let mut file = OpenOptions::new()
         .write(true)
         .create(true)
@@ -58,12 +60,14 @@ async fn test_hybrid_seek() {
         .expect("no completion future returned")
         .await
         .unwrap();
+    log::info!("opened file");
     file.hybrid_write_all(b"Hello, world!").await.unwrap();
     file.hybrid_flush()
         .completion()
         .expect("no completion future returned")
         .await
         .unwrap();
+    log::info!("flushed");
 
     let mut file = OpenOptions::new()
         .read(true)
@@ -80,6 +84,7 @@ async fn test_hybrid_seek() {
     let mut buffer = Vec::new();
     file.hybrid_read_to_end(&mut buffer).await.unwrap();
     assert_eq!(buffer, b"world!");
+    log::info!("exiting");
 }
 
 #[tokio::test]

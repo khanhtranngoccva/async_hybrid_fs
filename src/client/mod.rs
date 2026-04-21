@@ -21,7 +21,7 @@ pub use register::RegisterError;
 pub use register::RegisteredFile;
 pub use requests::Target;
 
-use crate::client::pending_io::uring::UringPendingIoFiller;
+use crate::client::pending_io::uring::{UringPendingIoFiller, UringPendingIoObj};
 use crate::client::ticketing::{
     CompletionTicketQueue, CompletionTicketSubmitter, SubmissionTicketId,
 };
@@ -58,7 +58,7 @@ impl Drop for Client {
         let uring = self.uring.take();
         if let Some(uring) = uring {
             // Drop the completion ticket submitter to stop the completion thread.
-            drop(uring.completion_ticket_submitter);
+            let _ = UringPendingIoObj::new_poison(&uring).wait();
             drop(uring.uring);
             uring.cthread.join().expect("uring_cthread join failed");
         }
@@ -176,6 +176,7 @@ impl Client {
             if let Some(sqpoll) = cfg.sqpoll {
                 builder.setup_sqpoll(sqpoll);
             };
+            builder.setup_clamp();
             match builder.build(expected_total_squeue_size) {
                 Ok(uring) => Some(uring),
                 Err(_) if cfg.allow_fallback => None,
@@ -195,7 +196,9 @@ impl Client {
         if let Some(mut ring) = ring {
             // Pre-allocate sparse file table for registration (Linux 5.12+). If this fails, file registration won't work but unregistered fds will still function.
             let _ = ring.submitter().register_files_sparse(MAX_REGISTERED_FILES);
-            let actual_total_squeue_size = ring.submission().capacity();
+            // u64::MAX is the poison ticket ID, set to usize::MAX to be compatible with 32-bit - we do not want the queue size to hit u64::MAX.
+            let actual_total_squeue_size =
+                ring.submission().capacity().min(usize::MAX as usize - 1);
             // Investigate the submission queue size.
             let (op_ticket_queue_size, cancel_ticket_queue_size) = if actual_total_squeue_size
                 >= expected_total_squeue_size as usize
@@ -207,11 +210,6 @@ impl Client {
                 )
             } else {
                 // We need to adjust the ticket queue sizes to fit the submission queue size using a ratio.
-                log::debug!(
-                    "actual_total_squeue_size: {}, expected_total_squeue_size: {}",
-                    actual_total_squeue_size,
-                    expected_total_squeue_size
-                );
                 let cancel_queue_size = actual_total_squeue_size
                     .saturating_mul(cfg.cancel_queue_size as usize)
                     .saturating_div(expected_total_squeue_size as usize);
@@ -276,39 +274,21 @@ fn completion_thread(
     queue: CompletionTicketQueue,
 ) {
     let mut completion = unsafe { ring.completion_shared() };
-    // This flag marks that the submission thread has terminated and we should drain all remaining operations in the pending map until it is empty.
-    let mut submission_thread_terminated = false;
     loop {
-        if submission_thread_terminated && pending.is_empty() {
+        let Some(entry) = completion.next() else {
+            ring.submitter()
+                .submit_and_wait(1)
+                .expect("failed to wait for completion");
+            completion.sync();
+            continue;
+        };
+        let id = SubmissionTicketId(entry.user_data());
+        let (_, req) = pending
+            .remove(&id)
+            .expect("completion for unknown request id");
+        completion::handle_completion(req, entry.result());
+        if id == SubmissionTicketId::POISON {
             break;
-        }
-        let mut wait_permits = 1usize;
-        if !submission_thread_terminated {
-            match queue.request_completion_tickets() {
-                Some(count) => wait_permits = count,
-                None => {
-                    submission_thread_terminated = true;
-                    continue;
-                }
-            }
-        }
-        for _ in 0..wait_permits {
-            // Blocking and looping with io_uring_enter is OK now, since the submission thread permits a wait.
-            let e = loop {
-                let Some(entry) = completion.next() else {
-                    ring.submitter()
-                        .submit_and_wait(1)
-                        .expect("failed to wait for completion");
-                    completion.sync();
-                    continue;
-                };
-                break entry;
-            };
-            let id = SubmissionTicketId(e.user_data());
-            let (_, req) = pending
-                .remove(&id)
-                .expect("completion for unknown request id");
-            completion::handle_completion(req, e.result());
         }
     }
 }

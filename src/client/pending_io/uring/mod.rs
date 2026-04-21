@@ -115,6 +115,24 @@ impl<'lifetime> UringPendingIoObj<'lifetime> {
             ticket_queue,
         }
     }
+
+    pub(crate) fn new_poison(uring: &'lifetime ClientUring) -> Self {
+        let mut state = UringPendingIoState::new(
+            io_uring::opcode::Nop::new()
+                .build()
+                .flags(squeue::Flags::IO_DRAIN),
+        );
+        // Override the submission ticket to be the poison ticket.
+        state.submission_ticket = Some(Arc::new(
+            uring.normal_submission_ticket_queue.create_poison(),
+        ));
+        Self {
+            state: Arc::new(Mutex::new(state)),
+            done_cv: Arc::new(Condvar::new()),
+            uring,
+            ticket_queue: &uring.normal_submission_ticket_queue,
+        }
+    }
 }
 
 /// Filler to be sent to the reaper thread for updating the state of the operation.
@@ -154,20 +172,21 @@ impl<'lifetime> Future for UringPendingIoObj<'lifetime> {
         let mut state = inner.state.lock();
         match state.status {
             UringPendingIoStatus::NotSubmitted => {
-                assert!(
-                    state.submission_ticket.is_none(),
-                    "submission ticket should not be assigned yet"
-                );
-                // Attempt to assign a ticket to the operation in a nonblocking manner.
-                let ticket = inner.ticket_queue.poll_submission_ticket(cx);
-                let ticket_id = match ticket {
-                    Poll::Ready(ticket) => {
-                        let ticket_id = ticket.id();
-                        state.submission_ticket = Some(Arc::new(ticket));
-                        ticket_id
-                    }
-                    Poll::Pending => {
-                        return Poll::Pending;
+                let ticket_id = match &state.submission_ticket {
+                    Some(ticket) => ticket.id(),
+                    None => {
+                        // Attempt to assign a ticket to the operation in a nonblocking manner.
+                        let ticket = inner.ticket_queue.poll_submission_ticket(cx);
+                        match ticket {
+                            Poll::Ready(ticket) => {
+                                let ticket_id = ticket.id();
+                                state.submission_ticket = Some(Arc::new(ticket));
+                                ticket_id
+                            }
+                            Poll::Pending => {
+                                return Poll::Pending;
+                            }
+                        }
                     }
                 };
                 state.waker.clone_from(&cx.waker());
@@ -228,10 +247,15 @@ fn submit_operation(
         unsafe { submission.push(&state.entry) }.expect("submission queue should always have enough space for the number of requests indicated by ticket count");
         submission.sync();
     });
-    // This allows the reaper thread to proceed and avoid the blocking syscalls (which is harder to control).
     uring
-        .completion_ticket_submitter
-        .grant_completion_tickets(1);
+        .uring
+        .submit()
+        .expect("failed to flush operations to kernel");
+    // Removed this call and use the poison pill approach instead
+    // // This allows the reaper thread to proceed and avoid the blocking syscalls (which is harder to control).
+    // uring
+    //     .completion_ticket_submitter
+    //     .grant_completion_tickets(1);
 }
 
 /// Cancel a pending operation using the borrowed submission ticket.
@@ -271,18 +295,21 @@ impl<'lifetime> UringPendingIoObj<'lifetime> {
         loop {
             match state.status {
                 UringPendingIoStatus::NotSubmitted => {
-                    assert!(
-                        state.submission_ticket.is_none(),
-                        "submission ticket should not be assigned yet"
-                    );
-                    // Blocking call here is OK - the reaper thread cannot see the operation yet.
-                    let ticket = self.ticket_queue.request_submission_ticket();
+                    let ticket_id = match &state.submission_ticket {
+                        Some(ticket) => ticket.id(),
+                        None => {
+                            let ticket = self.ticket_queue.request_submission_ticket();
+                            let ticket_id = ticket.id();
+                            state.submission_ticket = Some(Arc::new(ticket));
+                            ticket_id
+                        }
+                    };
                     submit_operation(
                         self.uring,
                         &mut state,
                         self.state.clone(),
                         self.done_cv.clone(),
-                        ticket.id(),
+                        ticket_id,
                     );
                 }
                 UringPendingIoStatus::Submitted => {
