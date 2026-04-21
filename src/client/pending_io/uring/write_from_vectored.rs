@@ -1,24 +1,14 @@
-use super::UringPendingIo;
-use super::{PendingIoImpl, macros};
+use super::{PendingIoImpl, UringPendingIoObj};
 use crate::client::requests::IovecArray;
-use crate::runtime;
-use crate::{
-    ClientUring, UringTarget,
-    client::ticketing::SubmissionTicketId,
-    client::{command::Command, completion::WritevResult, requests::WritevRequest},
-    iobuf::IoBuf,
-};
+use crate::{ClientUring, UringTarget, client::completion::WritevResult, iobuf::IoBuf};
 use std::{io, pin::Pin, sync::Arc, task::Poll};
-use tokio::sync::oneshot as oneshot_async;
 
-struct CompletionState<Buf>
+struct CompletionState<'a, Buf>
 where
     Buf: IoBuf,
 {
-    /// Holder for the buffer, ensuring that the raw pointer is valid.
+    raw: UringPendingIoObj<'a>,
     bufs: Vec<Buf>,
-    /// Channel for receiving operation results. If the operation is done, the channel will no longer exist and the cancellation is ignored.
-    result_rx: oneshot_async::Receiver<io::Result<u32>>,
 }
 
 struct Completion<'req, 'a, Target, Buf>
@@ -26,7 +16,7 @@ where
     Target: UringTarget + Sync + ?Sized,
     Buf: IoBuf,
 {
-    state: Option<CompletionState<Buf>>,
+    state: Option<CompletionState<'a, Buf>>,
     request: &'req mut UringWriteFromVectoredAt<'a, Target, Buf>,
 }
 
@@ -37,7 +27,7 @@ where
 {
     pub(crate) fn new(
         request: &'req mut UringWriteFromVectoredAt<'a, Target, Buf>,
-        state: CompletionState<Buf>,
+        state: CompletionState<'a, Buf>,
     ) -> Self {
         Self {
             state: Some(state),
@@ -59,15 +49,11 @@ where
     ) -> std::task::Poll<Self::Output> {
         let inner = self.get_mut();
         let mut state = inner.state.take().expect("state must be Some");
-        match Pin::new(&mut state.result_rx).poll(cx) {
-            Poll::Ready(Ok(Ok(bytes_written))) => Poll::Ready({
-                Ok(WritevResult {
-                    bufs: state.bufs,
-                    bytes_written: bytes_written as usize,
-                })
-            }),
-            Poll::Ready(Ok(Err(e))) => Poll::Ready(Err(e)),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::other(e))),
+        match Pin::new(&mut state.raw).poll(cx) {
+            Poll::Ready(res) => Poll::Ready(res.map(|bytes_written| WritevResult {
+                bufs: state.bufs,
+                bytes_written: bytes_written as usize,
+            })),
             Poll::Pending => {
                 inner.state = Some(state);
                 Poll::Pending
@@ -100,6 +86,8 @@ where
     Target: UringTarget + Sync + ?Sized,
     Buf: IoBuf,
 {
+    /// Completion state for the operation.
+    completion_state: Option<CompletionState<'a, Buf>>,
     /// Target to write to.
     target: &'a Target,
     /// Identity of the io_uring instance.
@@ -107,54 +95,8 @@ where
     /// Holder for the iovec array.
     // Array is pinned because the command object requires a pointer to iovec.
     iovec_array: Pin<IovecArray>,
-    /// Completion state, containing the buffer and the result channel.
-    completion_state: Option<CompletionState<Buf>>,
     /// Offset to write to.
     offset: u64,
-    /// Channel for sending operation IDs.
-    ack_tx: Option<oneshot::Sender<SubmissionTicketId>>,
-    /// Channel for receiving confirmation that the operation has been submitted. The ID must be received before the operation could be cancelled; otherwise, the future might drop before the operation even starts, leading to an operation with dangling pointers. We do not need the ID for any other purpose.
-    ack_rx: Option<oneshot::AsyncReceiver<SubmissionTicketId>>,
-    /// Channel for sending operation results.
-    result_tx: Option<oneshot_async::Sender<io::Result<u32>>>,
-    /// Client to use for submitting the operation and cancelling it.
-    client: &'a ClientUring,
-    /// Cancellation ID.
-    cancellation: Option<SubmissionTicketId>,
-    /// Whether cancellation is acknowledged.
-    // The reason for an extra field is that the cancel_uring method may not be called twice.
-    cancel_done: bool,
-}
-
-impl<'a, Target, Buf> UringPendingIo<Result<WritevResult<Buf>, io::Error>>
-    for UringWriteFromVectoredAt<'a, Target, Buf>
-where
-    Target: UringTarget + Sync + ?Sized,
-    Buf: IoBuf,
-{
-    unsafe fn build_command(&mut self) -> Command {
-        Command::Writev {
-            req: WritevRequest {
-                target: unsafe { self.target.as_target(self.identity) },
-                io_slices: self.iovec_array.as_ptr(),
-                io_slices_len: self
-                    .iovec_array
-                    .len()
-                    .try_into()
-                    .expect("len exceeds u32::MAX"),
-                offset: self.offset,
-            },
-            ack: Some(
-                self.ack_tx
-                    .take()
-                    .expect("build_command may only be run once per pending operation"),
-            ),
-            res: self
-                .result_tx
-                .take()
-                .expect("build_command may only be run once per pending operation"),
-        }
-    }
 }
 
 impl<'a, Target, Buf> UringWriteFromVectoredAt<'a, Target, Buf>
@@ -168,35 +110,34 @@ where
         mut bufs: Vec<Buf>,
         offset: u64,
     ) -> Self {
-        let (ack_tx, ack_rx) = oneshot::async_channel();
-        let (result_tx, result_rx) = oneshot_async::channel();
-        let mut op = Self {
+        let iov = Pin::new(IovecArray(
+            // Need to pin the iovec array because the command object requires a pointer.
+            bufs.iter_mut()
+                .map(|buf| libc::iovec {
+                    iov_base: buf.as_ptr() as *mut libc::c_void,
+                    iov_len: buf.len().into(),
+                })
+                .collect::<Vec<_>>(),
+        ));
+        let iov_ptr = iov.as_ptr();
+        let iov_len = iov.len().try_into().unwrap_or(u32::MAX);
+        Self {
             target,
             identity: &uring.identity,
-            iovec_array: Pin::new(IovecArray(
-                // Need to pin the iovec array because the command object requires a pointer.
-                bufs.iter_mut()
-                    .map(|buf| libc::iovec {
-                        iov_base: buf.as_ptr() as *mut libc::c_void,
-                        iov_len: buf.len().into(),
-                    })
-                    .collect::<Vec<_>>(),
-            )),
+            iovec_array: iov,
             completion_state: Some(CompletionState {
                 bufs,
-                result_rx: result_rx,
+                raw: UringPendingIoObj::new(
+                    uring,
+                    super::build_op!(unsafe { target.as_target(&uring.identity) }, |fd| {
+                        io_uring::opcode::Writev::new(fd, iov_ptr, iov_len)
+                            .offset(offset)
+                            .build()
+                    }),
+                ),
             }),
             offset,
-            ack_rx: Some(ack_rx),
-            ack_tx: Some(ack_tx),
-            result_tx: Some(result_tx),
-            client: uring,
-            cancellation: None,
-            cancel_done: false,
-        };
-        let command = unsafe { op.build_command() };
-        uring.send(command);
-        op
+        }
     }
 }
 
@@ -217,8 +158,42 @@ where
         }
     }
 
-    async fn _cancel(&mut self) -> Option<Result<WritevResult<Buf>, io::Error>> {
-        macros::uring_cancel_impl!(self)
+    async fn _cancel_async(&mut self) -> Option<Result<WritevResult<Buf>, io::Error>> {
+        match self.completion_state.as_mut() {
+            Some(state) => {
+                let res = state.raw.cancel_async().await.map(|r| {
+                    r.map(|bytes_written| {
+                        let state = self.completion_state.take().expect("state must be Some");
+                        WritevResult {
+                            bufs: state.bufs,
+                            bytes_written: bytes_written as usize,
+                        }
+                    })
+                });
+                self.completion_state = None;
+                res
+            }
+            None => None,
+        }
+    }
+
+    fn _cancel(&mut self) -> Option<Result<WritevResult<Buf>, io::Error>> {
+        match self.completion_state.as_mut() {
+            Some(state) => {
+                let res = state.raw.cancel().map(|r| {
+                    r.map(|bytes_written| {
+                        let state = self.completion_state.take().expect("state must be Some");
+                        WritevResult {
+                            bufs: state.bufs,
+                            bytes_written: bytes_written as usize,
+                        }
+                    })
+                });
+                self.completion_state = None;
+                res
+            }
+            None => None,
+        }
     }
 }
 
@@ -235,12 +210,6 @@ where
     Buf: IoBuf,
 {
     fn drop(&mut self) {
-        // Hot path: There is generally no point in cancelling the operation if it is
-        // already completed or has not been submitted yet, executing the cancellation
-        // function costs more time.
-        if self.completion_state.is_none() {
-            return;
-        }
-        runtime::execute_future_from_sync(self._cancel());
+        let _ = self._cancel();
     }
 }

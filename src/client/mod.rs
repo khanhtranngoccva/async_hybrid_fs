@@ -1,4 +1,3 @@
-mod command;
 mod completion;
 mod operations;
 pub(crate) mod pending_io;
@@ -6,7 +5,6 @@ mod register;
 mod requests;
 pub(crate) mod ticketing;
 
-use std::collections::VecDeque;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::{Arc, Mutex};
@@ -15,15 +13,15 @@ use std::{io, thread};
 use ticketing::SubmissionTicketQueue;
 
 use dashmap::{DashMap, DashSet};
+use io_uring::IoUring;
 use io_uring::cqueue::Entry as CEntry;
 use io_uring::squeue::Entry as SEntry;
-use io_uring::{IoUring, SubmissionQueue};
 pub use register::OwnedRegisteredFile;
 pub use register::RegisterError;
 pub use register::RegisteredFile;
 pub use requests::Target;
 
-use crate::client::command::{Command, CommandWithTicket};
+use crate::client::pending_io::uring::UringPendingIoFiller;
 use crate::client::ticketing::{
     CompletionTicketQueue, CompletionTicketSubmitter, SubmissionTicketId,
 };
@@ -41,12 +39,13 @@ pub struct Client {
 }
 
 pub(crate) struct ClientUring {
-    normal_sender: crossbeam_channel::Sender<Command>,
-    cancel_sender: crossbeam_channel::Sender<Command>,
+    submission_lock: Mutex<()>,
+    normal_submission_ticket_queue: SubmissionTicketQueue,
+    cancel_submission_ticket_queue: SubmissionTicketQueue,
+    completion_ticket_submitter: Arc<CompletionTicketSubmitter>,
+    pending: Arc<DashMap<SubmissionTicketId, UringPendingIoFiller>>,
     uring: Arc<IoUring>,
     probe: io_uring::Probe,
-    normal_sthread: JoinHandle<()>,
-    cancel_sthread: JoinHandle<()>,
     cthread: JoinHandle<()>,
     registered_files: Arc<DashSet<u32>>,
     next_file_slot: Arc<AtomicU32>,
@@ -58,20 +57,9 @@ impl Drop for Client {
         // Remove the uring instance, then join the threads.
         let uring = self.uring.take();
         if let Some(uring) = uring {
-            // Drop the senders to prevent any more commands from being submitted.
-            drop(uring.normal_sender);
-            drop(uring.cancel_sender);
+            // Drop the completion ticket submitter to stop the completion thread.
+            drop(uring.completion_ticket_submitter);
             drop(uring.uring);
-            // Join the submission threads.
-            uring
-                .normal_sthread
-                .join()
-                .expect("uring_sthread join failed");
-            uring
-                .cancel_sthread
-                .join()
-                .expect("cancel_sthread join failed");
-            // The completion queue thread is only joinable after the submission thread exits.
             uring.cthread.join().expect("uring_cthread join failed");
         }
     }
@@ -200,7 +188,6 @@ impl Client {
                 None
             }
         };
-        let pending: Arc<DashMap<SubmissionTicketId, CommandWithTicket>> = Default::default();
         let mut client = Client {
             uring: None,
             uring_enabled: Arc::new(AtomicBool::new(true)),
@@ -249,68 +236,29 @@ impl Client {
                 op_ticket_queue_size,
                 cancel_ticket_queue_size,
             ]);
-            let submission_lock = Arc::new(Mutex::new(()));
+            let submission_lock = Mutex::new(());
             let cancel_submission_ticket_queue = ticket_queues.pop().unwrap();
             let normal_submission_ticket_queue = ticket_queues.pop().unwrap();
             let (completion_ticket_submitter, completion_ticket_queue) =
                 ticketing::completion_ticket_pair();
             let completion_ticket_submitter = Arc::new(completion_ticket_submitter);
-
+            let pending_map = Arc::new(DashMap::new());
             let ring = Arc::new(ring);
-            let (normal_sender, normal_receiver) = crossbeam_channel::unbounded();
-            let (cancel_sender, cancel_receiver) = crossbeam_channel::unbounded();
-            let normal_sthread = thread::Builder::new()
-                .name(String::from("async_hybrid_fs_rt_normal_sthread"))
-                .spawn({
-                    let pending = pending.clone();
-                    let ring = ring.clone();
-                    let submission_lock = submission_lock.clone();
-                    let completion_ticket_submitter = completion_ticket_submitter.clone();
-                    move || {
-                        submission_thread(
-                            ring,
-                            pending,
-                            normal_receiver,
-                            normal_submission_ticket_queue,
-                            submission_lock,
-                            completion_ticket_submitter,
-                        )
-                    }
-                })
-                .unwrap();
-            let cancel_sthread = thread::Builder::new()
-                .name(String::from("async_hybrid_fs_rt_cancel_sthread"))
-                .spawn({
-                    let pending = pending.clone();
-                    let ring = ring.clone();
-                    let submission_lock = submission_lock.clone();
-                    let completion_ticket_submitter = completion_ticket_submitter.clone();
-                    move || {
-                        submission_thread(
-                            ring,
-                            pending,
-                            cancel_receiver,
-                            cancel_submission_ticket_queue,
-                            submission_lock,
-                            completion_ticket_submitter,
-                        )
-                    }
-                })
-                .unwrap();
             let cthread = thread::spawn({
-                let pending = pending.clone();
+                let pending = pending_map.clone();
                 let ring = ring.clone();
                 move || completion_thread(ring, pending, completion_ticket_queue)
             });
             let mut probe = io_uring::Probe::new();
             ring.submitter().register_probe(&mut probe)?;
             client.uring = Some(ClientUring {
-                normal_sender,
-                cancel_sender,
+                normal_submission_ticket_queue: normal_submission_ticket_queue,
+                cancel_submission_ticket_queue: cancel_submission_ticket_queue,
+                submission_lock: submission_lock,
+                pending: pending_map,
+                completion_ticket_submitter: completion_ticket_submitter,
                 uring: ring,
                 probe: probe,
-                normal_sthread,
-                cancel_sthread,
                 cthread,
                 registered_files: Arc::new(DashSet::new()),
                 identity: Arc::new(()),
@@ -321,126 +269,10 @@ impl Client {
     }
 }
 
-fn with_submission_queue<'a, F, R>(uring: &'a IoUring, submission_lock: &'a Mutex<()>, f: F) -> R
-where
-    F: FnOnce(SubmissionQueue<'a>) -> R,
-{
-    let _submission_lock = submission_lock.lock().unwrap();
-    let submission = unsafe { uring.submission_shared() };
-    f(submission)
-}
-
-/// Thread for submitting events to the io_uring submission queue.
-fn submission_thread(
-    ring: Arc<IoUring>,
-    pending: Arc<DashMap<SubmissionTicketId, CommandWithTicket>>,
-    receiver: crossbeam_channel::Receiver<Command>,
-    ticket_queue: SubmissionTicketQueue,
-    submission_lock: Arc<Mutex<()>>,
-    completion_ticket_submitter: Arc<CompletionTicketSubmitter>,
-) {
-    let mut queue = VecDeque::new();
-    let ticket_queue_capacity = ticket_queue.capacity();
-    let mut batched_guards = Vec::with_capacity(ticket_queue_capacity);
-    let mut batched_requests = Vec::with_capacity(ticket_queue_capacity);
-    let mut batched_acks = Vec::with_capacity(ticket_queue_capacity);
-
-    // Structure that allows entry removal from the pending map during a panic unwind.
-    struct PendingEntryGuard {
-        pending: Arc<DashMap<SubmissionTicketId, CommandWithTicket>>,
-        id: SubmissionTicketId,
-        armed: bool,
-    }
-    impl PendingEntryGuard {
-        fn new(
-            pending: Arc<DashMap<SubmissionTicketId, CommandWithTicket>>,
-            id: SubmissionTicketId,
-        ) -> Self {
-            Self {
-                pending,
-                id,
-                armed: true,
-            }
-        }
-        fn disarm(&mut self) {
-            self.armed = false;
-        }
-    }
-    impl Drop for PendingEntryGuard {
-        fn drop(&mut self) {
-            if self.armed {
-                self.pending.remove(&self.id);
-            }
-        }
-    }
-
-    while let Ok(command) = receiver.recv() {
-        queue.push_back(command);
-        while let Ok(command) = receiver.try_recv() {
-            queue.push_back(command);
-        }
-
-        // Queue must be drained
-        while !queue.is_empty() {
-            let tickets = ticket_queue.request_submission_tickets(queue.len());
-            // Indicates how many tickets were granted, never greater than number of items in the deque nor greater than the io_uring submission queue capacity.
-            let ticket_count = tickets.len();
-
-            // How the io_uring submission queue works:
-            // - The buffer is shared between the kernel and userspace.
-            // - There are atomic head and tail indices that allow them to be shared mutably between kernel and userspace safely.
-            // - The Rust library we're using abstracts over this by caching the head and tail as local values. Once we've made our inserts, we update the atomic tail and then tell the kernel to consume some of the queue. When we update the atomic tail, we also check the atomic head and update our local cached value; some entries may have been consumed by the kernel in some other thread since we last checked and we may actually have more free space than we thought.
-            for ticket in tickets {
-                let command = queue.pop_front().unwrap();
-                let mut command_with_ticket = CommandWithTicket {
-                    submission_ticket: ticket,
-                    command,
-                };
-                let io_uring_entry = command::build_io_uring_entry(&command_with_ticket);
-                let ack = command::take_command_ack(&mut command_with_ticket.command);
-                let id = command_with_ticket.submission_ticket.id();
-                let insertion_res = pending.insert(id, command_with_ticket);
-                assert!(
-                    insertion_res.is_none(),
-                    "command with id {} already exists in pending map",
-                    id.0
-                );
-                let guard = PendingEntryGuard::new(pending.clone(), id);
-                batched_guards.push(guard);
-                batched_requests.push(io_uring_entry);
-                batched_acks.push((ack, id));
-            }
-
-            // Lock on the submission queue for as little time as possible.
-            // SAFETY: The submission entry references memory owned by the caller's future, which is awaiting completion.
-            with_submission_queue(&ring, &submission_lock, |mut submission| {
-                for entry in batched_requests.drain(..) {
-                    unsafe {submission.push(&entry)}.expect("submission queue should always have enough space for the number of requests indicated by ticket count");
-                }
-                submission.sync();
-            });
-            // This is still necessary even with sqpoll, as our kernel thread may have gone to sleep.
-            ring.submit().unwrap();
-            // Disarm the pending entry guards because the submission is successful.
-            for mut guard in batched_guards.drain(..) {
-                guard.disarm();
-            }
-            // Send the operation IDs to the pending I/O objects to allow them to be cancelled.
-            for (ack, id) in batched_acks.drain(..) {
-                if let Some(ack) = ack {
-                    let _ = ack.send(id);
-                }
-            }
-            // Send wait permits to the completion thread to indicate that it can now perform a blocking read of the next completion entry.
-            completion_ticket_submitter.grant_completion_tickets(ticket_count);
-        }
-    }
-}
-
 /// Thread for handling completions from the io_uring completion queue.
 fn completion_thread(
     ring: Arc<IoUring>,
-    pending: Arc<DashMap<SubmissionTicketId, CommandWithTicket>>,
+    pending: Arc<DashMap<SubmissionTicketId, UringPendingIoFiller>>,
     queue: CompletionTicketQueue,
 ) {
     let mut completion = unsafe { ring.completion_shared() };

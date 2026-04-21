@@ -112,8 +112,16 @@ where
         }
     }
 
-    async fn _cancel(&mut self) -> Option<T> {
+    async fn _cancel_async(&mut self) -> Option<T> {
         Some(self._completion()?.await)
+    }
+
+    fn _cancel(&mut self) -> Option<T> {
+        if self.task.is_some() {
+            runtime::execute_future_from_sync(self._cancel_async())
+        } else {
+            None
+        }
     }
 }
 
@@ -124,12 +132,7 @@ where
     T: Send,
 {
     fn drop(&mut self) {
-        // Hot path: There is generally no point in waiting for the operation if it is
-        // already completed or has not been submitted yet, executing the future costs more time.
-        if self.task.is_none() {
-            return;
-        }
-        runtime::execute_future_from_sync(self._cancel());
+        let _ = self._cancel();
     }
 }
 

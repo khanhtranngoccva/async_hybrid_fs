@@ -1,17 +1,10 @@
-use super::{UringPendingIo, macros};
-use crate::client::ticketing::SubmissionTicketId;
-use crate::runtime;
-use crate::{
-    ClientUring, UringTarget,
-    client::{command::Command, pending_io::PendingIoImpl, requests::FallocateRequest},
-};
+use crate::client::pending_io::uring::UringPendingIoObj;
+use crate::{ClientUring, UringTarget, client::pending_io::PendingIoImpl};
 use nix::fcntl::FallocateFlags;
 use std::{io, pin::Pin, sync::Arc, task::Poll};
-use tokio::sync::oneshot as oneshot_async;
 
-struct CompletionState {
-    /// Channel for receiving operation results. If the operation is done, the channel will no longer exist and the cancellation is ignored.
-    result_rx: oneshot_async::Receiver<io::Result<()>>,
+struct CompletionState<'a> {
+    raw: UringPendingIoObj<'a>,
 }
 
 struct Completion<'req, 'a, Target>
@@ -19,7 +12,7 @@ where
     Target: UringTarget + Sync + ?Sized,
 {
     request: &'req mut UringFallocate<'a, Target>,
-    state: Option<CompletionState>,
+    inner: Option<CompletionState<'a>>,
 }
 
 impl<'req, 'a, Target> Completion<'req, 'a, Target>
@@ -28,11 +21,11 @@ where
 {
     pub(crate) fn new(
         request: &'req mut UringFallocate<'a, Target>,
-        state: CompletionState,
+        state: CompletionState<'a>,
     ) -> Self {
         Self {
             request,
-            state: Some(state),
+            inner: Some(state),
         }
     }
 }
@@ -48,13 +41,11 @@ where
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         let inner = self.get_mut();
-        let mut state = inner.state.take().expect("state must be Some");
-        match Pin::new(&mut state.result_rx).poll(cx) {
-            Poll::Ready(Ok(Ok(_))) => Poll::Ready(Ok(())),
-            Poll::Ready(Ok(Err(e))) => Poll::Ready(Err(e)),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::other(e))),
+        let mut state = inner.inner.take().expect("state must be Some");
+        match Pin::new(&mut state.raw).poll(cx) {
+            Poll::Ready(res) => Poll::Ready(res.map(|_| ())),
             Poll::Pending => {
-                inner.state = Some(state);
+                inner.inner = Some(state);
                 Poll::Pending
             }
         }
@@ -71,7 +62,7 @@ where
     Target: UringTarget + Sync + ?Sized,
 {
     fn drop(&mut self) {
-        self.request.completion_state = self.state.take();
+        self.request.completion_state = self.inner.take();
     }
 }
 
@@ -81,6 +72,8 @@ pub struct UringFallocate<'a, Target>
 where
     Target: UringTarget + Sync + ?Sized,
 {
+    /// Completion state.
+    completion_state: Option<CompletionState<'a>>,
     /// Target to fallocate.
     target: &'a Target,
     /// Identity of the io_uring instance.
@@ -91,46 +84,6 @@ where
     len: u64,
     /// Mode of the operation.
     mode: FallocateFlags,
-    /// Channel for sending operation IDs.
-    ack_tx: Option<oneshot::Sender<SubmissionTicketId>>,
-    /// Channel for receiving confirmation that the operation has been submitted. The ID must be received before the operation could be cancelled; otherwise, the future might drop before the operation even starts, leading to an operation with dangling pointers. We do not need the ID for any other purpose.
-    ack_rx: Option<oneshot::AsyncReceiver<SubmissionTicketId>>,
-    /// Channel for sending operation results.
-    result_tx: Option<oneshot_async::Sender<io::Result<()>>>,
-    /// Completion state.
-    completion_state: Option<CompletionState>,
-    /// Client to use for submitting the operation and cancelling it.
-    client: &'a ClientUring,
-    /// Cancellation ID.
-    cancellation: Option<SubmissionTicketId>,
-    /// Whether cancellation is acknowledged.
-    // The reason for an extra field is that the cancel_uring method may not be called twice.
-    cancel_done: bool,
-}
-
-impl<'a, Target> UringPendingIo<Result<(), io::Error>> for UringFallocate<'a, Target>
-where
-    Target: UringTarget + Sync + ?Sized,
-{
-    unsafe fn build_command(&mut self) -> Command {
-        Command::Fallocate {
-            req: FallocateRequest {
-                target: unsafe { self.target.as_target(self.identity) },
-                offset: self.offset,
-                len: self.len,
-                mode: self.mode.bits() as i32,
-            },
-            ack: Some(
-                self.ack_tx
-                    .take()
-                    .expect("build_command may only be run once per pending operation"),
-            ),
-            res: self
-                .result_tx
-                .take()
-                .expect("build_command may only be run once per pending operation"),
-        }
-    }
 }
 
 impl<'a, Target> UringFallocate<'a, Target>
@@ -144,25 +97,24 @@ where
         offset: u64,
         len: u64,
     ) -> Self {
-        let (ack_tx, ack_rx) = oneshot::async_channel();
-        let (result_tx, result_rx) = oneshot_async::channel();
-        let mut op = Self {
+        Self {
             target,
             identity: &client.identity,
             offset,
             len,
             mode,
-            ack_rx: Some(ack_rx),
-            ack_tx: Some(ack_tx),
-            result_tx: Some(result_tx),
-            completion_state: Some(CompletionState { result_rx }),
-            client,
-            cancellation: None,
-            cancel_done: false,
-        };
-        let command = unsafe { op.build_command() };
-        client.send(command);
-        op
+            completion_state: Some(CompletionState {
+                raw: UringPendingIoObj::new(
+                    client,
+                    super::build_op!(unsafe { target.as_target(&client.identity) }, |fd| {
+                        io_uring::opcode::Fallocate::new(fd, len)
+                            .mode(mode.bits())
+                            .offset(offset)
+                            .build()
+                    }),
+                ),
+            }),
+        }
     }
 }
 
@@ -179,8 +131,26 @@ where
             None => None,
         }
     }
-    async fn _cancel(&mut self) -> Option<Result<(), io::Error>> {
-        macros::uring_cancel_impl!(self)
+    async fn _cancel_async(&mut self) -> Option<Result<(), io::Error>> {
+        match self.completion_state.as_mut() {
+            Some(state) => {
+                let res = state.raw.cancel_async().await.map(|r| r.map(|_s| ()));
+                self.completion_state = None;
+                res
+            }
+            None => None,
+        }
+    }
+
+    fn _cancel(&mut self) -> Option<Result<(), io::Error>> {
+        match self.completion_state.as_mut() {
+            Some(state) => {
+                let res = state.raw.cancel().map(|r| r.map(|_s| ()));
+                self.completion_state = None;
+                res
+            }
+            None => None,
+        }
     }
 }
 
@@ -191,12 +161,6 @@ where
     Target: UringTarget + Sync + ?Sized,
 {
     fn drop(&mut self) {
-        // Hot path: There is generally no point in cancelling the operation if it is
-        // already completed or has not been submitted yet, executing the cancellation
-        // function costs more time.
-        if self.completion_state.is_none() {
-            return;
-        }
-        runtime::execute_future_from_sync(self._cancel());
+        let _ = self._cancel();
     }
 }

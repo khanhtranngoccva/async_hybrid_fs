@@ -1,9 +1,7 @@
+use crate::client::pending_io::PendingIoImpl;
 use std::pin::Pin;
 use std::task::Context;
 use std::task::Poll;
-
-use crate::client::pending_io::PendingIoImpl;
-use crate::runtime;
 
 struct CompletionState<'inner_pending, Processor, In, Out>
 where
@@ -100,10 +98,16 @@ where
         }
     }
 
-    async fn _cancel(&mut self) -> Option<Out> {
+    async fn _cancel_async(&mut self) -> Option<Out> {
+        self.input
+            ._cancel_async()
+            .await
+            .map(|input| (self.processor.take().expect("processor should not be None"))(input))
+    }
+
+    fn _cancel(&mut self) -> Option<Out> {
         self.input
             ._cancel()
-            .await
             .map(|input| (self.processor.take().expect("processor should not be None"))(input))
     }
 }
@@ -140,13 +144,7 @@ where
     Out: Send,
 {
     fn drop(&mut self) {
-        // Hot path: If the processor is removed, the operation is already completed or cancelled.
-        if self.processor.is_none() {
-            return;
-        }
-        // Must run cancel() on outer structure instead of the inner structure because we want
-        // inner operations to be performed
-        runtime::execute_future_from_sync(self._cancel());
+        let _ = self._cancel();
     }
 }
 

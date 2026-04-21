@@ -1,4 +1,3 @@
-use super::command::Command;
 use crate::{
     PendingIo, Target,
     borrowed_buf::BorrowedBuf,
@@ -18,15 +17,13 @@ use crate::{
                 write_from_vectored::UringWriteFromVectoredAt,
             },
         },
-        requests::CancelRequest,
-        ticketing::SubmissionTicketId,
     },
     helpers,
     iobuf::{IoBuf, IoBufMut},
     metadata::{Metadata, MknodType, Permissions},
 };
 use core::fmt;
-use io_uring::opcode;
+use io_uring::{SubmissionQueue, opcode};
 use nix::{
     fcntl::{AtFlags, FallocateFlags, FcntlArg, FdFlag, OFlag, PosixFadviseAdvice, RenameFlags},
     sys::{
@@ -46,32 +43,13 @@ use std::{
 };
 
 impl ClientUring {
-    pub(crate) fn send(&self, command: Command) {
-        self.normal_sender
-            .send(command)
-            .expect("normal submission thread dead");
-    }
-
-    fn send_cancel(&self, ticket_id: SubmissionTicketId) -> oneshot::Receiver<io::Result<()>> {
-        let (tx, rx) = oneshot::channel();
-        self.cancel_sender
-            .send(Command::Cancel {
-                req: CancelRequest { id: ticket_id },
-                res: tx,
-            })
-            .expect("cancel submission thread dead");
-        rx
-    }
-
-    /// Cancel a pending io_uring operation.
-    pub(crate) fn cancel_uring(&self, id: SubmissionTicketId) -> io::Result<()> {
-        assert!(
-            self.probe.is_supported(opcode::AsyncCancel::CODE),
-            "async cancel is not supported"
-        );
-        let rx = self.send_cancel(id);
-        rx.recv().expect("uring completion channel dropped")?;
-        Ok(())
+    pub(crate) fn with_submission_queue<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(SubmissionQueue<'_>) -> R,
+    {
+        let _submission_lock = self.submission_lock.lock().unwrap();
+        let submission = unsafe { self.uring.submission_shared() };
+        f(submission)
     }
 }
 
@@ -1039,13 +1017,13 @@ impl Client {
         &'a self,
         file: &'a (impl UringTarget + Sync + ?Sized),
     ) -> PendingIo<'a, io::Result<Metadata>> {
-        let mut statx_buf = Box::new(MaybeUninit::<libc::statx>::uninit());
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Statx::CODE)
         {
             let uring = self.uring.as_ref().expect("uring must be Some");
             PendingIo::new(UringStatx::new(uring, file))
         } else {
+            let mut statx_buf = Box::new(MaybeUninit::<libc::statx>::uninit());
             PendingIo::new(TokioScopedPendingIo::new(
                 move || -> io::Result<Metadata> {
                     helpers::syscall_cvt(unsafe {

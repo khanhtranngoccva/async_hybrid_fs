@@ -1,23 +1,14 @@
-use super::{UringPendingIo, macros};
-use crate::{
-    ClientUring, UringTarget,
-    client::ticketing::SubmissionTicketId,
-    client::{
-        command::Command, completion::ReadResult, pending_io::PendingIoImpl, requests::ReadRequest,
-    },
-    iobuf::IoBufMut,
-    runtime,
-};
+use crate::client::pending_io::PendingIoImpl;
+use crate::client::pending_io::uring::UringPendingIoObj;
+use crate::{ClientUring, UringTarget, client::completion::ReadResult, iobuf::IoBufMut};
 use std::{io, pin::Pin, sync::Arc, task::Poll};
-use tokio::sync::oneshot as oneshot_async;
 
-struct CompletionState<Buf>
+struct CompletionState<'a, Buf>
 where
     Buf: IoBufMut,
 {
+    raw: UringPendingIoObj<'a>,
     buf: Buf,
-    /// Channel for receiving operation results. If the operation is done, the channel will no longer exist and the cancellation is ignored.
-    result_rx: oneshot_async::Receiver<io::Result<u32>>,
 }
 
 struct Completion<'req, 'a, Target, Buf>
@@ -26,7 +17,7 @@ where
     Buf: IoBufMut,
 {
     request: &'req mut UringReadIntoAt<'a, Target, Buf>,
-    state: Option<CompletionState<Buf>>,
+    state: Option<CompletionState<'a, Buf>>,
 }
 
 impl<'req, 'a, Target, Buf> Completion<'req, 'a, Target, Buf>
@@ -36,7 +27,7 @@ where
 {
     pub(crate) fn new(
         request: &'req mut UringReadIntoAt<'a, Target, Buf>,
-        state: CompletionState<Buf>,
+        state: CompletionState<'a, Buf>,
     ) -> Self {
         Self {
             state: Some(state),
@@ -58,8 +49,8 @@ where
     ) -> std::task::Poll<Self::Output> {
         let inner = self.get_mut();
         let mut state = inner.state.take().expect("state must be Some");
-        match Pin::new(&mut state.result_rx).poll(cx) {
-            Poll::Ready(Ok(Ok(bytes_read))) => {
+        match Pin::new(&mut state.raw).poll(cx) {
+            Poll::Ready(Ok(bytes_read)) => {
                 unsafe {
                     state.buf.set_len(bytes_read as usize);
                 }
@@ -70,8 +61,7 @@ where
                     })
                 })
             }
-            Poll::Ready(Ok(Err(e))) => Poll::Ready(Err(e)),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::other(e))),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             Poll::Pending => {
                 inner.state = Some(state);
                 Poll::Pending
@@ -104,58 +94,14 @@ where
     Target: UringTarget + Sync + ?Sized,
     Buf: IoBufMut,
 {
+    /// Completion state for the operation.
+    completion_state: Option<CompletionState<'a, Buf>>,
     /// Target to read from.
     target: &'a Target,
     /// Identity of the io_uring instance.
     identity: &'a Arc<()>,
-    /// Completion state, containing the buffer and the result channel.
-    completion_state: Option<CompletionState<Buf>>,
     /// Offset to read from.
     offset: u64,
-    /// Channel for sending operation IDs.
-    ack_tx: Option<oneshot::Sender<SubmissionTicketId>>,
-    /// Channel for receiving confirmation that the operation has been submitted. The ID must be received before the operation could be cancelled; otherwise, the future might drop before the operation even starts, leading to an operation with dangling pointers. We do not need the ID for any other purpose.
-    ack_rx: Option<oneshot::AsyncReceiver<SubmissionTicketId>>,
-    /// Channel for sending operation results.
-    result_tx: Option<oneshot_async::Sender<io::Result<u32>>>,
-    /// Client to use for submitting the operation and cancelling it.
-    client: &'a ClientUring,
-    /// Cancellation ID.
-    cancellation: Option<SubmissionTicketId>,
-    /// Whether cancellation is acknowledged.
-    // The reason for an extra field is that the cancel_uring method may not be called twice.
-    cancel_done: bool,
-}
-
-impl<'a, Target, Buf> UringPendingIo<Result<ReadResult<Buf>, io::Error>>
-    for UringReadIntoAt<'a, Target, Buf>
-where
-    Target: UringTarget + Sync + ?Sized,
-    Buf: IoBufMut,
-{
-    unsafe fn build_command(&mut self) -> Command {
-        let state = self
-            .completion_state
-            .as_mut()
-            .expect("completion_state must be Some");
-        Command::Read {
-            req: ReadRequest {
-                target: unsafe { self.target.as_target(self.identity) },
-                buf_ptr: state.buf.as_mut_ptr(),
-                buf_len: state.buf.capacity().try_into().unwrap_or(u32::MAX),
-                offset: self.offset,
-            },
-            ack: Some(
-                self.ack_tx
-                    .take()
-                    .expect("build_command may only be run once per pending operation"),
-            ),
-            res: self
-                .result_tx
-                .take()
-                .expect("build_command may only be run once per pending operation"),
-        }
-    }
 }
 
 impl<'a, Target, Buf> UringReadIntoAt<'a, Target, Buf>
@@ -166,26 +112,27 @@ where
     pub(crate) fn new(
         uring: &'a ClientUring,
         target: &'a Target,
-        buf: Buf,
+        mut buf: Buf,
         offset: u64,
     ) -> Self {
-        let (ack_tx, ack_rx) = oneshot::async_channel();
-        let (result_tx, result_rx) = oneshot_async::channel();
-        let mut op = Self {
+        let buf_ptr = buf.as_mut_ptr();
+        let buf_len = buf.capacity().try_into().unwrap_or(u32::MAX);
+        Self {
             target,
             identity: &uring.identity,
-            completion_state: Some(CompletionState { buf, result_rx }),
             offset,
-            ack_rx: Some(ack_rx),
-            ack_tx: Some(ack_tx),
-            result_tx: Some(result_tx),
-            client: uring,
-            cancellation: None,
-            cancel_done: false,
-        };
-        let command = unsafe { op.build_command() };
-        uring.send(command);
-        op
+            completion_state: Some(CompletionState {
+                buf,
+                raw: UringPendingIoObj::new(
+                    uring,
+                    super::build_op!(unsafe { target.as_target(&uring.identity) }, |fd| {
+                        io_uring::opcode::Read::new(fd, buf_ptr, buf_len)
+                            .offset(offset)
+                            .build()
+                    }),
+                ),
+            }),
+        }
     }
 }
 
@@ -206,8 +153,48 @@ where
         }
     }
 
-    async fn _cancel(&mut self) -> Option<Result<ReadResult<Buf>, io::Error>> {
-        macros::uring_cancel_impl!(self)
+    async fn _cancel_async(&mut self) -> Option<Result<ReadResult<Buf>, io::Error>> {
+        match self.completion_state.as_mut() {
+            Some(state) => {
+                let res = state.raw.cancel_async().await.map(|r| {
+                    r.map(|bytes_read| {
+                        let mut state = self.completion_state.take().expect("state must be Some");
+                        unsafe {
+                            state.buf.set_len(bytes_read as usize);
+                        }
+                        ReadResult {
+                            buf: state.buf,
+                            bytes_read: bytes_read as usize,
+                        }
+                    })
+                });
+                self.completion_state = None;
+                res
+            }
+            None => None,
+        }
+    }
+
+    fn _cancel(&mut self) -> Option<Result<ReadResult<Buf>, io::Error>> {
+        match self.completion_state.as_mut() {
+            Some(state) => {
+                let res = state.raw.cancel().map(|r| {
+                    r.map(|bytes_read| {
+                        let mut state = self.completion_state.take().expect("state must be Some");
+                        unsafe {
+                            state.buf.set_len(bytes_read as usize);
+                        }
+                        ReadResult {
+                            buf: state.buf,
+                            bytes_read: bytes_read as usize,
+                        }
+                    })
+                });
+                self.completion_state = None;
+                res
+            }
+            None => None,
+        }
     }
 }
 
@@ -224,12 +211,6 @@ where
     Buf: IoBufMut,
 {
     fn drop(&mut self) {
-        // Hot path: There is generally no point in cancelling the operation if it is
-        // already completed or has not been submitted yet, executing the cancellation
-        // function costs more time.
-        if self.completion_state.is_none() {
-            return;
-        }
-        runtime::execute_future_from_sync(self._cancel());
+        let _ = self._cancel();
     }
 }

@@ -1,11 +1,5 @@
-use crate::{
-    client::command::{Command, CommandWithTicket},
-    metadata::Metadata,
-};
-use std::{
-    io,
-    os::fd::{FromRawFd, OwnedFd},
-};
+use crate::client::pending_io::uring::UringPendingIoFiller;
+use std::io;
 
 /// Result of a read operation: the buffer and actual bytes read.
 pub struct ReadResult<B> {
@@ -39,80 +33,11 @@ pub struct WritevResult<B> {
     pub bytes_written: usize,
 }
 
-pub(crate) fn handle_completion(cmd: CommandWithTicket, result: i32) {
+pub(crate) fn handle_completion(filler: UringPendingIoFiller, result: i32) {
     let result: io::Result<i32> = if result < 0 {
         Err(io::Error::from_raw_os_error(-result))
     } else {
         Ok(result)
     };
-    match cmd.command {
-        Command::Read { res, .. } => {
-            let _ = res.send(result.map(|n| n as u32));
-        }
-        Command::Readv { res, .. } => {
-            let _ = res.send(result.map(|n| n as u32));
-        }
-        Command::Write { res, .. } => {
-            let _ = res.send(result.map(|n| n as u32));
-        }
-        Command::Writev { res, .. } => {
-            let _ = res.send(result.map(|n| n as u32));
-        }
-        Command::Sync { res, .. } => {
-            let _ = res.send(result.map(|_| ()));
-        }
-        Command::Statx { req, res, .. } => {
-            let outcome = result.map(|_| {
-                // SAFETY: The kernel has initialized the statx buffer
-                let statx = unsafe { (*req.statx_buf).assume_init() };
-                Metadata(statx)
-            });
-            let _ = res.send(outcome);
-        }
-        Command::Fallocate { res, .. } => {
-            let _ = res.send(result.map(|_| ()));
-        }
-        Command::Fadvise { res, .. } => {
-            let _ = res.send(result.map(|_| ()));
-        }
-        Command::Ftruncate { res, .. } => {
-            let _ = res.send(result.map(|_| ()));
-        }
-        Command::OpenAt { res, .. } => {
-            let outcome = result.map(|fd| {
-                // SAFETY: The kernel returns a valid fd on success
-                unsafe { OwnedFd::from_raw_fd(fd) }
-            });
-            let _ = res.send(outcome);
-        }
-        Command::StatxPath { req, res, .. } => {
-            let outcome = result.map(|_| {
-                // SAFETY: The kernel has initialized the statx buffer
-                let statx = unsafe { (*req.statx_buf).assume_init() };
-                Metadata(statx)
-            });
-            let _ = res.send(outcome);
-        }
-        Command::Close { res, .. } => {
-            let _ = res.send(result.map(|_| ()));
-        }
-        Command::RenameAt { res, .. } => {
-            let _ = res.send(result.map(|_| ()));
-        }
-        Command::UnlinkAt { res, .. } => {
-            let _ = res.send(result.map(|_| ()));
-        }
-        Command::MkdirAt { res, .. } => {
-            let _ = res.send(result.map(|_| ()));
-        }
-        Command::SymlinkAt { res, .. } => {
-            let _ = res.send(result.map(|_| ()));
-        }
-        Command::LinkAt { res, .. } => {
-            let _ = res.send(result.map(|_| ()));
-        }
-        Command::Cancel { res, .. } => {
-            let _ = res.send(result.map(|_| ()));
-        }
-    }
+    filler.fill(result);
 }

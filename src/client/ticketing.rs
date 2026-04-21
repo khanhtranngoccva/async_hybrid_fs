@@ -1,4 +1,7 @@
-use std::sync::{Arc, Condvar, Mutex};
+use std::{
+    sync::{Arc, Condvar, Mutex},
+    task::{Context, Poll, Waker},
+};
 
 /// The submission ticket ID, which may be used as the user_data field/entry ID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -10,7 +13,7 @@ pub(crate) struct SubmissionTicketId(pub(crate) u64);
 #[derive(Debug)]
 pub(crate) struct SubmissionTicket {
     id: SubmissionTicketId,
-    tickets: Arc<Mutex<Vec<SubmissionTicketId>>>,
+    state: Arc<Mutex<SubmissionTicketQueueState>>,
     condvar: Arc<Condvar>,
 }
 
@@ -22,9 +25,27 @@ impl SubmissionTicket {
 
 impl Drop for SubmissionTicket {
     fn drop(&mut self) {
-        let mut tickets = self.tickets.lock().unwrap();
-        tickets.push(self.id.clone());
+        let mut tickets = self.state.lock().unwrap();
+        tickets.ids.push(self.id.clone());
+        tickets.wake_all();
         self.condvar.notify_one();
+    }
+}
+
+#[derive(Debug)]
+struct SubmissionTicketQueueState {
+    /// Internal IDs to assign.
+    ids: Vec<SubmissionTicketId>,
+    /// Asynchronous wakers to notify when a ticket is available.
+    wakers: Vec<Waker>,
+}
+
+impl SubmissionTicketQueueState {
+    // Some tasks may not poll (cancelled) so we may miss updates. Therefore, we have to notify all wakers. It might be better to simply use oneshot channels instead
+    fn wake_all(&mut self) {
+        for waker in self.wakers.drain(..) {
+            waker.wake();
+        }
     }
 }
 
@@ -33,22 +54,22 @@ impl Drop for SubmissionTicket {
 pub(crate) struct SubmissionTicketQueue {
     /// Original capacity of the queue.
     capacity: usize,
-    /// Queue of submission tickets.
-    tickets: Arc<Mutex<Vec<SubmissionTicketId>>>,
+    /// Inner state of the queue.
+    state: Arc<Mutex<SubmissionTicketQueueState>>,
     /// Condvar for notifying that a ticket is available.
     condvar: Arc<Condvar>,
 }
 
 impl SubmissionTicketQueue {
     fn new(size: usize, starting_id: u64) -> Self {
-        let tickets = Mutex::new(
-            (starting_id..starting_id + size as u64)
-                .map(SubmissionTicketId)
-                .collect(),
-        );
+        let ids: Vec<_> = (starting_id..starting_id + size as u64)
+            .map(SubmissionTicketId)
+            .collect();
+        let wakers = vec![];
+        let state = SubmissionTicketQueueState { ids, wakers };
         Self {
             capacity: size,
-            tickets: Arc::new(tickets),
+            state: Arc::new(Mutex::new(state)),
             condvar: Arc::new(Condvar::new()),
         }
     }
@@ -70,21 +91,36 @@ impl SubmissionTicketQueue {
         queues
     }
 
-    /// Request at least one and up to `count` submission tickets.
-    pub(crate) fn request_submission_tickets(&self, count: usize) -> Vec<SubmissionTicket> {
-        let mut tickets = self.tickets.lock().unwrap();
-        while tickets.is_empty() {
-            tickets = self.condvar.wait(tickets).unwrap();
+    /// Request a submission ticket. If the queue is empty, the caller will block until a ticket is available.
+    pub(crate) fn request_submission_ticket(&self) -> SubmissionTicket {
+        let mut state = self.state.lock().unwrap();
+        while state.ids.is_empty() {
+            state = self.condvar.wait(state).unwrap();
         }
-        let remaining_length = tickets.len().saturating_sub(count);
-        tickets
-            .drain(remaining_length..)
-            .map(|id| SubmissionTicket {
-                id,
-                tickets: self.tickets.clone(),
-                condvar: self.condvar.clone(),
-            })
-            .collect()
+        let id = state.ids.pop().unwrap();
+        SubmissionTicket {
+            id,
+            state: self.state.clone(),
+            condvar: self.condvar.clone(),
+        }
+    }
+
+    /// Attempt to request a submission ticket. If the queue is empty, `Poll::Pending` is returned.
+    pub(crate) fn poll_submission_ticket(
+        &self,
+        context: &mut Context<'_>,
+    ) -> Poll<SubmissionTicket> {
+        let mut state = self.state.lock().unwrap();
+        if state.ids.is_empty() {
+            state.wakers.push(context.waker().clone());
+            return Poll::Pending;
+        }
+        let id = state.ids.pop().unwrap();
+        Poll::Ready(SubmissionTicket {
+            id,
+            state: self.state.clone(),
+            condvar: self.condvar.clone(),
+        })
     }
 }
 

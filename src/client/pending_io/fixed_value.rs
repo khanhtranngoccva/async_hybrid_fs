@@ -76,8 +76,12 @@ where
         }
     }
 
-    async fn _cancel(&mut self) -> Option<T> {
-        Some(self._completion()?.await)
+    async fn _cancel_async(&mut self) -> Option<T> {
+        self.value.take()
+    }
+
+    fn _cancel(&mut self) -> Option<T> {
+        self.value.take()
     }
 }
 

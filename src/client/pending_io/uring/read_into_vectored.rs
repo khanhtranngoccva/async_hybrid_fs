@@ -1,22 +1,15 @@
-use super::{UringPendingIo, macros};
 use crate::client::pending_io::PendingIoImpl;
+use crate::client::pending_io::uring::UringPendingIoObj;
 use crate::client::requests::IovecArray;
-use crate::client::ticketing::SubmissionTicketId;
-use crate::runtime;
-use crate::{
-    ClientUring, UringTarget,
-    client::{command::Command, completion::ReadvResult, requests::ReadvRequest},
-    iobuf::IoBufMut,
-};
+use crate::{ClientUring, UringTarget, client::completion::ReadvResult, iobuf::IoBufMut};
 use std::cmp::min;
 use std::{io, pin::Pin, sync::Arc, task::Poll};
-use tokio::sync::oneshot as oneshot_async;
 
-struct CompletionState<Buf> {
+struct CompletionState<'a, Buf> {
+    raw: UringPendingIoObj<'a>,
     /// Buffers to read into.
+    // Note: the Buf object is supposed to be dropped after the operation is completed.
     bufs: Vec<Buf>,
-    /// Channel for receiving operation results.
-    result_rx: oneshot_async::Receiver<io::Result<u32>>,
 }
 
 struct Completion<'req, 'a, Target, Buf>
@@ -25,7 +18,7 @@ where
     Buf: IoBufMut,
 {
     request: &'req mut UringReadIntoVectoredAt<'a, Target, Buf>,
-    state: Option<CompletionState<Buf>>,
+    state: Option<CompletionState<'a, Buf>>,
 }
 
 impl<'req, 'a, Target, Buf> Completion<'req, 'a, Target, Buf>
@@ -35,12 +28,30 @@ where
 {
     pub(crate) fn new(
         request: &'req mut UringReadIntoVectoredAt<'a, Target, Buf>,
-        state: CompletionState<Buf>,
+        state: CompletionState<'a, Buf>,
     ) -> Self {
         Self {
             request,
             state: Some(state),
         }
+    }
+}
+
+fn convert_result<Buf>(mut bufs: Vec<Buf>, bytes_read: i32) -> ReadvResult<Buf>
+where
+    Buf: IoBufMut,
+{
+    let mut cur_bytes_read = bytes_read as usize;
+    for buf in bufs.iter_mut() {
+        let bytes_read_into_target = min(buf.capacity(), cur_bytes_read);
+        unsafe {
+            buf.set_len(bytes_read_into_target);
+        }
+        cur_bytes_read -= bytes_read_into_target;
+    }
+    ReadvResult {
+        bufs,
+        bytes_read: bytes_read as usize,
     }
 }
 
@@ -57,23 +68,9 @@ where
     ) -> std::task::Poll<Self::Output> {
         let inner = self.get_mut();
         let mut state = inner.state.take().expect("state must be Some");
-        match Pin::new(&mut state.result_rx).poll(cx) {
-            Poll::Ready(Ok(Ok(bytes_read))) => Poll::Ready({
-                let mut cur_bytes_read = bytes_read as usize;
-                for buf in state.bufs.iter_mut() {
-                    let bytes_read_into_target = min(buf.capacity(), cur_bytes_read);
-                    unsafe {
-                        buf.set_len(bytes_read_into_target);
-                    }
-                    cur_bytes_read -= bytes_read_into_target;
-                }
-                Ok(ReadvResult {
-                    bufs: state.bufs,
-                    bytes_read: bytes_read as usize,
-                })
-            }),
-            Poll::Ready(Ok(Err(e))) => Poll::Ready(Err(e)),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::other(e))),
+        match Pin::new(&mut state.raw).poll(cx) {
+            Poll::Ready(Ok(bytes_read)) => Poll::Ready(Ok(convert_result(state.bufs, bytes_read))),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             Poll::Pending => {
                 inner.state = Some(state);
                 Poll::Pending
@@ -106,6 +103,8 @@ where
     Target: UringTarget + Sync + ?Sized,
     Buf: IoBufMut,
 {
+    /// Completion state for the operation.
+    completion_state: Option<CompletionState<'a, Buf>>,
     /// Target to read from.
     target: &'a Target,
     /// Identity of the io_uring instance.
@@ -115,52 +114,6 @@ where
     iovec_array: Pin<IovecArray>,
     /// Offset to read from.
     offset: u64,
-    /// Channel for sending operation IDs.
-    ack_tx: Option<oneshot::Sender<SubmissionTicketId>>,
-    /// Channel for receiving confirmation that the operation has been submitted. The ID must be received before the operation could be cancelled; otherwise, the future might drop before the operation even starts, leading to an operation with dangling pointers. We do not need the ID for any other purpose.
-    ack_rx: Option<oneshot::AsyncReceiver<SubmissionTicketId>>,
-    /// Channel for sending operation results.
-    result_tx: Option<oneshot_async::Sender<io::Result<u32>>>,
-    /// Completion state for the operation.
-    completion_state: Option<CompletionState<Buf>>,
-    /// Client to use for submitting the operation and cancelling it.
-    client: &'a ClientUring,
-    /// Cancellation ID.
-    cancellation: Option<SubmissionTicketId>,
-    /// Whether cancellation is acknowledged.
-    // The reason for an extra field is that the cancel_uring method may not be called twice.
-    cancel_done: bool,
-}
-
-impl<'a, Target, Buf> UringPendingIo<Result<ReadvResult<Buf>, io::Error>>
-    for UringReadIntoVectoredAt<'a, Target, Buf>
-where
-    Target: UringTarget + Sync + ?Sized,
-    Buf: IoBufMut,
-{
-    unsafe fn build_command(&mut self) -> Command {
-        Command::Readv {
-            req: ReadvRequest {
-                target: unsafe { self.target.as_target(self.identity) },
-                io_slices: self.iovec_array.as_ptr(),
-                io_slices_len: self
-                    .iovec_array
-                    .len()
-                    .try_into()
-                    .expect("len exceeds u32::MAX"),
-                offset: self.offset,
-            },
-            ack: Some(
-                self.ack_tx
-                    .take()
-                    .expect("build_command may only be run once per pending operation"),
-            ),
-            res: self
-                .result_tx
-                .take()
-                .expect("build_command may only be run once per pending operation"),
-        }
-    }
 }
 
 impl<'a, Target, Buf> UringReadIntoVectoredAt<'a, Target, Buf>
@@ -174,32 +127,33 @@ where
         mut bufs: Vec<Buf>,
         offset: u64,
     ) -> Self {
-        let (ack_tx, ack_rx) = oneshot::async_channel();
-        let (result_tx, result_rx) = oneshot_async::channel();
-        let mut op = Self {
+        let iovec_array = Pin::new(IovecArray(
+            bufs.iter_mut()
+                .map(|buf| libc::iovec {
+                    iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+                    iov_len: buf.capacity().into(),
+                })
+                .collect::<Vec<_>>(),
+        ));
+        let iov_len = iovec_array.len().try_into().unwrap_or(u32::MAX);
+        let iov_ptr = iovec_array.as_ptr();
+        Self {
             target,
             identity: &uring.identity,
-            // Need to pin the iovec array because the command object requires a pointer.
-            iovec_array: Pin::new(IovecArray(
-                bufs.iter_mut()
-                    .map(|buf| libc::iovec {
-                        iov_base: buf.as_mut_ptr() as *mut libc::c_void,
-                        iov_len: buf.capacity().into(),
-                    })
-                    .collect::<Vec<_>>(),
-            )),
-            completion_state: Some(CompletionState { bufs, result_rx }),
+            iovec_array,
+            completion_state: Some(CompletionState {
+                bufs,
+                raw: UringPendingIoObj::new(
+                    uring,
+                    super::build_op!(unsafe { target.as_target(&uring.identity) }, |fd| {
+                        io_uring::opcode::Readv::new(fd, iov_ptr, iov_len)
+                            .offset(offset)
+                            .build()
+                    }),
+                ),
+            }),
             offset,
-            ack_rx: Some(ack_rx),
-            ack_tx: Some(ack_tx),
-            result_tx: Some(result_tx),
-            client: uring,
-            cancellation: None,
-            cancel_done: false,
-        };
-        let command = unsafe { op.build_command() };
-        uring.send(command);
-        op
+        }
     }
 }
 
@@ -220,8 +174,36 @@ where
         }
     }
 
-    async fn _cancel(&mut self) -> Option<Result<ReadvResult<Buf>, io::Error>> {
-        macros::uring_cancel_impl!(self)
+    async fn _cancel_async(&mut self) -> Option<Result<ReadvResult<Buf>, io::Error>> {
+        match self.completion_state.as_mut() {
+            Some(state) => {
+                let res = state.raw.cancel_async().await.map(|r| {
+                    r.map(|bytes_read| {
+                        let state = self.completion_state.take().expect("state must be Some");
+                        convert_result(state.bufs, bytes_read)
+                    })
+                });
+                self.completion_state = None;
+                res
+            }
+            None => None,
+        }
+    }
+
+    fn _cancel(&mut self) -> Option<Result<ReadvResult<Buf>, io::Error>> {
+        match self.completion_state.as_mut() {
+            Some(state) => {
+                let res = state.raw.cancel().map(|r| {
+                    r.map(|bytes_read| {
+                        let state = self.completion_state.take().expect("state must be Some");
+                        convert_result(state.bufs, bytes_read)
+                    })
+                });
+                self.completion_state = None;
+                res
+            }
+            None => None,
+        }
     }
 }
 
@@ -238,12 +220,6 @@ where
     Buf: IoBufMut,
 {
     fn drop(&mut self) {
-        // Hot path: There is generally no point in cancelling the operation if it is
-        // already completed or has not been submitted yet, executing the cancellation
-        // function costs more time.
-        if self.completion_state.is_none() {
-            return;
-        }
-        runtime::execute_future_from_sync(self._cancel());
+        let _ = self._cancel();
     }
 }

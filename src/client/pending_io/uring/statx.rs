@@ -1,24 +1,19 @@
-use super::{UringPendingIo, macros};
-use crate::runtime;
-use crate::{
-    ClientUring, Metadata, UringTarget,
-    client::ticketing::SubmissionTicketId,
-    client::{command::Command, pending_io::PendingIoImpl, requests::StatxRequest},
-};
+use super::UringPendingIoObj;
+use crate::{ClientUring, Metadata, UringTarget, client::pending_io::PendingIoImpl};
 use std::mem::MaybeUninit;
-use std::{io, pin::Pin, sync::Arc, task::Poll};
-use tokio::sync::oneshot as oneshot_async;
+use std::os::fd::AsRawFd;
+use std::{io, pin::Pin, task::Poll};
 
-struct CompletionState {
-    /// Channel for receiving operation results. If the operation is done, the channel will no longer exist and the cancellation is ignored.
-    result_rx: oneshot_async::Receiver<io::Result<Metadata>>,
+struct CompletionState<'a> {
+    statx_buf: Box<MaybeUninit<libc::statx>>,
+    raw: UringPendingIoObj<'a>,
 }
 
 struct Completion<'req, 'a, Target>
 where
     Target: UringTarget + Sync + ?Sized,
 {
-    state: Option<CompletionState>,
+    state: Option<CompletionState<'a>>,
     request: &'req mut UringStatx<'a, Target>,
 }
 
@@ -26,7 +21,10 @@ impl<'req, 'a, Target> Completion<'req, 'a, Target>
 where
     Target: UringTarget + Sync + ?Sized,
 {
-    pub(crate) fn new(request: &'req mut UringStatx<'a, Target>, state: CompletionState) -> Self {
+    pub(crate) fn new(
+        request: &'req mut UringStatx<'a, Target>,
+        state: CompletionState<'a>,
+    ) -> Self {
         Self {
             state: Some(state),
             request,
@@ -46,10 +44,11 @@ where
     ) -> std::task::Poll<Self::Output> {
         let inner = self.get_mut();
         let mut state = inner.state.take().expect("state must be Some");
-        match Pin::new(&mut state.result_rx).poll(cx) {
-            Poll::Ready(Ok(Ok(metadata))) => Poll::Ready(Ok(metadata)),
-            Poll::Ready(Ok(Err(e))) => Poll::Ready(Err(e)),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::other(e))),
+        match Pin::new(&mut state.raw).poll(cx) {
+            Poll::Ready(Ok(_)) => {
+                Poll::Ready(Ok(Metadata(unsafe { (*state.statx_buf).assume_init() })))
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             Poll::Pending => {
                 inner.state = Some(state);
                 Poll::Pending
@@ -78,72 +77,10 @@ pub struct UringStatx<'a, Target>
 where
     Target: UringTarget + Sync + ?Sized,
 {
+    /// Completion state, containing the statx buffer.
+    completion_state: Option<CompletionState<'a>>,
     /// Target to query metadata.
     target: &'a Target,
-    /// Identity of the io_uring instance.
-    identity: &'a Arc<()>,
-    /// Channel for sending operation IDs.
-    ack_tx: Option<oneshot::Sender<SubmissionTicketId>>,
-    /// Channel for receiving confirmation that the operation has been submitted. The ID must be received before the operation could be cancelled; otherwise, the future might drop before the operation even starts, leading to an operation with dangling pointers. We do not need the ID for any other purpose.
-    ack_rx: Option<oneshot::AsyncReceiver<SubmissionTicketId>>,
-    /// Channel for sending operation results.
-    result_tx: Option<oneshot_async::Sender<io::Result<Metadata>>>,
-    /// Completion state, containing the result channel.
-    completion_state: Option<CompletionState>,
-    /// Client to use for submitting the operation and cancelling it.
-    client: &'a ClientUring,
-    /// Cancellation ID.
-    cancellation: Option<SubmissionTicketId>,
-    /// Whether cancellation is acknowledged.
-    // The reason for an extra field is that the cancel_uring method may not be called twice.
-    cancel_done: bool,
-}
-
-impl<'a, Target> UringPendingIo<Result<Metadata, io::Error>> for UringStatx<'a, Target>
-where
-    Target: UringTarget + Sync + ?Sized,
-{
-    unsafe fn build_command(&mut self) -> Command {
-        Command::Statx {
-            req: StatxRequest {
-                target: unsafe { self.target.as_target(self.identity) },
-                statx_buf: Box::new(MaybeUninit::uninit()),
-            },
-            ack: Some(
-                self.ack_tx
-                    .take()
-                    .expect("build_command may only be run once per pending operation"),
-            ),
-            res: self
-                .result_tx
-                .take()
-                .expect("build_command may only be run once per pending operation"),
-        }
-    }
-}
-
-impl<'a, Target> Future for UringStatx<'a, Target>
-where
-    Target: UringTarget + Sync + ?Sized,
-{
-    type Output = io::Result<Metadata>;
-
-    fn poll(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        let inner = self.get_mut();
-        let mut state = inner.completion_state.take().expect("state must be Some");
-        match Pin::new(&mut state.result_rx).poll(cx) {
-            Poll::Ready(Ok(Ok(metadata))) => Poll::Ready(Ok(metadata)),
-            Poll::Ready(Ok(Err(e))) => Poll::Ready(Err(e)),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::other(e))),
-            Poll::Pending => {
-                inner.completion_state = Some(state);
-                Poll::Pending
-            }
-        }
-    }
 }
 
 impl<'a, Target> UringStatx<'a, Target>
@@ -151,22 +88,24 @@ where
     Target: UringTarget + Sync + ?Sized,
 {
     pub(crate) fn new(uring: &'a ClientUring, target: &'a Target) -> Self {
-        let (ack_tx, ack_rx) = oneshot::async_channel();
-        let (result_tx, result_rx) = oneshot_async::channel();
-        let mut op = Self {
+        let mut statx_buf = Box::new(MaybeUninit::uninit());
+        let statx_ptr = statx_buf.as_mut_ptr();
+        Self {
             target,
-            identity: &uring.identity,
-            ack_rx: Some(ack_rx),
-            ack_tx: Some(ack_tx),
-            result_tx: Some(result_tx),
-            completion_state: Some(CompletionState { result_rx }),
-            client: uring,
-            cancellation: None,
-            cancel_done: false,
-        };
-        let command = unsafe { op.build_command() };
-        uring.send(command);
-        op
+            completion_state: Some(CompletionState {
+                statx_buf,
+                raw: UringPendingIoObj::new(
+                    uring,
+                    io_uring::opcode::Statx::new(
+                        io_uring::types::Fd(target.as_file_descriptor().as_raw_fd()),
+                        c"".as_ptr(),
+                        statx_ptr as *mut io_uring::types::statx,
+                    )
+                    .flags(libc::AT_EMPTY_PATH)
+                    .build(),
+                ),
+            }),
+        }
     }
 }
 
@@ -184,8 +123,33 @@ where
         }
     }
 
-    async fn _cancel(&mut self) -> Option<Result<Metadata, io::Error>> {
-        macros::uring_cancel_impl!(self)
+    async fn _cancel_async(&mut self) -> Option<Result<Metadata, io::Error>> {
+        match self.completion_state.as_mut() {
+            Some(state) => {
+                let res = state
+                    .raw
+                    .cancel_async()
+                    .await
+                    .map(|r| r.map(|_s| Metadata(unsafe { (*state.statx_buf).assume_init() })));
+                self.completion_state = None;
+                res
+            }
+            None => None,
+        }
+    }
+
+    fn _cancel(&mut self) -> Option<Result<Metadata, io::Error>> {
+        match self.completion_state.as_mut() {
+            Some(state) => {
+                let res = state
+                    .raw
+                    .cancel()
+                    .map(|r| r.map(|_s| Metadata(unsafe { (*state.statx_buf).assume_init() })));
+                self.completion_state = None;
+                res
+            }
+            None => None,
+        }
     }
 }
 
@@ -196,12 +160,6 @@ where
     Target: UringTarget + Sync + ?Sized,
 {
     fn drop(&mut self) {
-        // Hot path: There is generally no point in cancelling the operation if it is
-        // already completed or has not been submitted yet, executing the cancellation
-        // function costs more time.
-        if self.completion_state.is_none() {
-            return;
-        }
-        runtime::execute_future_from_sync(self._cancel());
+        let _ = self._cancel();
     }
 }

@@ -16,6 +16,7 @@ libc = "0.2.183"
 log = "0.4.29"
 nix = { version = "0.31.2", features = ["fs", "uio", "user"] }
 oneshot = { version = "0.2.1", features = ["async", "std"] }
+parking_lot = "0.12.5"
 thiserror = "2.0.18"
 tokio = { version = "1.50.0", features = ["fs", "rt", "sync"] }
 

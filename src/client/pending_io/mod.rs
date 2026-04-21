@@ -8,9 +8,14 @@ use std::pin::Pin;
 
 #[async_trait::async_trait]
 pub(crate) trait PendingIoImpl<T>: Unpin + Send {
+    /// Return a boxed future that can be awaited to get the result of the operation.
     fn _completion<'a>(&'a mut self) -> Option<Pin<Box<dyn Future<Output = T> + Send + 'a>>>;
 
-    async fn _cancel(&mut self) -> Option<T>;
+    /// Cancel the pending I/O operation and wait for the result asynchronously. If the operation is to be executed to completion, the transforming behavior must be identical to completion()
+    async fn _cancel_async(&mut self) -> Option<T>;
+
+    /// Cancel the pending I/O operation synchronously. After execution this function, the inner object must be declared finished, the result must be extracted and transformed, and the transforming behavior must be identical to completion()
+    fn _cancel(&mut self) -> Option<T>;
 }
 
 /// Wrapper for user-friendly methods for cancellable pending I/O operations.
@@ -46,7 +51,7 @@ where
 
     /// Consume the object and cancel the pending I/O operation.
     pub async fn cancel(mut self) -> Option<T> {
-        self.inner._cancel().await
+        self.inner._cancel_async().await
     }
 
     /// Chain a function to the pending I/O operation that is guaranteed to run if the operation is completed, even if the pending structure is dropped.

@@ -116,7 +116,7 @@ async fn test_architecture_blocking_latency() {
                 Ok(msg) => msg,
                 Err(crossbeam_channel::RecvError) => break,
             };
-            let ticket = queue.request_submission_tickets(1).pop().unwrap();
+            let ticket = queue.request_submission_ticket();
             let ticket_id = ticket.id();
             mapping.insert(ticket_id, (msg.0, msg.1, ticket));
             completion_ticket_submitter.grant_completion_tickets(1);

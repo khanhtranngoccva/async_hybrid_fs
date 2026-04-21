@@ -1,21 +1,18 @@
-use super::UringPendingIo;
 use crate::{
     ClientUring,
-    client::{command::Command, pending_io::PendingIoImpl, requests::CloseRequest},
+    client::pending_io::{PendingIoImpl, uring::UringPendingIoObj},
 };
-use std::{io, os::fd::IntoRawFd, pin::Pin, sync::Arc, task::Poll};
-use tokio::sync::oneshot::{self, Receiver, Sender};
+use std::{io, marker::PhantomData, os::fd::IntoRawFd, pin::Pin, task::Poll};
 
-struct CompletionState {
-    /// Channel for receiving operation results. If the operation is done, the channel will no longer exist and the cancellation is ignored.
-    result_rx: Receiver<io::Result<()>>,
+struct CompletionState<'a> {
+    raw: UringPendingIoObj<'a>,
 }
 
 struct Completion<'req, 'a, Target>
 where
     Target: IntoRawFd + Sized + Send,
 {
-    state: Option<CompletionState>,
+    state: Option<CompletionState<'a>>,
     request: &'req mut UringClose<'a, Target>,
 }
 
@@ -23,7 +20,10 @@ impl<'req, 'a, Target> Completion<'req, 'a, Target>
 where
     Target: IntoRawFd + Sized + Send,
 {
-    pub(crate) fn new(request: &'req mut UringClose<'a, Target>, state: CompletionState) -> Self {
+    pub(crate) fn new(
+        request: &'req mut UringClose<'a, Target>,
+        state: CompletionState<'a>,
+    ) -> Self {
         Self {
             state: Some(state),
             request,
@@ -43,10 +43,8 @@ where
     ) -> std::task::Poll<Self::Output> {
         let inner = self.get_mut();
         let mut state = inner.state.take().expect("state object must be Some");
-        match Pin::new(&mut state.result_rx).poll(cx) {
-            Poll::Ready(Ok(Ok(()))) => Poll::Ready(Ok(())),
-            Poll::Ready(Ok(Err(e))) => Poll::Ready(Err(e)),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::other(e))),
+        match Pin::new(&mut state.raw).poll(cx) {
+            Poll::Ready(res) => Poll::Ready(res.map(|_| ())),
             Poll::Pending => {
                 inner.state = Some(state);
                 Poll::Pending
@@ -72,35 +70,9 @@ pub struct UringClose<'a, Target>
 where
     Target: IntoRawFd + Sized + Send,
 {
-    /// Target to close.
-    target: Option<Target>,
-    /// Channel for sending operation results.
-    result_tx: Option<Sender<io::Result<()>>>,
-    /// Minimal completion state.
-    state: Option<CompletionState>,
-    _identity: &'a Arc<()>,
+    state: Option<CompletionState<'a>>,
     _client: &'a ClientUring,
-}
-
-impl<'a, Target> UringPendingIo<Result<(), io::Error>> for UringClose<'a, Target>
-where
-    Target: IntoRawFd + Sized + Send,
-{
-    unsafe fn build_command(&mut self) -> Command {
-        Command::Close {
-            req: CloseRequest {
-                fd: self
-                    .target
-                    .take()
-                    .expect("target must be Some")
-                    .into_raw_fd(),
-            },
-            res: self
-                .result_tx
-                .take()
-                .expect("build_command may only be run once per pending operation"),
-        }
-    }
+    _target: PhantomData<Target>,
 }
 
 impl<'a, Target> UringClose<'a, Target>
@@ -108,17 +80,18 @@ where
     Target: IntoRawFd + Sized + Send,
 {
     pub(crate) fn new(client: &'a ClientUring, target: Target) -> Self {
-        let (result_tx, result_rx) = oneshot::channel();
-        let mut op = Self {
-            target: Some(target),
-            _identity: &client.identity,
-            result_tx: Some(result_tx),
-            state: Some(CompletionState { result_rx }),
+        Self {
+            state: Some(CompletionState {
+                raw: UringPendingIoObj::new(
+                    client,
+                    super::build_op_fd_only!(Target::Fd(target.into_raw_fd()), |fd| {
+                        io_uring::opcode::Close::new(fd).build()
+                    }),
+                ),
+            }),
             _client: client,
-        };
-        let command = unsafe { op.build_command() };
-        client.send(command);
-        op
+            _target: PhantomData,
+        }
     }
 }
 
@@ -136,9 +109,21 @@ where
         }
     }
 
-    async fn _cancel(&mut self) -> Option<Result<(), io::Error>> {
+    async fn _cancel_async(&mut self) -> Option<Result<(), io::Error>> {
         // The operation is not cancellable, so we return the result of the operation.
         Some(self._completion()?.await)
+    }
+
+    fn _cancel(&mut self) -> Option<Result<(), io::Error>> {
+        // The operation is not cancellable, so we return the result of the operation.
+        match self.state.as_mut() {
+            Some(state) => {
+                let res = state.raw.wait().map(|r| r.map(|_s| ()));
+                self.state = None;
+                res
+            }
+            None => None,
+        }
     }
 }
 
@@ -149,12 +134,6 @@ where
     Target: IntoRawFd + Sized + Send,
 {
     fn drop(&mut self) {
-        // Must attempt to cancel if operation is not completed
-        if let Some(state) = self.state.take() {
-            let _ = state
-                .result_rx
-                .blocking_recv()
-                .expect("result_rx must be received to avoid a dangling pointer issue");
-        }
+        let _ = self._cancel();
     }
 }
