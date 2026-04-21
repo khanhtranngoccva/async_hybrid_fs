@@ -107,13 +107,13 @@ where
             path,
             flags,
             completion_state: Some(CompletionState {
-                statx_buf: Box::new(MaybeUninit::uninit()),
+                statx_buf: statx_buf,
                 raw: UringPendingIoObj::new(
                     uring,
                     io_uring::opcode::Statx::new(
                         io_uring::types::Fd(dir_target.as_file_descriptor().as_raw_fd()),
                         path_ptr,
-                        statx_ptr,
+                        statx_ptr as *mut io_uring::types::statx,
                     )
                     .flags(flags.bits())
                     .mask(libc::STATX_BASIC_STATS)
