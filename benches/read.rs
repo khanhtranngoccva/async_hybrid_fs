@@ -5,7 +5,6 @@ use std::cmp;
 use std::io::Read;
 use std::path::Path;
 use tokio::{
-    fs::File,
     runtime::{self, Runtime},
 };
 
@@ -20,7 +19,7 @@ async fn read_hybrid(client: &Client, path: impl AsRef<Path>, size: usize) {
         .expect("no completion future returned")
         .await
         .expect("failed to open file");
-    let mut file = File::from_std(std::fs::File::from(fd));
+    let mut file = std::fs::File::from(fd);
     let mut buffer = vec![0; size];
     let mut size_left = size;
     while size_left > 0 {
@@ -33,6 +32,12 @@ async fn read_hybrid(client: &Client, path: impl AsRef<Path>, size: usize) {
             .expect("failed to read");
         size_left -= bytes_read;
     }
+    client
+        .close(file)
+        .completion()
+        .expect("no completion future returned")
+        .await
+        .expect("failed to close file");
 }
 
 async fn read_tokio(path: impl AsRef<Path>, size: usize) {
@@ -49,7 +54,7 @@ async fn read_hybrid_batched(client: &Client, path: impl AsRef<Path>, size: usiz
     // let batch_size = 16384 - 512usize;
     while current_count > 0 {
         let current_batch = current_count.min(batch_size);
-        let mut futures = Vec::new();
+        let mut futures = Vec::with_capacity(current_batch);
         for _ in 0..current_batch {
             let future = read_hybrid(client, path.as_ref(), size);
             futures.push(future);
@@ -88,7 +93,7 @@ async fn read_hybrid_multi(clients: &[Client], path: impl AsRef<Path>, size: usi
 }
 
 async fn read_hybrid_default_round_robin(path: impl AsRef<Path>, size: usize, count: usize) {
-    let mut futures = Vec::new();
+    let mut futures = Vec::with_capacity(count);
     for _ in 0..count {
         let future = read_hybrid(default_client(), path.as_ref(), size);
         futures.push(future);
@@ -97,7 +102,7 @@ async fn read_hybrid_default_round_robin(path: impl AsRef<Path>, size: usize, co
 }
 
 async fn read_tokio_batched(path: impl AsRef<Path>, size: usize, count: usize) {
-    let mut futures = Vec::new();
+    let mut futures = Vec::with_capacity(count);
     for _ in 0..count {
         let future = read_tokio(path.as_ref(), size);
         futures.push(future);
@@ -106,10 +111,10 @@ async fn read_tokio_batched(path: impl AsRef<Path>, size: usize, count: usize) {
 }
 
 fn read_blocking_batched(path: impl AsRef<Path>, size: usize, count: usize) {
-    let mut threads = Vec::new();
+    let mut threads = Vec::with_capacity(NUM_THREADS);
     const NUM_THREADS: usize = 4;
     let num_ops = count / NUM_THREADS;
-    let mut num_ops_per_thread = Vec::new();
+    let mut num_ops_per_thread = Vec::with_capacity(NUM_THREADS);
     for _ in 0..(NUM_THREADS - 1) {
         num_ops_per_thread.push(num_ops);
     }

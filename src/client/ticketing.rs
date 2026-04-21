@@ -65,7 +65,7 @@ impl SubmissionTicketQueue {
         let ids: Vec<_> = (starting_id..starting_id + size as u64)
             .map(SubmissionTicketId)
             .collect();
-        let wakers = vec![];
+        let wakers = Vec::with_capacity(1024);
         let state = SubmissionTicketQueueState { ids, wakers };
         Self {
             capacity: size,
@@ -83,7 +83,7 @@ impl SubmissionTicketQueue {
     /// Panics if the total number of tickets exceeds numeric bounds.
     pub(crate) fn new_multiple(sizes: &[usize]) -> Vec<Self> {
         let mut starting_id = 0u64;
-        let mut queues = Vec::new();
+        let mut queues = Vec::with_capacity(sizes.len());
         for size in sizes {
             queues.push(Self::new(*size, starting_id));
             starting_id += *size as u64;

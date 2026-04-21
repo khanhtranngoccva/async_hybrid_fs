@@ -18,7 +18,7 @@ pub fn generate_default_client_shards() -> Vec<Client> {
     let num_shards = available_parallelism()
         .unwrap_or(NonZero::new(8usize).unwrap())
         .get();
-    let mut clients = Vec::new();
+    let mut clients = Vec::with_capacity(num_shards);
     for _ in 0..num_shards {
         clients.push(Client::build(UringCfg::default()).expect("failed to build client"));
     }
