@@ -30,7 +30,7 @@ use parking_lot::{Condvar, Mutex};
 use super::PendingIoImpl;
 use crate::client::{
     ClientUring,
-    ticketing::{SubmissionTicket, SubmissionTicketId, SubmissionTicketQueue},
+    ticketing::{SubmissionTicket, SubmissionTicketQueue},
 };
 
 // New implementation of pending I/O, universally usable for all operations
@@ -40,7 +40,9 @@ use crate::client::{
 pub(crate) enum UringPendingIoStatus {
     // Not yet submitted. At this point, the operation has not yet received a submission ticket or appeared in the io_uring submission queue.
     NotSubmitted,
-    // Submitted. At this point, the operation has received a ticket and appeared in the io_uring submission queue. It may not yet be acknowledged by the kernel, so a flush via io_uring_enter must be called.
+    // Submitting. The operation has received a ticket, and is being staged in the submission thread without risking being indefinitely blocked. An operation will have to wait until it is in the Submitted state (registered by io_uring) to be cancellable.
+    Submitting,
+    // Submitted. At this point, the operation has received a ticket and is already acknowledged by the kernel.
     Submitted,
     // The operation's filler has received a value.
     Done,
@@ -51,12 +53,8 @@ pub(crate) enum UringPendingIoStatus {
 pub(crate) struct UringPendingIoState {
     /// The status of the operation.
     status: UringPendingIoStatus,
-    /// The submission ticket. It can only be removed when the operation is done and the filler is filled.
-    submission_ticket: Option<Arc<SubmissionTicket>>,
     /// Flag whether the cancellation has been triggered or not.
     cancel_triggered: bool,
-    /// The I/O entry to send to the actual io_uring queue. When a ticket is retrieved, the entry is assigned the ID corresponding to the ticket and submitted to the queue. Note that the ID should not be assigned yet.
-    entry: squeue::Entry,
     /// The waker, used as a condition variable for async code.
     waker: Waker,
     /// The result of the operation.
@@ -64,27 +62,22 @@ pub(crate) struct UringPendingIoState {
 }
 
 impl UringPendingIoState {
-    fn new(entry: squeue::Entry) -> Self {
+    fn new() -> Self {
         Self {
             status: UringPendingIoStatus::NotSubmitted,
-            submission_ticket: None,
             cancel_triggered: false,
-            entry: entry,
             waker: Waker::noop().clone(),
             result: None,
         }
     }
 
     /// Trigger the cancellation of the operation, and returns a cloned reference to the submission ticket to prevent the ticket from being available prematurely. The reaper still requires a reference to live here so that no operation can steal the ticket.
-    fn trigger_cancel(&mut self) -> Option<Arc<SubmissionTicket>> {
-        if self.status != UringPendingIoStatus::Submitted
-            || self.cancel_triggered
-            || self.submission_ticket.is_none()
-        {
-            return None;
+    fn trigger_cancel(&mut self) -> bool {
+        if self.status != UringPendingIoStatus::Submitted || self.cancel_triggered {
+            return false;
         }
         self.cancel_triggered = true;
-        self.submission_ticket.clone()
+        true
     }
 }
 
@@ -92,7 +85,11 @@ impl UringPendingIoState {
 pub(crate) struct UringPendingIoObj<'lifetime> {
     /// The state of the operation. Note that the lock should be held for as briefly as possible.
     state: Arc<Mutex<UringPendingIoState>>,
-    done_cv: Arc<Condvar>,
+    transition_cv: Arc<Condvar>,
+    /// The anonymous I/O entry to send to the actual io_uring queue. When a ticket is retrieved, a cloned entry is assigned the ID corresponding to the ticket and submitted to the queue. Note that the ID should not be assigned yet.
+    entry: squeue::Entry,
+    /// The submission ticket. It can only be removed when the operation is done and the filler is filled. When the ticket is acquired, the operation is sent to the submission thread.
+    submission_ticket: Option<Arc<SubmissionTicket>>,
     uring: &'lifetime ClientUring,
     ticket_queue: &'lifetime SubmissionTicketQueue,
 }
@@ -109,30 +106,100 @@ impl<'lifetime> UringPendingIoObj<'lifetime> {
             &uring.normal_submission_ticket_queue
         };
         Self {
-            state: Arc::new(Mutex::new(UringPendingIoState::new(entry))),
-            done_cv: Arc::new(Condvar::new()),
+            state: Arc::new(Mutex::new(UringPendingIoState::new())),
+            transition_cv: Arc::new(Condvar::new()),
+            entry,
+            submission_ticket: None,
             uring,
             ticket_queue,
         }
+    }
+
+    fn submitter(&self) -> UringPendingIoSubmitter {
+        UringPendingIoSubmitter {
+            state: self.state.clone(),
+            transition_cv: self.transition_cv.clone(),
+            entry: self.entry.clone(),
+            submission_ticket: self
+                .submission_ticket
+                .clone()
+                .expect("submission ticket should be assigned"),
+        }
+    }
+
+    fn filler(&self) -> UringPendingIoFiller {
+        UringPendingIoFiller {
+            state: self.state.clone(),
+            transition_cv: self.transition_cv.clone(),
+        }
+    }
+
+    fn submit(&mut self, ticket: Arc<SubmissionTicket>) -> () {
+        let ticket_id = ticket.id();
+        self.submission_ticket = Some(ticket);
+        let submitter = self.submitter();
+        let filler = self.filler();
+        // Insert the filler into the pending map.
+        let preexisting_key = self.uring.pending.insert(ticket_id, filler);
+        assert!(
+            preexisting_key.is_none(),
+            "ticket id {} already exists in pending map",
+            ticket_id.0
+        );
+        // Send the submitter to the submission thread.
+        self.uring
+            .submission_sender
+            .send(submitter)
+            .expect("submission thread should be running");
+    }
+}
+
+pub(crate) struct UringPendingIoSubmitter {
+    state: Arc<Mutex<UringPendingIoState>>,
+    submission_ticket: Arc<SubmissionTicket>,
+    transition_cv: Arc<Condvar>,
+    entry: squeue::Entry,
+}
+
+impl UringPendingIoSubmitter {
+    // Mark the operation as submitted.
+    pub(crate) fn mark_submitted(self) {
+        let mut state = self.state.lock();
+        // The completion thread may race and fill the result prematurely, then set the results to None.
+        if state.status == UringPendingIoStatus::Done {
+            return;
+        }
+        state.status = UringPendingIoStatus::Submitted;
+        // Notify the future or the blocking thread that the operation changed its state.
+        let waker = core::mem::replace(&mut state.waker, Waker::noop().clone());
+        waker.wake();
+        self.transition_cv.notify_all();
+    }
+
+    // Create an identified entry for the operation.
+    pub(crate) fn create_entry(&self) -> squeue::Entry {
+        let mut entry = self.entry.clone();
+        entry.set_user_data(self.submission_ticket.id().0);
+        entry
     }
 }
 
 /// Filler to be sent to the reaper thread for updating the state of the operation.
 pub(crate) struct UringPendingIoFiller {
     state: Arc<Mutex<UringPendingIoState>>,
-    done_cv: Arc<Condvar>,
+    transition_cv: Arc<Condvar>,
 }
 
 impl UringPendingIoFiller {
-    pub(crate) fn fill(self, result: io::Result<i32>) {
+    pub(crate) fn complete(self, result: io::Result<i32>) {
         let mut state = self.state.lock();
         state.status = UringPendingIoStatus::Done;
-        // Do not remove the ticket here to avoid blocking the reaper thread.
-        // state.submission_ticket.take();
         state.result = Some(result);
+        // We would like to remove the ticket, but it blocks the reaper thread.
+        // Notify the future or the blocking thread that the operation changed its state.
         let waker = core::mem::replace(&mut state.waker, Waker::noop().clone());
         waker.wake();
-        self.done_cv.notify_all();
+        self.transition_cv.notify_one();
     }
 }
 
@@ -141,7 +208,7 @@ impl<'lifetime> Debug for UringPendingIoObj<'lifetime> {
         let lock = self.state.lock();
         f.debug_struct("UringPendingIoObj")
             .field("status", &lock.status)
-            .field("submission_ticket", &lock.submission_ticket)
+            .field("submission_ticket", &self.submission_ticket)
             .finish()
     }
 }
@@ -157,89 +224,46 @@ impl<'lifetime> Future for UringPendingIoObj<'lifetime> {
         match state.status {
             UringPendingIoStatus::NotSubmitted => {
                 assert!(
-                    state.submission_ticket.is_none(),
+                    inner.submission_ticket.is_none(),
                     "submission ticket should not be assigned yet"
                 );
-                // Attempt to assign a ticket to the operation in a nonblocking manner.
+                // Attempt to assign a ticket to the operation in a nonblocking manner. As long as it has not received a ticket and entered the Submitting state yet, it can be trivially cancelled.
                 let ticket = inner.ticket_queue.poll_submission_ticket(cx);
-                let ticket_id = match ticket {
-                    Poll::Ready(ticket) => {
-                        let ticket_id = ticket.id();
-                        state.submission_ticket = Some(Arc::new(ticket));
-                        ticket_id
-                    }
+                let ticket = match ticket {
+                    Poll::Ready(ticket) => Arc::new(ticket),
                     Poll::Pending => {
                         return Poll::Pending;
                     }
                 };
+                state.status = UringPendingIoStatus::Submitting;
                 state.waker.clone_from(&cx.waker());
-                submit_operation(
-                    inner.uring,
-                    &mut state,
-                    inner.state.clone(),
-                    inner.done_cv.clone(),
-                    ticket_id,
-                );
+                drop(state);
+                inner.submit(ticket);
+                Poll::Pending
+            }
+            UringPendingIoStatus::Submitting => {
+                state.waker.clone_from(&cx.waker());
                 Poll::Pending
             }
             UringPendingIoStatus::Submitted => {
-                // Update the waker just in case, the operation is not done yet.
                 state.waker.clone_from(&cx.waker());
                 Poll::Pending
             }
             UringPendingIoStatus::Done => {
+                let res = state
+                    .result
+                    .take()
+                    .expect("result should be Some - future should not be polled multiple times");
                 // The operation is done, remove the ticket and return the result.
-                state.submission_ticket.take();
-                Poll::Ready(
-                    state.result.take().expect(
-                        "result should be Some - future should not be polled multiple times",
-                    ),
-                )
+                inner.submission_ticket.take();
+                Poll::Ready(res)
             }
         }
     }
 }
 
-fn submit_operation(
-    uring: &ClientUring,
-    state: &mut UringPendingIoState,
-    state_arc: Arc<Mutex<UringPendingIoState>>,
-    done_cv_arc: Arc<Condvar>,
-    ticket_id: SubmissionTicketId,
-) {
-    state.entry.set_user_data(ticket_id.0);
-    state.status = UringPendingIoStatus::Submitted;
-    // Insert the filler into the pending map.
-    let preexisting_key = uring.pending.insert(
-        ticket_id,
-        UringPendingIoFiller {
-            state: state_arc,
-            done_cv: done_cv_arc,
-        },
-    );
-    assert!(
-        preexisting_key.is_none(),
-        "ticket id {} already exists in pending map",
-        ticket_id.0
-    );
-    // Submit the operation to the io_uring submission queue
-    uring.with_submission_queue(|mut submission| {
-        unsafe { submission.push(&state.entry) }.expect("submission queue should always have enough space for the number of requests indicated by ticket count");
-        submission.sync();
-    });
-    // This allows the reaper thread to proceed and avoid the blocking syscalls (which is harder to control).
-    uring
-        .completion_ticket_submitter
-        .grant_completion_tickets(1);
-}
-
 /// Cancel a pending operation using the borrowed submission ticket.
 fn cancel_operation(uring: &ClientUring, ticket: &SubmissionTicket) -> () {
-    // In the hot path, we let the reaper initiate I/O to decrease latency. However, this may lead to the entry not yet acknowledged by the kernel, so we have to flush it first.
-    uring
-        .uring
-        .submit()
-        .expect("failed to flush operations to kernel");
     let entry = io_uring::opcode::AsyncCancel::new(ticket.id().0).build();
     // Create the cancellation operation.
     let mut cancel_obj = UringPendingIoObj::new(uring, entry);
@@ -270,26 +294,23 @@ impl<'lifetime> UringPendingIoObj<'lifetime> {
         loop {
             match state.status {
                 UringPendingIoStatus::NotSubmitted => {
-                    assert!(
-                        state.submission_ticket.is_none(),
-                        "submission ticket should not be assigned yet"
-                    );
                     // Blocking call here is OK - the reaper thread cannot see the operation yet.
-                    let ticket = self.ticket_queue.request_submission_ticket();
-                    submit_operation(
-                        self.uring,
-                        &mut state,
-                        self.state.clone(),
-                        self.done_cv.clone(),
-                        ticket.id(),
-                    );
+                    let ticket = Arc::new(self.ticket_queue.request_submission_ticket());
+                    state.status = UringPendingIoStatus::Submitting;
+                    drop(state);
+                    // Temporarily release the lock to submit the operation - we can do that because the status is marked.
+                    self.submit(ticket);
+                    state = self.state.lock();
+                    continue;
                 }
-                UringPendingIoStatus::Submitted => {
-                    self.done_cv.wait(&mut state);
+                UringPendingIoStatus::Submitted | UringPendingIoStatus::Submitting => {
+                    self.transition_cv.wait(&mut state);
                 }
                 UringPendingIoStatus::Done => {
-                    state.submission_ticket.take();
-                    return state.result.take();
+                    let res = state.result.take();
+                    drop(state);
+                    self.submission_ticket.take();
+                    return res;
                 }
             }
         }
@@ -298,27 +319,29 @@ impl<'lifetime> UringPendingIoObj<'lifetime> {
     pub(crate) fn cancel_inner(&mut self) -> CancelResult {
         let mut state = self.state.lock();
         match state.status {
-            // The operation is not submitted yet, so we can do nothing.
+            // The operation is not submitted yet, so we have to do nothing.
             UringPendingIoStatus::NotSubmitted => {
-                assert!(
-                    state.submission_ticket.is_none(),
-                    "submission ticket should not be assigned yet"
-                );
                 return CancelResult::WaitDone(None);
+            }
+            // The operation is submitting, so we have to wait for it to be submitted, only after that the SQE is cancellable.
+            UringPendingIoStatus::Submitting => {
+                self.transition_cv.wait(&mut state);
             }
             UringPendingIoStatus::Submitted => {}
             UringPendingIoStatus::Done => {
                 // Must remove the submission ticket here because the operation may be polled midway,
                 // marked as done, and then reach this point with a ticket.
-                state.submission_ticket.take();
-                return CancelResult::WaitDone(state.result.take());
+                let result = state.result.take();
+                drop(state);
+                self.submission_ticket.take();
+                return CancelResult::WaitDone(result);
             }
         };
-        // When submitted, the ticket must have been acquired and the operation must have already been in the submission queue.
-        let ticket = state.trigger_cancel();
+        // When submitted, the ticket must have been acquired and the operation must have already been acknowledged.
+        let cancellable = state.trigger_cancel();
         // Reaper thread may not block.
         drop(state);
-        if let Some(ticket) = ticket {
+        if cancellable && let Some(ticket) = self.submission_ticket.clone() {
             cancel_operation(self.uring, &ticket);
         }
         CancelResult::WaitNeeded

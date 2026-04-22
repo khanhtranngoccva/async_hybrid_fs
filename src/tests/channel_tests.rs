@@ -7,7 +7,7 @@ use std::{
 use dashmap::DashMap;
 
 use crate::client::ticketing::{
-    SubmissionTicket, SubmissionTicketId, SubmissionTicketQueue, completion_ticket_pair,
+    SubmissionTicket, SubmissionTicketId, SubmissionTicketQueue, permit_pair,
 };
 // The request pipeline currently consists of 5 channels/barriers, which consumes extra time if they block:
 // - A crossbeam channel for the caller to submit commands to the backpressure queues.
@@ -83,7 +83,7 @@ async fn test_architecture_blocking_latency() {
     let (submission_tx, submission_rx) =
         crossbeam_channel::unbounded::<(Instant, tokio::sync::oneshot::Sender<Instant>)>();
     // This channel signals the completion queue.
-    let (completion_ticket_submitter, completion_ticket_queue) = completion_ticket_pair();
+    let (completion_ticket_submitter, completion_ticket_queue) = permit_pair();
     // This channel simulates the io_uring processor.
     let (completion_tx, completion_rx) = crossbeam_channel::bounded::<SubmissionTicketId>(16384);
     let queue = Arc::new(SubmissionTicketQueue::new_multiple(&[16384]).pop().unwrap());
@@ -93,7 +93,7 @@ async fn test_architecture_blocking_latency() {
         let mapping = mapping.clone();
         move || {
             loop {
-                let count = completion_ticket_queue.request_completion_tickets();
+                let count = completion_ticket_queue.request_permits();
                 let count = match count {
                     None => break,
                     Some(count) => count,
@@ -119,7 +119,7 @@ async fn test_architecture_blocking_latency() {
             let ticket = queue.request_submission_ticket();
             let ticket_id = ticket.id();
             mapping.insert(ticket_id, (msg.0, msg.1, ticket));
-            completion_ticket_submitter.grant_completion_tickets(1);
+            completion_ticket_submitter.grant_permits(1);
             completion_tx.send(ticket_id).unwrap();
         }
     });

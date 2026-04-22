@@ -39,5 +39,5 @@ pub(crate) fn handle_completion(filler: UringPendingIoFiller, result: i32) {
     } else {
         Ok(result)
     };
-    filler.fill(result);
+    filler.complete(result);
 }

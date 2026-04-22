@@ -10,11 +10,16 @@ pub(crate) struct SubmissionTicketId(pub(crate) u64);
 
 /// A submission ticket represents a permit to submit an operation to the io_uring submission queue, acting as a backpressure mechanism to prevent having to block using `io_uring_enter`.
 /// The ticket must be held for the duration of the operation, as when it is dropped, the ticket is returned to the submission queue. Since it is used as the user_data field for cancelling, it must not be given to outside code until the kernel has acknowledged the operation.
-#[derive(Debug)]
 pub(crate) struct SubmissionTicket {
     id: SubmissionTicketId,
     state: Arc<Mutex<SubmissionTicketQueueState>>,
     condvar: Arc<Condvar>,
+}
+
+impl std::fmt::Debug for SubmissionTicket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SubmissionTicket {{ id: {:?} }}", self.id.0)
+    }
 }
 
 impl SubmissionTicket {
@@ -126,71 +131,70 @@ impl SubmissionTicketQueue {
 }
 
 #[derive(Debug)]
-struct CompletionTicketState {
-    completion_tickets: usize,
+struct PermitState {
+    permits: usize,
     dropped: bool,
 }
 
 #[derive(Debug)]
-pub(crate) struct CompletionTicketSubmitter {
-    completion_tickets: Arc<Mutex<CompletionTicketState>>,
+pub(crate) struct PermitSubmitter {
+    permit_state: Arc<Mutex<PermitState>>,
     condvar: Arc<Condvar>,
 }
 
-impl CompletionTicketSubmitter {
-    pub(crate) fn grant_completion_tickets(&self, count: usize) {
-        let mut completion_ticket_state = self.completion_tickets.lock().unwrap();
-        completion_ticket_state.completion_tickets += count;
+impl PermitSubmitter {
+    pub(crate) fn grant_permits(&self, count: usize) {
+        let mut permit_state = self.permit_state.lock().unwrap();
+        permit_state.permits += count;
         self.condvar.notify_all();
     }
 }
 
-impl Drop for CompletionTicketSubmitter {
+impl Drop for PermitSubmitter {
     fn drop(&mut self) {
-        let mut completion_ticket_state = self.completion_tickets.lock().unwrap();
-        completion_ticket_state.dropped = true;
+        let mut permit_state = self.permit_state.lock().unwrap();
+        permit_state.dropped = true;
         self.condvar.notify_all();
     }
 }
 
 /// A queue of completion tickets.
 #[derive(Debug)]
-pub(crate) struct CompletionTicketQueue {
-    completion_tickets: Arc<Mutex<CompletionTicketState>>,
+pub(crate) struct PermitQueue {
+    permit_state: Arc<Mutex<PermitState>>,
     condvar: Arc<Condvar>,
 }
 
-impl CompletionTicketQueue {
-    /// Request one or more completion tickets.
-    /// One completion ticket grants one permit to perform a blocking read using io_uring_enter.
-    /// If `None` is returned, the completion queue is empty, the caller can exit immediately.
-    pub(crate) fn request_completion_tickets(&self) -> Option<usize> {
-        let mut completion_tickets_guard = self.completion_tickets.lock().unwrap();
-        while completion_tickets_guard.completion_tickets == 0 {
-            if completion_tickets_guard.dropped {
+impl PermitQueue {
+    /// Request one or more permits.
+    /// If `None` is returned, the permits are empty, the caller can exit immediately.
+    pub(crate) fn request_permits(&self) -> Option<usize> {
+        let mut permit_state_guard = self.permit_state.lock().unwrap();
+        while permit_state_guard.permits == 0 {
+            if permit_state_guard.dropped {
                 return None;
             }
-            completion_tickets_guard = self.condvar.wait(completion_tickets_guard).unwrap();
+            permit_state_guard = self.condvar.wait(permit_state_guard).unwrap();
         }
-        let take_count = completion_tickets_guard.completion_tickets.min(1048576);
-        completion_tickets_guard.completion_tickets -= take_count;
+        let take_count = permit_state_guard.permits.min(1048576);
+        permit_state_guard.permits -= take_count;
         Some(take_count)
     }
 }
 
-pub(crate) fn completion_ticket_pair() -> (CompletionTicketSubmitter, CompletionTicketQueue) {
-    let completion_tickets = Arc::new(Mutex::new(CompletionTicketState {
-        completion_tickets: 0,
+pub(crate) fn permit_pair() -> (PermitSubmitter, PermitQueue) {
+    let permit_state = Arc::new(Mutex::new(PermitState {
+        permits: 0,
         dropped: false,
     }));
     let condvar = Arc::new(Condvar::new());
     (
-        CompletionTicketSubmitter {
-            completion_tickets: completion_tickets.clone(),
+        PermitSubmitter {
+            permit_state: permit_state.clone(),
             condvar: condvar.clone(),
         },
-        CompletionTicketQueue {
-            completion_tickets,
+        PermitQueue {
+            permit_state,
             condvar,
         },
     )
