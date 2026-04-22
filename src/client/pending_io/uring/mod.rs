@@ -165,7 +165,7 @@ impl UringPendingIoSubmitter {
     // Mark the operation as submitted.
     pub(crate) fn mark_submitted(self) {
         let mut state = self.state.lock();
-        // The completion thread may race and fill the result prematurely, then set the results to None.
+        // The completion thread may race and fill the result prematurely, then we should do nothing.
         if state.status == UringPendingIoStatus::Done {
             return;
         }
