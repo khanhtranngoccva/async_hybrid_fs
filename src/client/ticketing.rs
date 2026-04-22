@@ -8,6 +8,14 @@ use std::{
 #[repr(transparent)]
 pub(crate) struct SubmissionTicketId(pub(crate) u64);
 
+impl SubmissionTicketId {
+    pub(crate) const POISON: Self = Self(u64::MAX);
+
+    pub(crate) fn is_poison(&self) -> bool {
+        *self == Self::POISON
+    }
+}
+
 /// A submission ticket represents a permit to submit an operation to the io_uring submission queue, acting as a backpressure mechanism to prevent having to block using `io_uring_enter`.
 /// The ticket must be held for the duration of the operation, as when it is dropped, the ticket is returned to the submission queue. Since it is used as the user_data field for cancelling, it must not be given to outside code until the kernel has acknowledged the operation.
 pub(crate) struct SubmissionTicket {
@@ -30,6 +38,9 @@ impl SubmissionTicket {
 
 impl Drop for SubmissionTicket {
     fn drop(&mut self) {
+        if self.id.is_poison() {
+            return;
+        }
         let mut tickets = self.state.lock().unwrap();
         tickets.ids.push(self.id.clone());
         tickets.wake_all();
@@ -95,6 +106,15 @@ impl SubmissionTicketQueue {
             starting_id += *size as u64;
         }
         queues
+    }
+
+    /// Create a poison submission ticket.
+    pub(crate) fn poison_ticket(&self) -> SubmissionTicket {
+        SubmissionTicket {
+            id: SubmissionTicketId::POISON,
+            state: self.state.clone(),
+            condvar: self.condvar.clone(),
+        }
     }
 
     /// Request a submission ticket. If the queue is empty, the caller will block until a ticket is available.

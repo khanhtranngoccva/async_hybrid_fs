@@ -22,7 +22,9 @@ pub use register::RegisterError;
 pub use register::RegisteredFile;
 pub use requests::Target;
 
-use crate::client::pending_io::uring::{UringPendingIoFiller, UringPendingIoSubmitter};
+use crate::client::pending_io::uring::{
+    UringPendingIoFiller, UringPendingIoObj, UringPendingIoSubmitter,
+};
 use crate::client::ticketing::{PermitQueue, PermitSubmitter, SubmissionTicketId};
 
 /// Maximum length for a single io_uring read/write operation.
@@ -57,7 +59,8 @@ impl Drop for Client {
         // Remove the uring instance, then join the threads.
         let uring = self.uring.take();
         if let Some(uring) = uring {
-            // Drop the completion ticket submitter to stop the completion thread.
+            // Create a poison pill to end the completion thread. Since all pending I/O operations are borrowed and properly waited when dropped, the poison pill is only submitted when no more operations are pending.
+            let _ = UringPendingIoObj::poison(&uring).wait();
             drop(uring.submission_sender);
             drop(uring.uring);
             uring.sthread.join().expect("uring_sthread join failed");
@@ -163,8 +166,6 @@ impl Client {
         let ring = {
             #[cfg(target_os = "linux")]
             let mut builder = IoUring::<SEntry, CEntry>::builder();
-            // Clamp is not used here to ensure that the submission queue is not smaller than the requested size.
-            // If there is a problem, .
             if cfg.coop_taskrun {
                 builder.setup_coop_taskrun();
             };
@@ -177,6 +178,7 @@ impl Client {
             if let Some(sqpoll) = cfg.sqpoll {
                 builder.setup_sqpoll(sqpoll);
             };
+            builder.setup_clamp();
             match builder.build(expected_total_squeue_size) {
                 Ok(uring) => Some(uring),
                 Err(_) if cfg.allow_fallback => None,
@@ -196,7 +198,8 @@ impl Client {
         if let Some(mut ring) = ring {
             // Pre-allocate sparse file table for registration (Linux 5.12+). If this fails, file registration won't work but unregistered fds will still function.
             let _ = ring.submitter().register_files_sparse(MAX_REGISTERED_FILES);
-            let actual_total_squeue_size = ring.submission().capacity();
+            // Limit squeue to usize::MAX - 1 to avoid conflict with the poison submission ticket (u64::MAX).
+            let actual_total_squeue_size = ring.submission().capacity().min(usize::MAX - 1);
             // Investigate the submission queue size.
             let (op_ticket_queue_size, cancel_ticket_queue_size) = if actual_total_squeue_size
                 >= expected_total_squeue_size as usize
@@ -252,7 +255,7 @@ impl Client {
             let cthread = thread::spawn({
                 let pending = pending_map.clone();
                 let ring = ring.clone();
-                move || completion_thread(ring, pending, completion_ticket_queue)
+                move || completion_thread(ring, pending)
             });
             let mut probe = io_uring::Probe::new();
             ring.submitter().register_probe(&mut probe)?;
@@ -302,8 +305,8 @@ fn submission_thread(
         ring.submitter()
             .submit()
             .expect("failed to perform batch submit");
-        let entry_count = queue.len();
-        permit_submitter.grant_permits(entry_count);
+        // let entry_count = queue.len();
+        // permit_submitter.grant_permits(entry_count);
         for entry in queue.drain(..) {
             entry.mark_submitted();
         }
@@ -314,43 +317,28 @@ fn submission_thread(
 fn completion_thread(
     ring: Arc<IoUring>,
     pending: Arc<DashMap<SubmissionTicketId, UringPendingIoFiller>>,
-    queue: PermitQueue,
 ) {
     let mut completion = unsafe { ring.completion_shared() };
     // This flag marks that the submission thread has terminated and we should drain all remaining operations in the pending map until it is empty.
-    let mut submission_thread_terminated = false;
+    // let mut submission_thread_terminated = false;
     loop {
-        if submission_thread_terminated && pending.is_empty() {
-            break;
-        }
-        let mut wait_permits = 1usize;
-        if !submission_thread_terminated {
-            let res = queue.request_permits();
-            match res {
-                Some(count) => wait_permits = count,
-                None => {
-                    submission_thread_terminated = true;
-                    continue;
-                }
-            }
-        }
-        for _ in 0..wait_permits {
-            // Blocking and looping with io_uring_enter is OK now, since the submission thread permits a wait.
-            let e = loop {
-                let Some(entry) = completion.next() else {
-                    ring.submitter()
-                        .submit_and_wait(1)
-                        .expect("failed to wait for completion");
-                    completion.sync();
-                    continue;
-                };
-                break entry;
+        let e = loop {
+            let Some(entry) = completion.next() else {
+                ring.submitter()
+                    .submit_and_wait(1)
+                    .expect("failed to wait for completion");
+                completion.sync();
+                continue;
             };
-            let id = SubmissionTicketId(e.user_data());
-            let (_, req) = pending
-                .remove(&id)
-                .expect("completion for unknown request id");
-            completion::handle_completion(req, e.result());
+            break entry;
+        };
+        let id = SubmissionTicketId(e.user_data());
+        let (_, req) = pending
+            .remove(&id)
+            .expect("completion for unknown request id");
+        completion::handle_completion(req, e.result());
+        if id.is_poison() {
+            break;
         }
     }
 }

@@ -115,6 +115,22 @@ impl<'lifetime> UringPendingIoObj<'lifetime> {
         }
     }
 
+    pub(crate) fn poison(uring: &'lifetime ClientUring) -> Self {
+        let entry = io_uring::opcode::Nop::new()
+            .build()
+            .flags(squeue::Flags::IO_DRAIN);
+        Self {
+            state: Arc::new(Mutex::new(UringPendingIoState::new())),
+            transition_cv: Arc::new(Condvar::new()),
+            entry: entry,
+            submission_ticket: Some(Arc::new(
+                uring.normal_submission_ticket_queue.poison_ticket(),
+            )),
+            uring,
+            ticket_queue: &uring.normal_submission_ticket_queue,
+        }
+    }
+
     fn submitter(&self) -> UringPendingIoSubmitter {
         UringPendingIoSubmitter {
             state: self.state.clone(),
@@ -227,13 +243,16 @@ impl<'lifetime> Future for UringPendingIoObj<'lifetime> {
                     inner.submission_ticket.is_none(),
                     "submission ticket should not be assigned yet"
                 );
-                // Attempt to assign a ticket to the operation in a nonblocking manner. As long as it has not received a ticket and entered the Submitting state yet, it can be trivially cancelled.
-                let ticket = inner.ticket_queue.poll_submission_ticket(cx);
-                let ticket = match ticket {
-                    Poll::Ready(ticket) => Arc::new(ticket),
-                    Poll::Pending => {
-                        return Poll::Pending;
-                    }
+                let ticket = match inner.submission_ticket.clone() {
+                    // This branch allows ticket overrides
+                    Some(t) => t,
+                    // Attempt to assign a ticket to the operation in a nonblocking manner. As long as it has not received a ticket and entered the Submitting state yet, it can be trivially cancelled.
+                    None => match inner.ticket_queue.poll_submission_ticket(cx) {
+                        Poll::Ready(ticket) => Arc::new(ticket),
+                        Poll::Pending => {
+                            return Poll::Pending;
+                        }
+                    },
                 };
                 state.status = UringPendingIoStatus::Submitting;
                 state.waker.clone_from(&cx.waker());
@@ -294,8 +313,12 @@ impl<'lifetime> UringPendingIoObj<'lifetime> {
         loop {
             match state.status {
                 UringPendingIoStatus::NotSubmitted => {
-                    // Blocking call here is OK - the reaper thread cannot see the operation yet.
-                    let ticket = Arc::new(self.ticket_queue.request_submission_ticket());
+                    let ticket = match self.submission_ticket.clone() {
+                        // The operation may use overridden tickets.
+                        Some(t) => t,
+                        // Blocking call here is OK - the reaper thread cannot see the operation yet.
+                        None => Arc::new(self.ticket_queue.request_submission_ticket()),
+                    };
                     state.status = UringPendingIoStatus::Submitting;
                     drop(state);
                     // Temporarily release the lock to submit the operation - we can do that because the status is marked.
