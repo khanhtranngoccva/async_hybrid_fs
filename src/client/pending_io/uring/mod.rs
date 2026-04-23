@@ -30,7 +30,7 @@ use parking_lot::{Condvar, Mutex};
 use super::PendingIoImpl;
 use crate::client::{
     ClientUring,
-    ticketing::{SubmissionTicket, SubmissionTicketQueue},
+    ticketing::{SubmissionTicket, SubmissionTicketId, SubmissionTicketQueue},
 };
 
 // New implementation of pending I/O, universally usable for all operations
@@ -94,6 +94,7 @@ pub(crate) struct UringPendingIoObj<'lifetime> {
     ticket_queue: &'lifetime SubmissionTicketQueue,
 }
 
+#[hotpath::measure_all]
 impl<'lifetime> UringPendingIoObj<'lifetime> {
     pub(crate) fn new(uring: &'lifetime ClientUring, entry: squeue::Entry) -> Self {
         let opcode = entry.get_opcode();
@@ -150,23 +151,30 @@ impl<'lifetime> UringPendingIoObj<'lifetime> {
         }
     }
 
-    fn submit(&mut self, ticket: Arc<SubmissionTicket>) -> () {
-        let ticket_id = ticket.id();
-        self.submission_ticket = Some(ticket);
-        let submitter = self.submitter();
-        let filler = self.filler();
-        // Insert the filler into the pending map.
+    fn send(&self, submitter: UringPendingIoSubmitter) -> () {
+        self.uring
+            .submission_sender
+            .send(submitter)
+            .expect("submission thread should be running");
+    }
+
+    fn insert_filler(&self, ticket_id: SubmissionTicketId, filler: UringPendingIoFiller) -> () {
         let preexisting_key = self.uring.pending.insert(ticket_id, filler);
         assert!(
             preexisting_key.is_none(),
             "ticket id {} already exists in pending map",
             ticket_id.0
         );
+    }
+
+    fn submit(&mut self, ticket: Arc<SubmissionTicket>) -> () {
+        let ticket_id = ticket.id();
+        self.submission_ticket = Some(ticket);
+        let filler = self.filler();
+        self.insert_filler(ticket_id, filler);
+        let submitter = self.submitter();
         // Send the submitter to the submission thread.
-        self.uring
-            .submission_sender
-            .send(submitter)
-            .expect("submission thread should be running");
+        self.send(submitter);
     }
 }
 
@@ -177,6 +185,7 @@ pub(crate) struct UringPendingIoSubmitter {
     entry: squeue::Entry,
 }
 
+#[hotpath::measure_all]
 impl UringPendingIoSubmitter {
     // Mark the operation as submitted.
     pub(crate) fn mark_submitted(self) {
@@ -206,6 +215,7 @@ pub(crate) struct UringPendingIoFiller {
     transition_cv: Arc<Condvar>,
 }
 
+#[hotpath::measure_all]
 impl UringPendingIoFiller {
     pub(crate) fn complete(self, result: io::Result<i32>) {
         let mut state = self.state.lock();
@@ -230,6 +240,7 @@ impl<'lifetime> Debug for UringPendingIoObj<'lifetime> {
 }
 
 /// Async version of the operation.
+#[hotpath::measure_all]
 impl<'lifetime> Future for UringPendingIoObj<'lifetime> {
     type Output = Result<i32, io::Error>;
 
@@ -274,7 +285,9 @@ impl<'lifetime> Future for UringPendingIoObj<'lifetime> {
                     .take()
                     .expect("result should be Some - future should not be polled multiple times");
                 // The operation is done, remove the ticket and return the result.
-                inner.submission_ticket.take();
+                if let Some(ticket) = inner.submission_ticket.take() {
+                    // let _ = inner.uring.ticket_dropper.send(ticket);
+                }
                 Poll::Ready(res)
             }
         }
@@ -332,7 +345,10 @@ impl<'lifetime> UringPendingIoObj<'lifetime> {
                 UringPendingIoStatus::Done => {
                     let res = state.result.take();
                     drop(state);
-                    self.submission_ticket.take();
+                    // Performance optimization: drop the ticket in a delayed thread.
+                    if let Some(ticket) = self.submission_ticket.take() {
+                        // let _ = self.uring.ticket_dropper.send(ticket);
+                    }
                     return res;
                 }
             }
@@ -356,7 +372,9 @@ impl<'lifetime> UringPendingIoObj<'lifetime> {
                 // marked as done, and then reach this point with a ticket.
                 let result = state.result.take();
                 drop(state);
-                self.submission_ticket.take();
+                if let Some(ticket) = self.submission_ticket.take() {
+                    // let _ = self.uring.ticket_dropper.send(ticket);
+                }
                 return CancelResult::WaitDone(result);
             }
         };

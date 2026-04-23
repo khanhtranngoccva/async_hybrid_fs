@@ -2,3 +2,4 @@
 *.svg
 perf.data
 perf.data.*
+profile.json.gz

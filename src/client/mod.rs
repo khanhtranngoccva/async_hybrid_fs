@@ -7,8 +7,8 @@ pub(crate) mod ticketing;
 
 use std::collections::VecDeque;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32};
-use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::{io, thread};
 use ticketing::SubmissionTicketQueue;
@@ -25,7 +25,7 @@ pub use requests::Target;
 use crate::client::pending_io::uring::{
     UringPendingIoFiller, UringPendingIoObj, UringPendingIoSubmitter,
 };
-use crate::client::ticketing::{PermitQueue, PermitSubmitter, SubmissionTicketId};
+use crate::client::ticketing::{SubmissionTicket, SubmissionTicketId};
 
 /// Maximum length for a single io_uring read/write operation.
 ///
@@ -40,15 +40,16 @@ pub struct Client {
 }
 
 pub(crate) struct ClientUring {
-    submission_lock: Mutex<()>,
     normal_submission_ticket_queue: SubmissionTicketQueue,
     cancel_submission_ticket_queue: SubmissionTicketQueue,
     submission_sender: crossbeam_channel::Sender<UringPendingIoSubmitter>,
+    ticket_dropper: crossbeam_channel::Sender<Arc<SubmissionTicket>>,
     pending: Arc<DashMap<SubmissionTicketId, UringPendingIoFiller>>,
     uring: Arc<IoUring>,
     probe: io_uring::Probe,
     sthread: JoinHandle<()>,
     cthread: JoinHandle<()>,
+    ticket_dropper_thread: JoinHandle<()>,
     registered_files: Arc<DashSet<u32>>,
     next_file_slot: Arc<AtomicU32>,
     identity: Arc<()>,
@@ -62,9 +63,14 @@ impl Drop for Client {
             // Create a poison pill to end the completion thread. Since all pending I/O operations are borrowed and properly waited when dropped, the poison pill is only submitted when no more operations are pending.
             let _ = UringPendingIoObj::poison(&uring).wait();
             drop(uring.submission_sender);
+            drop(uring.ticket_dropper);
             drop(uring.uring);
             uring.sthread.join().expect("uring_sthread join failed");
             uring.cthread.join().expect("uring_cthread join failed");
+            uring
+                .ticket_dropper_thread
+                .join()
+                .expect("uring_ticket_dropper_thread join failed");
         }
     }
 }
@@ -240,31 +246,42 @@ impl Client {
                 op_ticket_queue_size,
                 cancel_ticket_queue_size,
             ]);
-            let submission_lock = Mutex::new(());
             let cancel_submission_ticket_queue = ticket_queues.pop().unwrap();
             let normal_submission_ticket_queue = ticket_queues.pop().unwrap();
             let (submission_sender, submission_receiver) =
-                crossbeam_channel::bounded::<UringPendingIoSubmitter>(op_ticket_queue_size);
-            let (completion_ticket_submitter, completion_ticket_queue) = ticketing::permit_pair();
+                crossbeam_channel::bounded::<UringPendingIoSubmitter>(actual_total_squeue_size);
+            let (ticket_dropper, ticket_dropper_receiver) =
+                crossbeam_channel::unbounded::<Arc<SubmissionTicket>>();
             let pending_map = Arc::new(DashMap::new());
             let ring = Arc::new(ring);
-            let sthread = thread::spawn({
-                let ring = ring.clone();
-                move || submission_thread(ring, submission_receiver, completion_ticket_submitter)
-            });
-            let cthread = thread::spawn({
-                let pending = pending_map.clone();
-                let ring = ring.clone();
-                move || completion_thread(ring, pending)
-            });
+            let sthread = std::thread::Builder::new()
+                .name(String::from("ahfs_worker"))
+                .spawn({
+                    let ring = ring.clone();
+                    move || submission_thread(ring, submission_receiver)
+                })
+                .expect("should spawn thread");
+            let cthread = std::thread::Builder::new()
+                .name(String::from("ahfs_worker"))
+                .spawn({
+                    let pending = pending_map.clone();
+                    let ring = ring.clone();
+                    move || completion_thread(ring, pending)
+                })
+                .expect("should spawn thread");
+            let ticket_dropper_thread = std::thread::Builder::new()
+                .name(String::from("ahfs_worker"))
+                .spawn(move || ticket_dropper_thread(ticket_dropper_receiver))
+                .expect("should spawn thread");
             let mut probe = io_uring::Probe::new();
             ring.submitter().register_probe(&mut probe)?;
             client.uring = Some(ClientUring {
                 normal_submission_ticket_queue: normal_submission_ticket_queue,
                 cancel_submission_ticket_queue: cancel_submission_ticket_queue,
-                submission_lock: submission_lock,
                 pending: pending_map,
                 submission_sender: submission_sender,
+                ticket_dropper: ticket_dropper,
+                ticket_dropper_thread: ticket_dropper_thread,
                 uring: ring,
                 probe: probe,
                 sthread,
@@ -282,31 +299,32 @@ impl Client {
 fn submission_thread(
     ring: Arc<IoUring>,
     receiver: crossbeam_channel::Receiver<UringPendingIoSubmitter>,
-    permit_submitter: PermitSubmitter,
 ) {
     let mut submission = unsafe { ring.submission_shared() };
     let capacity = submission.capacity();
     let mut queue = VecDeque::with_capacity(capacity);
     loop {
-        let Ok(item) = receiver.recv() else {
-            break;
+        let item = match receiver.recv() {
+            Ok(item) => item,
+            Err(crossbeam_channel::RecvError) => break,
         };
         queue.push_back(item);
         queue.extend(receiver.try_iter().take(capacity - 1));
         for submitter in queue.iter() {
             let entry = submitter.create_entry();
-            unsafe {
-                submission
-                    .push(&entry)
-                    .expect("failed to push entry to submission queue")
-            };
+            loop {
+                if let Err(_) = unsafe { submission.push(&entry) } {
+                    // We need to synchronize the head and tail before retrying because it is stale. However, we do not need to block because poison requests only work when nothing is running, and the queues restrict the number of active tickets.
+                    submission.sync();
+                    continue;
+                }
+                break;
+            }
         }
         submission.sync();
         ring.submitter()
             .submit()
             .expect("failed to perform batch submit");
-        // let entry_count = queue.len();
-        // permit_submitter.grant_permits(entry_count);
         for entry in queue.drain(..) {
             entry.mark_submitted();
         }
@@ -340,6 +358,21 @@ fn completion_thread(
         if id.is_poison() {
             break;
         }
+    }
+}
+
+/// Thread for asynchronously dropping submission tickets, allowing the future object to not stall at drop.
+fn ticket_dropper_thread(ticket_dropper: crossbeam_channel::Receiver<Arc<SubmissionTicket>>) {
+    let batch_size = 1024;
+    let mut batch = VecDeque::with_capacity(batch_size);
+    loop {
+        let Ok(ticket) = ticket_dropper.recv() else {
+            break;
+        };
+        batch.push_back(ticket);
+        batch.extend(ticket_dropper.try_iter().take(batch_size - 1));
+        // The drop happens after this call.
+        batch.drain(..);
     }
 }
 

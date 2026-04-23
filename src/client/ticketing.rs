@@ -179,12 +179,14 @@ impl Drop for PermitSubmitter {
 }
 
 /// A queue of completion tickets.
+#[allow(unused)]
 #[derive(Debug)]
 pub(crate) struct PermitQueue {
     permit_state: Arc<Mutex<PermitState>>,
     condvar: Arc<Condvar>,
 }
 
+#[allow(unused)]
 impl PermitQueue {
     /// Request one or more permits.
     /// If `None` is returned, the permits are empty, the caller can exit immediately.
@@ -202,6 +204,7 @@ impl PermitQueue {
     }
 }
 
+#[allow(unused)]
 pub(crate) fn permit_pair() -> (PermitSubmitter, PermitQueue) {
     let permit_state = Arc::new(Mutex::new(PermitState {
         permits: 0,

@@ -2,7 +2,7 @@ use crate::{
     PendingIo, Target,
     borrowed_buf::BorrowedBuf,
     client::{
-        Client, ClientUring, URING_LEN_MAX, UringTarget,
+        Client, URING_LEN_MAX, UringTarget,
         completion::{ReadResult, ReadvResult, WriteResult, WritevResult},
         pending_io::{
             fallback::TokioScopedPendingIo,
@@ -23,7 +23,7 @@ use crate::{
     metadata::{Metadata, MknodType, Permissions},
 };
 use core::fmt;
-use io_uring::{SubmissionQueue, opcode};
+use io_uring::opcode;
 use nix::{
     fcntl::{AtFlags, FallocateFlags, FcntlArg, FdFlag, OFlag, PosixFadviseAdvice, RenameFlags},
     sys::{
@@ -41,17 +41,6 @@ use std::{
     sync::atomic::Ordering,
     u32, u64,
 };
-
-impl ClientUring {
-    pub(crate) fn with_submission_queue<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce(SubmissionQueue<'_>) -> R,
-    {
-        let _submission_lock = self.submission_lock.lock().unwrap();
-        let submission = unsafe { self.uring.submission_shared() };
-        f(submission)
-    }
-}
 
 impl Client {
     const AT_FDCWD: BorrowedFd<'static> = unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) };
