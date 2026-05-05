@@ -1,8 +1,8 @@
 use parking_lot::{Condvar, Mutex};
 use std::{
-    collections::VecDeque,
+    pin::Pin,
     sync::Arc,
-    task::{Context, Poll, Waker},
+    task::{Context, Poll},
 };
 
 /// The submission ticket ID, which may be used as the user_data field/entry ID.
@@ -22,8 +22,7 @@ impl SubmissionTicketId {
 /// The ticket must be held for the duration of the operation, as when it is dropped, the ticket is returned to the submission queue. Since it is used as the user_data field for cancelling, it must not be given to outside code until the kernel has acknowledged the operation.
 pub(crate) struct SubmissionTicket {
     id: SubmissionTicketId,
-    state: Arc<Mutex<SubmissionTicketQueueState>>,
-    condvar: Arc<Condvar>,
+    id_tx: crossfire::MTx<crossfire::mpmc::Array<SubmissionTicketId>>,
 }
 
 impl std::fmt::Debug for SubmissionTicket {
@@ -43,23 +42,8 @@ impl Drop for SubmissionTicket {
         if self.id.is_poison() {
             return;
         }
-        let mut tickets = self.state.lock();
-        tickets.ids.push_back(self.id);
-        let wakers: VecDeque<_> = tickets.wakers.drain(..).collect();
-        drop(tickets);
-        for waker in wakers {
-            waker.wake();
-        }
-        self.condvar.notify_one();
+        let _ = self.id_tx.send(self.id);
     }
-}
-
-#[derive(Debug)]
-struct SubmissionTicketQueueState {
-    /// Internal IDs to assign.
-    ids: VecDeque<SubmissionTicketId>,
-    /// Asynchronous wakers to notify when a ticket is available.
-    wakers: VecDeque<Waker>,
 }
 
 /// A queue of submission tickets.
@@ -67,23 +51,27 @@ struct SubmissionTicketQueueState {
 pub(crate) struct SubmissionTicketQueue {
     /// Original capacity of the queue.
     capacity: usize,
-    /// Inner state of the queue.
-    state: Arc<Mutex<SubmissionTicketQueueState>>,
-    /// Condvar for notifying that a ticket is available.
-    condvar: Arc<Condvar>,
+    id_tx: crossfire::MTx<crossfire::mpmc::Array<SubmissionTicketId>>,
+    id_async_rx: crossfire::MAsyncRx<crossfire::mpmc::Array<SubmissionTicketId>>,
+    id_rx: crossfire::MRx<crossfire::mpmc::Array<SubmissionTicketId>>,
+    // /// Inner state of the queue.
+    // state: Arc<Mutex<SubmissionTicketQueueState>>,
+    // /// Condvar for notifying that a ticket is available.
+    // condvar: Arc<Condvar>,
 }
 
 impl SubmissionTicketQueue {
     fn new(size: usize, starting_id: u64) -> Self {
-        let ids: VecDeque<_> = (starting_id..starting_id + size as u64)
-            .map(SubmissionTicketId)
-            .collect();
-        let wakers = VecDeque::with_capacity(1024);
-        let state = SubmissionTicketQueueState { ids, wakers };
+        let (id_tx, id_async_rx) = crossfire::mpmc::bounded_blocking_async(size);
+        let id_rx = id_async_rx.clone().into_blocking();
+        for i in starting_id..starting_id + size as u64 {
+            id_tx.send(SubmissionTicketId(i)).unwrap();
+        }
         Self {
             capacity: size,
-            state: Arc::new(Mutex::new(state)),
-            condvar: Arc::new(Condvar::new()),
+            id_tx,
+            id_async_rx,
+            id_rx,
         }
     }
 
@@ -109,22 +97,16 @@ impl SubmissionTicketQueue {
     pub(crate) fn poison_ticket(&self) -> SubmissionTicket {
         SubmissionTicket {
             id: SubmissionTicketId::POISON,
-            state: self.state.clone(),
-            condvar: self.condvar.clone(),
+            id_tx: self.id_tx.clone(),
         }
     }
 
     /// Request a submission ticket. If the queue is empty, the caller will block until a ticket is available.
     pub(crate) fn request_submission_ticket(&self) -> SubmissionTicket {
-        let mut state = self.state.lock();
-        while state.ids.is_empty() {
-            self.condvar.wait(&mut state);
-        }
-        let id = state.ids.pop_front().unwrap();
+        let id = self.id_rx.recv().unwrap();
         SubmissionTicket {
             id,
-            state: self.state.clone(),
-            condvar: self.condvar.clone(),
+            id_tx: self.id_tx.clone(),
         }
     }
 
@@ -133,17 +115,17 @@ impl SubmissionTicketQueue {
         &self,
         context: &mut Context<'_>,
     ) -> Poll<SubmissionTicket> {
-        let mut state = self.state.lock();
-        if state.ids.is_empty() {
-            state.wakers.push_back(context.waker().clone());
-            return Poll::Pending;
+        let mut recv_future = self.id_async_rx.recv();
+        match Pin::new(&mut recv_future).poll(context) {
+            Poll::Ready(Ok(id)) => Poll::Ready(SubmissionTicket {
+                id,
+                id_tx: self.id_tx.clone(),
+            }),
+            Poll::Ready(Err(e)) => {
+                panic!("failed to receive submission ticket: {:?}", e);
+            }
+            Poll::Pending => Poll::Pending,
         }
-        let id = state.ids.pop_front().unwrap();
-        Poll::Ready(SubmissionTicket {
-            id,
-            state: self.state.clone(),
-            condvar: self.condvar.clone(),
-        })
     }
 }
 
