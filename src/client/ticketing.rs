@@ -1,5 +1,6 @@
 use parking_lot::{Condvar, Mutex};
 use std::{
+    collections::VecDeque,
     sync::Arc,
     task::{Context, Poll, Waker},
 };
@@ -43,8 +44,8 @@ impl Drop for SubmissionTicket {
             return;
         }
         let mut tickets = self.state.lock();
-        tickets.ids.push(self.id);
-        let wakers: Vec<_> = tickets.wakers.drain(..).collect();
+        tickets.ids.push_back(self.id);
+        let wakers: VecDeque<_> = tickets.wakers.drain(..).collect();
         drop(tickets);
         for waker in wakers {
             waker.wake();
@@ -56,9 +57,9 @@ impl Drop for SubmissionTicket {
 #[derive(Debug)]
 struct SubmissionTicketQueueState {
     /// Internal IDs to assign.
-    ids: Vec<SubmissionTicketId>,
+    ids: VecDeque<SubmissionTicketId>,
     /// Asynchronous wakers to notify when a ticket is available.
-    wakers: Vec<Waker>,
+    wakers: VecDeque<Waker>,
 }
 
 /// A queue of submission tickets.
@@ -74,10 +75,10 @@ pub(crate) struct SubmissionTicketQueue {
 
 impl SubmissionTicketQueue {
     fn new(size: usize, starting_id: u64) -> Self {
-        let ids: Vec<_> = (starting_id..starting_id + size as u64)
+        let ids: VecDeque<_> = (starting_id..starting_id + size as u64)
             .map(SubmissionTicketId)
             .collect();
-        let wakers = Vec::with_capacity(1024);
+        let wakers = VecDeque::with_capacity(1024);
         let state = SubmissionTicketQueueState { ids, wakers };
         Self {
             capacity: size,
@@ -119,7 +120,7 @@ impl SubmissionTicketQueue {
         while state.ids.is_empty() {
             self.condvar.wait(&mut state);
         }
-        let id = state.ids.pop().unwrap();
+        let id = state.ids.pop_front().unwrap();
         SubmissionTicket {
             id,
             state: self.state.clone(),
@@ -134,10 +135,10 @@ impl SubmissionTicketQueue {
     ) -> Poll<SubmissionTicket> {
         let mut state = self.state.lock();
         if state.ids.is_empty() {
-            state.wakers.push(context.waker().clone());
+            state.wakers.push_back(context.waker().clone());
             return Poll::Pending;
         }
-        let id = state.ids.pop().unwrap();
+        let id = state.ids.pop_front().unwrap();
         Poll::Ready(SubmissionTicket {
             id,
             state: self.state.clone(),
