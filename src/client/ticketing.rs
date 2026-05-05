@@ -1,5 +1,6 @@
+use parking_lot::{Condvar, Mutex};
 use std::{
-    sync::{Arc, Condvar, Mutex},
+    sync::Arc,
     task::{Context, Poll, Waker},
 };
 
@@ -41,7 +42,7 @@ impl Drop for SubmissionTicket {
         if self.id.is_poison() {
             return;
         }
-        let mut tickets = self.state.lock().unwrap();
+        let mut tickets = self.state.lock();
         tickets.ids.push(self.id.clone());
         tickets.wake_all();
         self.condvar.notify_one();
@@ -119,9 +120,9 @@ impl SubmissionTicketQueue {
 
     /// Request a submission ticket. If the queue is empty, the caller will block until a ticket is available.
     pub(crate) fn request_submission_ticket(&self) -> SubmissionTicket {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         while state.ids.is_empty() {
-            state = self.condvar.wait(state).unwrap();
+            self.condvar.wait(&mut state);
         }
         let id = state.ids.pop().unwrap();
         SubmissionTicket {
@@ -136,7 +137,7 @@ impl SubmissionTicketQueue {
         &self,
         context: &mut Context<'_>,
     ) -> Poll<SubmissionTicket> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         if state.ids.is_empty() {
             state.wakers.push(context.waker().clone());
             return Poll::Pending;
@@ -164,7 +165,7 @@ pub(crate) struct PermitSubmitter {
 
 impl PermitSubmitter {
     pub(crate) fn grant_permits(&self, count: usize) {
-        let mut permit_state = self.permit_state.lock().unwrap();
+        let mut permit_state = self.permit_state.lock();
         permit_state.permits += count;
         self.condvar.notify_all();
     }
@@ -172,7 +173,7 @@ impl PermitSubmitter {
 
 impl Drop for PermitSubmitter {
     fn drop(&mut self) {
-        let mut permit_state = self.permit_state.lock().unwrap();
+        let mut permit_state = self.permit_state.lock();
         permit_state.dropped = true;
         self.condvar.notify_all();
     }
@@ -191,12 +192,12 @@ impl PermitQueue {
     /// Request one or more permits.
     /// If `None` is returned, the permits are empty, the caller can exit immediately.
     pub(crate) fn request_permits(&self) -> Option<usize> {
-        let mut permit_state_guard = self.permit_state.lock().unwrap();
+        let mut permit_state_guard = self.permit_state.lock();
         while permit_state_guard.permits == 0 {
             if permit_state_guard.dropped {
                 return None;
             }
-            permit_state_guard = self.condvar.wait(permit_state_guard).unwrap();
+            self.condvar.wait(&mut permit_state_guard);
         }
         let take_count = permit_state_guard.permits.min(1048576);
         permit_state_guard.permits -= take_count;

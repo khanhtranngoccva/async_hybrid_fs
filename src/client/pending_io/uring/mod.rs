@@ -195,9 +195,7 @@ impl UringPendingIoSubmitter {
             return;
         }
         state.status = UringPendingIoStatus::Submitted;
-        // Notify the future or the blocking thread that the operation changed its state.
-        let waker = core::mem::replace(&mut state.waker, Waker::noop().clone());
-        waker.wake();
+        // We only need to notify any threads that deals with cancels.
         self.transition_cv.notify_all();
     }
 
