@@ -195,6 +195,7 @@ impl UringPendingIoSubmitter {
             return;
         }
         state.status = UringPendingIoStatus::Submitted;
+        drop(state);
         // We only need to notify any threads that deals with cancels.
         self.transition_cv.notify_all();
     }
@@ -222,6 +223,7 @@ impl UringPendingIoFiller {
         // We would like to remove the ticket, but it blocks the reaper thread.
         // Notify the future or the blocking thread that the operation changed its state.
         let waker = core::mem::replace(&mut state.waker, Waker::noop().clone());
+        drop(state);
         waker.wake();
         self.transition_cv.notify_one();
     }
