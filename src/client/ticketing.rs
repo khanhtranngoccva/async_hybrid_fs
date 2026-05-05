@@ -33,7 +33,7 @@ impl std::fmt::Debug for SubmissionTicket {
 
 impl SubmissionTicket {
     pub(crate) fn id(&self) -> SubmissionTicketId {
-        self.id.clone()
+        self.id
     }
 }
 
@@ -43,8 +43,12 @@ impl Drop for SubmissionTicket {
             return;
         }
         let mut tickets = self.state.lock();
-        tickets.ids.push(self.id.clone());
-        tickets.wake_all();
+        tickets.ids.push(self.id);
+        let wakers: Vec<_> = tickets.wakers.drain(..).collect();
+        drop(tickets);
+        for waker in wakers {
+            waker.wake();
+        }
         self.condvar.notify_one();
     }
 }
@@ -55,15 +59,6 @@ struct SubmissionTicketQueueState {
     ids: Vec<SubmissionTicketId>,
     /// Asynchronous wakers to notify when a ticket is available.
     wakers: Vec<Waker>,
-}
-
-impl SubmissionTicketQueueState {
-    // Some tasks may not poll (cancelled) so we may miss updates. Therefore, we have to notify all wakers. It might be better to simply use oneshot channels instead
-    fn wake_all(&mut self) {
-        for waker in self.wakers.drain(..) {
-            waker.wake();
-        }
-    }
 }
 
 /// A queue of submission tickets.
