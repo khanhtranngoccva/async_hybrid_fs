@@ -9,6 +9,7 @@ use nix::{
 use std::{
     io,
     path::{Path, PathBuf},
+    pin::Pin,
 };
 use tokio::fs::File;
 
@@ -301,8 +302,8 @@ pub fn create_dir(path: impl AsRef<Path>) -> PendingIo<'static, io::Result<()>> 
     default::default_client().create_dir(path)
 }
 
-pub async fn create_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
-    default::default_client().create_dir_all(path).await
+pub fn create_dir_all(path: impl AsRef<Path>) -> impl Future<Output = io::Result<()>> + Send {
+    default::default_client().create_dir_all(path)
 }
 
 pub fn create_dir_with_permissions(

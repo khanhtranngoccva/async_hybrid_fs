@@ -1539,84 +1539,92 @@ impl Client {
 
     /// Standard library compatible method for ensuring that a directory exists by creating it and all missing parent directories,
     /// equivalent to [`std::fs::create_dir_all`].
-    pub async fn create_dir_all(&self, path: impl AsRef<Path>) -> io::Result<()> {
-        let path = path.as_ref();
-        if path == Path::new("") {
-            return Ok(());
-        }
-
-        match self
-            .create_dir(path)
-            .completion()
-            .expect("no completion")
-            .await
-        {
-            Ok(()) => return Ok(()),
-            Err(ref e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(_) if path.is_dir() => return Ok(()),
-            Err(e) => return Err(e),
-        }
-        match path.parent() {
-            Some(p) => Box::pin(self.create_dir_all(p)).await?,
-            None => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "failed to create whole tree",
-                ));
+    // Recursive future intentionally marked as Send to avoid weird error messages, copying paths are relatively cheap
+    pub fn create_dir_all(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> impl Future<Output = io::Result<()>> + Send {
+        let path = path.as_ref().to_owned();
+        async move {
+            if path == Path::new("") {
+                return Ok(());
             }
-        }
-        match self
-            .create_dir(path)
-            .completion()
-            .expect("no completion")
-            .await
-        {
-            Ok(()) => Ok(()),
-            Err(_) if path.is_dir() => Ok(()),
-            Err(e) => Err(e),
+
+            match self
+                .create_dir(&path)
+                .completion()
+                .expect("no completion")
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(ref e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(_) if path.is_dir() => return Ok(()),
+                Err(e) => return Err(e),
+            }
+            match path.parent() {
+                Some(parent) => Box::pin(self.create_dir_all(parent)).await?,
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        "failed to create whole tree",
+                    ));
+                }
+            }
+            match self
+                .create_dir(&path)
+                .completion()
+                .expect("no completion")
+                .await
+            {
+                Ok(()) => Ok(()),
+                Err(_) if path.is_dir() => Ok(()),
+                Err(e) => Err(e),
+            }
         }
     }
 
     /// Create a directory and all missing parent directories with the specified permissions.
-    pub async fn create_dir_all_with_permissions(
+    pub fn create_dir_all_with_permissions(
         &self,
         path: impl AsRef<Path>,
         permissions: Permissions,
-    ) -> io::Result<()> {
-        let path = path.as_ref();
-        if path == Path::new("") {
-            return Ok(());
-        }
-
-        match self
-            .mkdir(path, permissions)
-            .completion()
-            .expect("no completion")
-            .await
-        {
-            Ok(()) => return Ok(()),
-            Err(ref e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(_) if path.is_dir() => return Ok(()),
-            Err(e) => return Err(e),
-        }
-        match path.parent() {
-            Some(p) => Box::pin(self.create_dir_all_with_permissions(p, permissions)).await?,
-            None => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "failed to create whole tree",
-                ));
+    ) -> impl Future<Output = io::Result<()>> + Send {
+        let path = path.as_ref().to_owned();
+        async move {
+            if path == Path::new("") {
+                return Ok(());
             }
-        }
-        match self
-            .mkdir(path, permissions)
-            .completion()
-            .expect("no completion")
-            .await
-        {
-            Ok(()) => Ok(()),
-            Err(_) if path.is_dir() => Ok(()),
-            Err(e) => Err(e),
+
+            match self
+                .mkdir(&path, permissions)
+                .completion()
+                .expect("no completion")
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(ref e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(_) if path.is_dir() => return Ok(()),
+                Err(e) => return Err(e),
+            }
+            match path.parent() {
+                Some(parent) => Box::pin(self.create_dir_all_with_permissions(&parent, permissions)).await?,
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        "failed to create whole tree",
+                    ));
+                }
+            }
+            match self
+                .mkdir(&path, permissions)
+                .completion()
+                .expect("no completion")
+                .await
+            {
+                Ok(()) => Ok(()),
+                Err(_) if path.is_dir() => Ok(()),
+                Err(e) => Err(e),
+            }
         }
     }
 
