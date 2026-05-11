@@ -186,3 +186,12 @@ async fn test_hybrid_read_write_vectored() {
         .unwrap();
     assert_eq!(&buffer[..bytes_read], b"Hello, world!");
 }
+
+#[tokio::test]
+async fn test_create_dir_all() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    crate::fs::create_dir_all(temp_dir.path().join("test").join("test2"))
+        .await
+        .unwrap();
+    assert!(temp_dir.path().join("test").join("test2").is_dir());
+}

@@ -302,7 +302,9 @@ pub fn create_dir(path: impl AsRef<Path>) -> PendingIo<'static, io::Result<()>> 
     default::default_client().create_dir(path)
 }
 
-pub fn create_dir_all(path: impl AsRef<Path>) -> impl Future<Output = io::Result<()>> + Send {
+pub fn create_dir_all(
+    path: impl AsRef<Path>,
+) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send>> {
     default::default_client().create_dir_all(path)
 }
 
@@ -313,13 +315,11 @@ pub fn create_dir_with_permissions(
     default::default_client().mkdir(path, permissions)
 }
 
-pub async fn create_dir_all_with_permissions(
+pub fn create_dir_all_with_permissions(
     path: impl AsRef<Path>,
     permissions: Permissions,
-) -> io::Result<()> {
-    default::default_client()
-        .create_dir_all_with_permissions(path, permissions)
-        .await
+) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send>> {
+    default::default_client().create_dir_all_with_permissions(path, permissions)
 }
 
 pub fn create_node(
@@ -421,7 +421,7 @@ async fn remove_dir_all_recursive(path: &Path) -> io::Result<()> {
                 }
             }
             Ok(_) => match client
-                .unlink(&child.path())
+                .unlink(child.path())
                 .completion()
                 .expect("no completion future returned")
                 .await

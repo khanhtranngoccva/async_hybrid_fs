@@ -38,6 +38,7 @@ use std::{
     mem::MaybeUninit,
     os::fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd},
     path::{Path, PathBuf},
+    pin::Pin,
     sync::atomic::Ordering,
     u32, u64,
 };
@@ -1540,12 +1541,12 @@ impl Client {
     /// Standard library compatible method for ensuring that a directory exists by creating it and all missing parent directories,
     /// equivalent to [`std::fs::create_dir_all`].
     // Recursive future intentionally marked as Send to avoid weird error messages, copying paths are relatively cheap
-    pub fn create_dir_all(
-        &self,
+    pub fn create_dir_all<'a>(
+        &'a self,
         path: impl AsRef<Path>,
-    ) -> impl Future<Output = io::Result<()>> + Send {
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'a>> {
         let path = path.as_ref().to_owned();
-        async move {
+        Box::pin(async move {
             if path == Path::new("") {
                 return Ok(());
             }
@@ -1562,7 +1563,7 @@ impl Client {
                 Err(e) => return Err(e),
             }
             match path.parent() {
-                Some(parent) => Box::pin(self.create_dir_all(parent)).await?,
+                Some(parent) => self.create_dir_all(parent).await?,
                 None => {
                     return Err(io::Error::new(
                         io::ErrorKind::Other,
@@ -1580,17 +1581,17 @@ impl Client {
                 Err(_) if path.is_dir() => Ok(()),
                 Err(e) => Err(e),
             }
-        }
+        })
     }
 
     /// Create a directory and all missing parent directories with the specified permissions.
-    pub fn create_dir_all_with_permissions(
-        &self,
+    pub fn create_dir_all_with_permissions<'a>(
+        &'a self,
         path: impl AsRef<Path>,
         permissions: Permissions,
-    ) -> impl Future<Output = io::Result<()>> + Send {
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'a>> {
         let path = path.as_ref().to_owned();
-        async move {
+        Box::pin(async move {
             if path == Path::new("") {
                 return Ok(());
             }
@@ -1607,7 +1608,10 @@ impl Client {
                 Err(e) => return Err(e),
             }
             match path.parent() {
-                Some(parent) => Box::pin(self.create_dir_all_with_permissions(&parent, permissions)).await?,
+                Some(parent) => {
+                    self.create_dir_all_with_permissions(&parent, permissions)
+                        .await?
+                }
                 None => {
                     return Err(io::Error::new(
                         io::ErrorKind::Other,
@@ -1625,7 +1629,7 @@ impl Client {
                 Err(_) if path.is_dir() => Ok(()),
                 Err(e) => Err(e),
             }
-        }
+        })
     }
 
     /// Create a symbolic link relative to a directory fd. This is the io_uring equivalent of `symlinkat(2)`.
