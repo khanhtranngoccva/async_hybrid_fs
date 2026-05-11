@@ -107,7 +107,7 @@ where
             path,
             flags,
             completion_state: Some(CompletionState {
-                statx_buf: statx_buf,
+                statx_buf,
                 raw: UringPendingIoObj::new(
                     uring,
                     io_uring::opcode::Statx::new(

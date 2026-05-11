@@ -44,7 +44,7 @@ where
     }
 }
 
-impl<'req, 'inner_pending, 'lifetime, Processor, In, Out> Unpin
+impl<'req, 'inner_pending, Processor, In, Out> Unpin
     for Completion<'req, 'inner_pending, Processor, In, Out>
 where
     Processor: FnOnce(In) -> Out + Send,
@@ -53,7 +53,7 @@ where
 {
 }
 
-impl<'req, 'inner_pending, 'lifetime, Processor, In, Out> Drop
+impl<'req, 'inner_pending, Processor, In, Out> Drop
     for Completion<'req, 'inner_pending, Processor, In, Out>
 where
     Processor: FnOnce(In) -> Out + Send,

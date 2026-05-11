@@ -40,7 +40,6 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     sync::atomic::Ordering,
-    u32, u64,
 };
 
 impl Client {
@@ -63,7 +62,11 @@ impl Client {
         self.uring_enabled.store(enabled, Ordering::Relaxed);
     }
 
-    /// Obtain a raw target object for use in mutable operations, which bypasses mutable checks.
+    /// Obtain a raw target object for use in mutable operations.
+    ///
+    /// # Safety
+    /// This method bypasses the borrow checker's restrictions.
+    /// You must ensure that the file descriptor and index remains valid (e.g. by keeping the original object).
     pub unsafe fn to_target(&self, target: &(impl UringTarget + ?Sized)) -> Target {
         match &self.uring {
             None => Target::Fd(target.as_file_descriptor().as_raw_fd()),
@@ -154,12 +157,10 @@ impl Client {
             Ok(_) => self
                 .read_into_at(file, buf, offset)
                 .map(|result| result.map(|result| result.bytes_read)),
-            Err(_) => {
-                return PendingIo::new(FixedValuePendingIo::new(Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "len exceeds u32::MAX",
-                ))));
-            }
+            Err(_) => PendingIo::new(FixedValuePendingIo::new(Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "len exceeds u32::MAX",
+            )))),
         }
     }
 
@@ -294,10 +295,10 @@ impl Client {
     }
 
     /// Standard-library compatible method for reading from a file at the specified offset using a zero-copy buffer, ensuring that the entire buffer is filled.
-    pub async fn read_exact_at<'buf>(
+    pub async fn read_exact_at(
         &self,
         file: &(impl UringTarget + Sync + ?Sized),
-        mut buf: &'buf mut [u8],
+        mut buf: &mut [u8],
         offset: impl TryInto<u64>,
     ) -> io::Result<()> {
         let mut offset: u64 = offset
@@ -405,10 +406,10 @@ impl Client {
     }
 
     /// Standard library compatible method for reading from a file into a vector.
-    pub async fn read_to_end<'buf>(
+    pub async fn read_to_end(
         &self,
         file: &mut (impl UringTarget + Sync + Send + ?Sized),
-        buf: &'buf mut Vec<u8>,
+        buf: &mut Vec<u8>,
     ) -> io::Result<usize> {
         const DEFAULT_BUF_SIZE: usize = 8 * 1024;
 
@@ -565,19 +566,19 @@ impl Client {
     }
 
     /// Standard library compatible method for reading from a file into a string.
-    pub async fn read_to_string<'buf>(
+    pub async fn read_to_string(
         &self,
         file: &mut (impl UringTarget + Sync + Send + ?Sized),
-        str: &'buf mut String,
+        str: &mut String,
     ) -> io::Result<usize> {
         unsafe { helpers::append_to_string(str, async |b| self.read_to_end(file, b).await) }.await
     }
 
     /// Standard library compatible method for reading exactly the number of bytes required to fill the buffer.
-    pub async fn read_exact<'buf>(
+    pub async fn read_exact(
         &self,
         file: &mut (impl UringTarget + Sync + Send + ?Sized),
-        mut buf: &'buf mut [u8],
+        mut buf: &mut [u8],
     ) -> io::Result<()> {
         while !buf.is_empty() {
             let res = self
@@ -640,7 +641,7 @@ impl Client {
                 move || -> io::Result<WriteResult<B>> {
                     let res = nix::sys::uio::pwrite(
                         file.as_file_descriptor(),
-                        &buf.as_slice(),
+                        buf.as_slice(),
                         offset as i64,
                     )?;
                     Ok(WriteResult {
@@ -726,10 +727,7 @@ impl Client {
             }
         }
         self.write_from_at(file, buf, offset)
-            .map(|result| match result {
-                Ok(result) => Ok(result.bytes_written),
-                Err(e) => return Err(e),
-            })
+            .map(|result| result.map(|result| result.bytes_written))
     }
 
     /// Standard library compatible method for writing multiple buffers to a file at the specified offset.
@@ -748,10 +746,10 @@ impl Client {
     }
 
     /// Standard library compatible method for writing an entire buffer to a file using a zero-copy buffer and an offset.
-    pub async fn write_all_at<'buf>(
+    pub async fn write_all_at(
         &self,
         file: &(impl UringTarget + Sync + ?Sized),
-        mut buf: &'buf [u8],
+        mut buf: &[u8],
         offset: impl TryInto<u64>,
     ) -> io::Result<()> {
         let mut offset: u64 = offset
@@ -798,7 +796,7 @@ impl Client {
             PendingIo::new(TokioScopedPendingIo::new(
                 move || -> io::Result<WriteResult<B>> {
                     let bytes_written =
-                        nix::unistd::write(file.as_file_descriptor(), &buf.as_slice())?;
+                        nix::unistd::write(file.as_file_descriptor(), buf.as_slice())?;
                     Ok(WriteResult { buf, bytes_written })
                 },
             ))
@@ -1193,7 +1191,7 @@ impl Client {
                     file.as_file_descriptor(),
                     offset as i64,
                     len as i64,
-                    advice.into(),
+                    advice,
                 )?;
                 Ok(())
             }))
@@ -1417,9 +1415,9 @@ impl Client {
             let new_path_owned = new_path.as_ref().to_owned();
             PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
                 nix::fcntl::renameat2(
-                    &old_dir_fd.as_file_descriptor(),
+                    old_dir_fd.as_file_descriptor(),
                     &old_path_owned,
-                    &new_dir_fd.as_file_descriptor(),
+                    new_dir_fd.as_file_descriptor(),
                     &new_path_owned,
                     flags,
                 )?;
@@ -1466,7 +1464,7 @@ impl Client {
         } else {
             let path_owned = path.as_ref().to_owned();
             PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
-                nix::unistd::unlinkat(&dir_fd.as_file_descriptor(), &path_owned, flags)?;
+                nix::unistd::unlinkat(dir_fd.as_file_descriptor(), &path_owned, flags)?;
                 Ok(())
             }))
         }
@@ -1515,7 +1513,7 @@ impl Client {
             let path_owned = path.as_ref().to_owned();
             PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
                 nix::sys::stat::mkdirat(
-                    &dir_fd.as_file_descriptor(),
+                    dir_fd.as_file_descriptor(),
                     &path_owned,
                     Mode::from_bits_retain(permissions.mode()),
                 )?;
@@ -1565,10 +1563,7 @@ impl Client {
             match path.parent() {
                 Some(parent) => self.create_dir_all(parent).await?,
                 None => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        "failed to create whole tree",
-                    ));
+                    return Err(io::Error::other("failed to create whole tree"));
                 }
             }
             match self
@@ -1609,14 +1604,11 @@ impl Client {
             }
             match path.parent() {
                 Some(parent) => {
-                    self.create_dir_all_with_permissions(&parent, permissions)
+                    self.create_dir_all_with_permissions(parent, permissions)
                         .await?
                 }
                 None => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        "failed to create whole tree",
-                    ));
+                    return Err(io::Error::other("failed to create whole tree"));
                 }
             }
             match self
@@ -2053,7 +2045,7 @@ impl Client {
         fd: &'a (impl UringTarget + Sync + ?Sized),
     ) -> PendingIo<'a, io::Result<OFlag>> {
         self.fcntl(fd, FcntlArg::F_GETFL)
-            .map(|r| r.map(|flags| OFlag::from_bits_retain(flags)))
+            .map(|r| r.map(OFlag::from_bits_retain))
     }
 
     /// Set the descriptor flags of a file descriptor, which is equivalent to `F_SETFD(2)`.
@@ -2072,7 +2064,7 @@ impl Client {
         fd: &'a (impl UringTarget + Sync + ?Sized),
     ) -> PendingIo<'a, io::Result<FdFlag>> {
         self.fcntl(fd, FcntlArg::F_GETFD)
-            .map(|r| r.map(|flags| FdFlag::from_bits_retain(flags)))
+            .map(|r| r.map(FdFlag::from_bits_retain))
     }
 
     /// Set the nonblocking status flag of a file descriptor.

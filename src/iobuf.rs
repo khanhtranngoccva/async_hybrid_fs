@@ -39,7 +39,7 @@ pub unsafe trait IoBuf: Send {
         self.len() == 0
     }
     /// Returns a slice of the buffer with its original lifetime.
-    fn as_slice<'a>(&'a self) -> &'a [u8] {
+    fn as_slice(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.as_ptr(), self.len()) }
     }
 }
@@ -57,7 +57,7 @@ pub unsafe trait IoBufMut: Send {
     /// Returns the buffer's total capacity (maximum bytes that can be read into it).
     fn capacity(&self) -> usize;
     /// Returns a slice of the buffer including the uninitialized part. This can be cast back to a raw slice.
-    fn as_mut_slice_with_uninit<'a>(&'a mut self) -> &'a mut [MaybeUninit<u8>] {
+    fn as_mut_slice_with_uninit(&mut self) -> &mut [MaybeUninit<u8>] {
         unsafe {
             std::slice::from_raw_parts_mut(
                 self.as_mut_ptr() as *mut MaybeUninit<u8>,
@@ -66,6 +66,10 @@ pub unsafe trait IoBufMut: Send {
         }
     }
     /// Sets the length of the buffer. If the reported capacity is more than the length of the original buffer, underlying algorithms will try to fill with bytes past the original length, so this method must be implemented.
+    ///
+    /// # Safety
+    /// As long as capacity() is correctly reported, the implementors always call this method correctly.
+    /// Avoid calling this method manually.
     unsafe fn set_len(&mut self, len: usize);
 }
 

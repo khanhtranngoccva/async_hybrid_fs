@@ -116,7 +116,7 @@ where
             bufs.iter_mut()
                 .map(|buf| libc::iovec {
                     iov_base: buf.as_ptr() as *mut libc::c_void,
-                    iov_len: buf.len().into(),
+                    iov_len: buf.len(),
                 })
                 .collect::<Vec<_>>(),
         ));

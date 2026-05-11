@@ -100,7 +100,7 @@ pub struct OwnedRegisteredFile {
 }
 
 impl OwnedRegisteredFile {
-    fn _cleanup(&mut self) -> () {
+    fn _cleanup(&mut self) {
         let _ = self
             ._uring
             .submitter()
@@ -165,7 +165,7 @@ impl Client {
         let uring = self
             .uring
             .as_ref()
-            .ok_or_else(|| RegisterError::IoUringNotSupported)?;
+            .ok_or(RegisterError::IoUringNotSupported)?;
         // Cycle through the slots until we find an empty one.
         let index = loop {
             if uring.registered_files.len() > MAX_REGISTERED_FILES as usize {

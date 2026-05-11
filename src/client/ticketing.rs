@@ -1,7 +1,5 @@
-use parking_lot::{Condvar, Mutex};
 use std::{
     pin::Pin,
-    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -127,77 +125,4 @@ impl SubmissionTicketQueue {
             Poll::Pending => Poll::Pending,
         }
     }
-}
-
-#[derive(Debug)]
-struct PermitState {
-    permits: usize,
-    dropped: bool,
-}
-
-#[derive(Debug)]
-pub(crate) struct PermitSubmitter {
-    permit_state: Arc<Mutex<PermitState>>,
-    condvar: Arc<Condvar>,
-}
-
-impl PermitSubmitter {
-    pub(crate) fn grant_permits(&self, count: usize) {
-        let mut permit_state = self.permit_state.lock();
-        permit_state.permits += count;
-        self.condvar.notify_all();
-    }
-}
-
-impl Drop for PermitSubmitter {
-    fn drop(&mut self) {
-        let mut permit_state = self.permit_state.lock();
-        permit_state.dropped = true;
-        self.condvar.notify_all();
-    }
-}
-
-/// A queue of completion tickets.
-#[allow(unused)]
-#[derive(Debug)]
-pub(crate) struct PermitQueue {
-    permit_state: Arc<Mutex<PermitState>>,
-    condvar: Arc<Condvar>,
-}
-
-#[allow(unused)]
-impl PermitQueue {
-    /// Request one or more permits.
-    /// If `None` is returned, the permits are empty, the caller can exit immediately.
-    pub(crate) fn request_permits(&self) -> Option<usize> {
-        let mut permit_state_guard = self.permit_state.lock();
-        while permit_state_guard.permits == 0 {
-            if permit_state_guard.dropped {
-                return None;
-            }
-            self.condvar.wait(&mut permit_state_guard);
-        }
-        let take_count = permit_state_guard.permits.min(1048576);
-        permit_state_guard.permits -= take_count;
-        Some(take_count)
-    }
-}
-
-#[allow(unused)]
-pub(crate) fn permit_pair() -> (PermitSubmitter, PermitQueue) {
-    let permit_state = Arc::new(Mutex::new(PermitState {
-        permits: 0,
-        dropped: false,
-    }));
-    let condvar = Arc::new(Condvar::new());
-    (
-        PermitSubmitter {
-            permit_state: permit_state.clone(),
-            condvar: condvar.clone(),
-        },
-        PermitQueue {
-            permit_state,
-            condvar,
-        },
-    )
 }

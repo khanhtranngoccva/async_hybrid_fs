@@ -123,7 +123,7 @@ impl<'lifetime> UringPendingIoObj<'lifetime> {
         Self {
             state: Arc::new(Mutex::new(UringPendingIoState::new())),
             transition_cv: Arc::new(Condvar::new()),
-            entry: entry,
+            entry,
             submission_ticket: Some(Arc::new(
                 uring.normal_submission_ticket_queue.poison_ticket(),
             )),
@@ -151,14 +151,14 @@ impl<'lifetime> UringPendingIoObj<'lifetime> {
         }
     }
 
-    fn send(&self, submitter: UringPendingIoSubmitter) -> () {
+    fn send(&self, submitter: UringPendingIoSubmitter) {
         self.uring
             .submission_sender
             .send(submitter)
             .expect("submission thread should be running");
     }
 
-    fn insert_filler(&self, ticket_id: SubmissionTicketId, filler: UringPendingIoFiller) -> () {
+    fn insert_filler(&self, ticket_id: SubmissionTicketId, filler: UringPendingIoFiller) {
         let preexisting_key = self.uring.pending.insert(ticket_id, filler);
         assert!(
             preexisting_key.is_none(),
@@ -167,7 +167,7 @@ impl<'lifetime> UringPendingIoObj<'lifetime> {
         );
     }
 
-    fn submit(&mut self, ticket: Arc<SubmissionTicket>) -> () {
+    fn submit(&mut self, ticket: Arc<SubmissionTicket>) {
         let ticket_id = ticket.id();
         self.submission_ticket = Some(ticket);
         let filler = self.filler();
@@ -266,17 +266,17 @@ impl<'lifetime> Future for UringPendingIoObj<'lifetime> {
                     },
                 };
                 state.status = UringPendingIoStatus::Submitting;
-                state.waker.clone_from(&cx.waker());
+                state.waker.clone_from(cx.waker());
                 drop(state);
                 inner.submit(ticket);
                 Poll::Pending
             }
             UringPendingIoStatus::Submitting => {
-                state.waker.clone_from(&cx.waker());
+                state.waker.clone_from(cx.waker());
                 Poll::Pending
             }
             UringPendingIoStatus::Submitted => {
-                state.waker.clone_from(&cx.waker());
+                state.waker.clone_from(cx.waker());
                 Poll::Pending
             }
             UringPendingIoStatus::Done => {
@@ -285,9 +285,7 @@ impl<'lifetime> Future for UringPendingIoObj<'lifetime> {
                     .take()
                     .expect("result should be Some - future should not be polled multiple times");
                 // The operation is done, remove the ticket and return the result.
-                if let Some(ticket) = inner.submission_ticket.take() {
-                    // let _ = inner.uring.ticket_dropper.send(ticket);
-                }
+                inner.submission_ticket.take();
                 Poll::Ready(res)
             }
         }
@@ -295,7 +293,7 @@ impl<'lifetime> Future for UringPendingIoObj<'lifetime> {
 }
 
 /// Cancel a pending operation using the borrowed submission ticket.
-fn cancel_operation(uring: &ClientUring, ticket: &SubmissionTicket) -> () {
+fn cancel_operation(uring: &ClientUring, ticket: &SubmissionTicket) {
     let entry = io_uring::opcode::AsyncCancel::new(ticket.id().0).build();
     // Create the cancellation operation.
     let mut cancel_obj = UringPendingIoObj::new(uring, entry);
@@ -346,9 +344,7 @@ impl<'lifetime> UringPendingIoObj<'lifetime> {
                     let res = state.result.take();
                     drop(state);
                     // Performance optimization: drop the ticket in a delayed thread.
-                    if let Some(ticket) = self.submission_ticket.take() {
-                        // let _ = self.uring.ticket_dropper.send(ticket);
-                    }
+                    self.submission_ticket.take();
                     return res;
                 }
             }
@@ -372,9 +368,7 @@ impl<'lifetime> UringPendingIoObj<'lifetime> {
                 // marked as done, and then reach this point with a ticket.
                 let result = state.result.take();
                 drop(state);
-                if let Some(ticket) = self.submission_ticket.take() {
-                    // let _ = self.uring.ticket_dropper.send(ticket);
-                }
+                self.submission_ticket.take();
                 return CancelResult::WaitDone(result);
             }
         };
@@ -466,7 +460,7 @@ mod tests {
         Client, HybridFile, HybridRead, PendingIo, UringCfg,
         client::pending_io::uring::read_into::UringReadIntoAt, default_client,
     };
-    use std::{io::pipe, os::fd::AsFd, sync::Arc, time::Duration, u64};
+    use std::{io::pipe, os::fd::AsFd, sync::Arc, time::Duration};
     use tokio::runtime::{Handle, RuntimeFlavor};
     use tokio_util::sync::CancellationToken;
 

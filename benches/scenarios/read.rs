@@ -1,13 +1,12 @@
 // Different crates use different functions.
-#[allow(unused)]
 use async_hybrid_fs::{Client, Permissions, default_client};
 use nix::fcntl::OFlag;
+use std::cmp;
 use std::io::Read;
-use std::num::NonZero;
 use std::path::Path;
-use std::{cmp, thread};
 use tokio::runtime::Handle;
 
+#[allow(unused)]
 pub async fn read_hybrid(client: &Client, path: impl AsRef<Path>, size: usize) {
     let fd = client
         .open_path(
@@ -40,6 +39,7 @@ pub async fn read_hybrid(client: &Client, path: impl AsRef<Path>, size: usize) {
         .expect("failed to close file");
 }
 
+#[allow(unused)]
 pub async fn read_tokio(path: impl AsRef<Path>, size: usize) {
     // Batching blocking operations reduces overhead.
     let path_owned = path.as_ref().to_owned();
@@ -48,6 +48,7 @@ pub async fn read_tokio(path: impl AsRef<Path>, size: usize) {
         .expect("failed to join task");
 }
 
+#[allow(unused)]
 pub async fn read_hybrid_batched(
     client: &Client,
     path: impl AsRef<Path>,
@@ -69,6 +70,7 @@ pub async fn read_hybrid_batched(
     }
 }
 
+#[allow(unused)]
 pub async fn read_hybrid_multi(
     clients: &[Client],
     path: impl AsRef<Path>,
@@ -80,8 +82,7 @@ pub async fn read_hybrid_multi(
     let remainder = count % clients.len();
     let (_, futures) = unsafe {
         async_scoped::TokioScope::scope_and_collect(move |scope| {
-            for idx in 0..clients.len() {
-                let client = &clients[idx];
+            for (idx, client) in clients.iter().enumerate() {
                 let path_owned = path.as_ref().to_owned();
                 scope.spawn(read_hybrid_batched(
                     client,
@@ -102,6 +103,7 @@ pub async fn read_hybrid_multi(
     }
 }
 
+#[allow(unused)]
 pub async fn read_hybrid_default(path: impl AsRef<Path>, size: usize) {
     let fd = default_client()
         .open_path(
@@ -134,6 +136,7 @@ pub async fn read_hybrid_default(path: impl AsRef<Path>, size: usize) {
         .expect("failed to close file");
 }
 
+#[allow(unused)]
 pub async fn read_hybrid_default_batched(path: impl AsRef<Path>, size: usize, count: usize) {
     let mut futures = Vec::with_capacity(count);
     for _ in 0..count {
@@ -142,6 +145,7 @@ pub async fn read_hybrid_default_batched(path: impl AsRef<Path>, size: usize, co
     futures::future::join_all(futures).await;
 }
 
+#[allow(unused)]
 pub async fn read_hybrid_default_round_robin(path: impl AsRef<Path>, size: usize, count: usize) {
     let tasks = Handle::current().metrics().num_workers();
     let even_task_item_count = count / tasks;
@@ -164,6 +168,7 @@ pub async fn read_hybrid_default_round_robin(path: impl AsRef<Path>, size: usize
     futures::future::join_all(futures).await;
 }
 
+#[allow(unused)]
 pub async fn read_tokio_batched(path: impl AsRef<Path>, size: usize, count: usize) {
     let mut futures = Vec::with_capacity(count);
     for _ in 0..count {
@@ -173,6 +178,7 @@ pub async fn read_tokio_batched(path: impl AsRef<Path>, size: usize, count: usiz
     futures::future::join_all(futures).await;
 }
 
+#[allow(unused)]
 pub fn read_blocking_batched(path: impl AsRef<Path>, size: usize, count: usize) {
     let mut threads = Vec::with_capacity(NUM_THREADS);
     const NUM_THREADS: usize = 4;

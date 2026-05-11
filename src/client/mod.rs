@@ -6,11 +6,11 @@ mod requests;
 pub(crate) mod ticketing;
 
 use std::collections::VecDeque;
+use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::thread::JoinHandle;
-use std::{io, thread};
 use ticketing::SubmissionTicketQueue;
 
 use dashmap::{DashMap, DashSet};
@@ -276,14 +276,14 @@ impl Client {
             let mut probe = io_uring::Probe::new();
             ring.submitter().register_probe(&mut probe)?;
             client.uring = Some(ClientUring {
-                normal_submission_ticket_queue: normal_submission_ticket_queue,
-                cancel_submission_ticket_queue: cancel_submission_ticket_queue,
+                normal_submission_ticket_queue,
+                cancel_submission_ticket_queue,
                 pending: pending_map,
-                submission_sender: submission_sender,
-                ticket_dropper: ticket_dropper,
-                ticket_dropper_thread: ticket_dropper_thread,
+                submission_sender,
+                ticket_dropper,
+                ticket_dropper_thread,
                 uring: ring,
-                probe: probe,
+                probe,
                 sthread,
                 cthread,
                 registered_files: Arc::new(DashSet::new()),
@@ -313,7 +313,7 @@ fn submission_thread(
         for submitter in queue.iter() {
             let entry = submitter.create_entry();
             loop {
-                if let Err(_) = unsafe { submission.push(&entry) } {
+                if unsafe { submission.push(&entry) }.is_err() {
                     // We need to synchronize the head and tail before retrying because it is stale. However, we do not need to block because poison requests only work when nothing is running, and the queues restrict the number of active tickets.
                     submission.sync();
                     continue;
@@ -381,6 +381,10 @@ pub trait UringTarget {
     fn as_file_descriptor(&self) -> BorrowedFd<'_>;
 
     /// Method for converting the target to a raw target object that can be used by the io_uring client.
+    ///
+    /// # Safety
+    /// This method bypasses the borrow checker's restrictions.
+    /// You must ensure that the file descriptor and index remains valid (e.g. by keeping the original object).
     unsafe fn as_target(&self, _uring_identity: &Arc<()>) -> Target;
 }
 

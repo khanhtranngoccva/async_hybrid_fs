@@ -168,9 +168,9 @@ impl From<libc::statx> for Metadata {
     }
 }
 
-impl Into<libc::statx> for Metadata {
-    fn into(self) -> libc::statx {
-        self.0
+impl From<Metadata> for libc::statx {
+    fn from(val: Metadata) -> Self {
+        val.0
     }
 }
 
@@ -255,9 +255,9 @@ impl From<libc::dev_t> for DeviceNumber {
     }
 }
 
-impl Into<libc::dev_t> for DeviceNumber {
-    fn into(self) -> libc::dev_t {
-        libc::makedev(self.major, self.minor)
+impl From<DeviceNumber> for libc::dev_t {
+    fn from(val: DeviceNumber) -> Self {
+        libc::makedev(val.major, val.minor)
     }
 }
 
