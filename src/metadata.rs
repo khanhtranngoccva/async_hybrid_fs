@@ -83,66 +83,82 @@ impl Metadata {
     // std::os::unix::fs::MetadataExt interface
     // ===========================================================================
 
+    /// Returns the number of the device that the file resides in.
     pub fn dev(&self) -> u64 {
         libc::makedev(self.0.stx_dev_major, self.0.stx_dev_minor) as u64
     }
 
+    /// Returns the inode number of the file.
     pub fn ino(&self) -> u64 {
         self.0.stx_ino
     }
 
+    /// Returns the mode of the file.
     pub fn mode(&self) -> u32 {
         self.0.stx_mode as u32
     }
 
+    /// Returns the number of hard links to the file.
     pub fn nlink(&self) -> u64 {
         self.0.stx_nlink as u64
     }
 
+    /// Returns the user ID of the file.
     pub fn uid(&self) -> u32 {
         self.0.stx_uid
     }
 
+    /// Returns the group ID of the file.
     pub fn gid(&self) -> u32 {
         self.0.stx_gid
     }
 
+    /// Returns the device number that the file points to (if it is a device file).
     pub fn rdev(&self) -> u64 {
         libc::makedev(self.0.stx_rdev_major, self.0.stx_rdev_minor) as u64
     }
 
+    /// Returns the size of the file, in bytes.
     pub fn size(&self) -> u64 {
         self.0.stx_size
     }
 
+    /// Returns the last access time.
     pub fn atime(&self) -> i64 {
         self.0.stx_atime.tv_sec
     }
 
+    /// Returns the nanoseconds part of the last access time.
     pub fn atime_nsec(&self) -> i64 {
         self.0.stx_atime.tv_nsec as i64
     }
 
+    /// Returns the last modification time.
     pub fn mtime(&self) -> i64 {
         self.0.stx_mtime.tv_sec
     }
 
+    /// Returns the nanoseconds part of the last modification time.
     pub fn mtime_nsec(&self) -> i64 {
         self.0.stx_mtime.tv_nsec as i64
     }
 
+    /// Returns the creation time.
     pub fn ctime(&self) -> i64 {
         self.0.stx_ctime.tv_sec
     }
 
+    /// Returns the nanoseconds part of the creation time.
     pub fn ctime_nsec(&self) -> i64 {
         self.0.stx_ctime.tv_nsec as i64
     }
 
+    /// Returns the block size of the file.
     pub fn blksize(&self) -> u64 {
         self.0.stx_blksize as u64
     }
 
+    /// Returns the number of blocks allocated for the file.
     pub fn blocks(&self) -> u64 {
         self.0.stx_blocks
     }
@@ -183,30 +199,37 @@ impl From<Metadata> for libc::statx {
 pub struct FileType(u16);
 
 impl FileType {
+    /// Returns `true` if this file type is a directory.
     pub fn is_dir(&self) -> bool {
         (self.0 & libc::S_IFMT as u16) == libc::S_IFDIR as u16
     }
 
+    /// Returns `true` if this file type is a regular file.
     pub fn is_file(&self) -> bool {
         (self.0 & libc::S_IFMT as u16) == libc::S_IFREG as u16
     }
 
+    /// Returns `true` if this file type is a symbolic link.
     pub fn is_symlink(&self) -> bool {
         (self.0 & libc::S_IFMT as u16) == libc::S_IFLNK as u16
     }
 
+    /// Returns `true` if this file type is a block device.
     pub fn is_block_device(&self) -> bool {
         (self.0 & libc::S_IFMT as u16) == libc::S_IFBLK as u16
     }
 
+    /// Returns `true` if this file type is a character device.
     pub fn is_char_device(&self) -> bool {
         (self.0 & libc::S_IFMT as u16) == libc::S_IFCHR as u16
     }
 
+    /// Returns `true` if this file type is a FIFO pipe.
     pub fn is_fifo(&self) -> bool {
         (self.0 & libc::S_IFMT as u16) == libc::S_IFIFO as u16
     }
 
+    /// Returns `true` if this file type is a socket.
     pub fn is_socket(&self) -> bool {
         (self.0 & libc::S_IFMT as u16) == libc::S_IFSOCK as u16
     }
@@ -242,7 +265,9 @@ impl fmt::Debug for FileType {
 /// Representation of device numbers in the major-minor form. Defaults to 0 for both major and minor. Can be converted to and from [`libc::dev_t`] with the [`From`] and [`Into`] traits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct DeviceNumber {
+    /// The major number of the device.
     pub major: u32,
+    /// The minor number of the device.
     pub minor: u32,
 }
 
@@ -267,15 +292,22 @@ impl From<DeviceNumber> for libc::dev_t {
 /// - Symlinks are not supported by this type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MknodType {
+    /// A block device.
     BlockDevice(DeviceNumber),
+    /// A character device.
     CharDevice(DeviceNumber),
+    /// A FIFO pipe.
     Fifo,
+    /// A socket.
     Socket,
+    /// A regular file.
     RegularFile,
+    /// A directory.
     Directory,
 }
 
 impl MknodType {
+    /// Converts this `MknodType` to a [`SFlag`] and a [`DeviceNumber`].
     pub fn to_sflag_and_device(&self) -> (SFlag, DeviceNumber) {
         match self {
             MknodType::BlockDevice(device) => (SFlag::S_IFBLK, *device),
@@ -313,18 +345,22 @@ impl MknodType {
 pub struct Permissions(u32);
 
 impl Permissions {
+    /// Returns `true` if this permissions object indicates the file is readonly.
     pub fn readonly(&self) -> bool {
         (self.0 & 0o200) == 0
     }
 
+    /// Returns the mode numberof the file.
     pub fn mode(&self) -> u32 {
         self.0
     }
 
+    /// Creates a new `Permissions` object from a mode number.
     pub fn from_mode(mode: u32) -> Self {
         Self(mode & 0o7777)
     }
 
+    /// Sets the readonly flag of the permissions object.
     pub fn set_readonly(&mut self, readonly: bool) {
         if readonly {
             self.0 &= !0o222;

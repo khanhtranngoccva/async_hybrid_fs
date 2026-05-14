@@ -53,6 +53,7 @@ impl Client {
         uring.probe.is_supported(code)
     }
 
+    /// Check if io_uring is available and active.
     pub fn is_uring_available_and_active(&self) -> bool {
         self.uring.is_some() && self.uring_enabled.load(Ordering::Relaxed)
     }
@@ -102,6 +103,9 @@ impl Client {
     /// The buffer is returned along with the number of bytes read. This allows buffer reuse and supports custom allocators (e.g., aligned buffers for O_DIRECT).
     ///
     /// Note that the read data may reside in the spare capacity of the buffer if the specified buffer's capacity is greater than its reported length, so it might be necessary to use a [`Vec::set_len()`] call to force the buffer to resize. It is usually safer to use the [`Self::read_at`] method insteaed.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn read_into_at<'a, B: IoBufMut + 'a>(
         &'a self,
         file: &'a (impl UringTarget + Sync + ?Sized),
@@ -147,6 +151,9 @@ impl Client {
     }
 
     /// Standard-library compatible method for reading from a file at the specified offset using a zero-copy buffer.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn read_at<'a>(
         &'a self,
         file: &'a (impl UringTarget + Sync + ?Sized),
@@ -167,6 +174,9 @@ impl Client {
     /// Read into multiple user-provided buffers at the specified offset. This is the primitive read operation that accepts any buffer type implementing [`IoBufMut`].
     ///
     /// The buffer is returned along with the number of bytes read. This allows buffer reuse and supports custom allocators (e.g., aligned buffers for O_DIRECT).
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn read_into_vectored_at<'a, B: IoBufMut + 'a>(
         &'a self,
         file: &'a (impl UringTarget + Sync + ?Sized),
@@ -239,6 +249,9 @@ impl Client {
     /// Read into multiple user-provided buffers at the internal seek cursor and advance the seek position. This is the primitive read operation that accepts any buffer type implementing [`IoBufMut`].
     ///
     /// The buffer is returned along with the number of bytes read. This allows buffer reuse and supports custom allocators (e.g., aligned buffers for O_DIRECT).
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn read_into_vectored<'a, B: IoBufMut + 'a>(
         &'a self,
         file: &'a mut (impl UringTarget + Sync + ?Sized),
@@ -360,6 +373,9 @@ impl Client {
     }
 
     /// Standard library compatible method for reading from a file using a zero-copy buffer and the file's internal seek cursor.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn read<'a>(
         &'a self,
         file: &'a mut (impl UringTarget + Sync + Send + ?Sized),
@@ -377,6 +393,9 @@ impl Client {
     }
 
     /// Standard library compatible method for reading from a file into a vector of buffers.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn read_vectored<'a>(
         &'a self,
         file: &'a mut (impl UringTarget + Sync + Send + ?Sized),
@@ -406,6 +425,9 @@ impl Client {
     }
 
     /// Standard library compatible method for reading from a file into a vector.
+    ///
+    /// # Cancellation safety
+    /// This method is not cancellation-safe.
     pub async fn read_to_end(
         &self,
         file: &mut (impl UringTarget + Sync + Send + ?Sized),
@@ -566,6 +588,9 @@ impl Client {
     }
 
     /// Standard library compatible method for reading from a file into a string.
+    ///
+    /// # Cancellation safety
+    /// This method is not cancellation-safe.
     pub async fn read_to_string(
         &self,
         file: &mut (impl UringTarget + Sync + Send + ?Sized),
@@ -575,6 +600,9 @@ impl Client {
     }
 
     /// Standard library compatible method for reading exactly the number of bytes required to fill the buffer.
+    ///
+    /// # Cancellation safety
+    /// This method is not cancellation-safe.
     pub async fn read_exact(
         &self,
         file: &mut (impl UringTarget + Sync + Send + ?Sized),
@@ -608,6 +636,9 @@ impl Client {
     /// Write a buffer to a file at the specified offset. Accepts any buffer type implementing [`IoBuf`].
     ///
     /// The buffer is returned along with the number of bytes written. This allows buffer reuse and supports custom allocators.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn write_from_at<'a, B: IoBuf + 'a>(
         &'a self,
         file: &'a (impl UringTarget + Sync + ?Sized),
@@ -656,6 +687,9 @@ impl Client {
     /// Write multiple buffers to a file at the specified offset. Accepts any buffer type implementing [`IoBuf`].
     ///
     /// The buffer is returned along with the number of bytes written. This allows buffer reuse and supports custom allocators.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn write_from_vectored_at<'a, B: IoBuf + 'a>(
         &'a self,
         file: &'a (impl UringTarget + Sync + ?Sized),
@@ -848,6 +882,9 @@ impl Client {
     }
 
     /// Standard library compatible method for writing a single buffer to a file.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn write<'a>(
         &'a self,
         file: &'a mut (impl UringTarget + Sync + Send + ?Sized),
@@ -858,6 +895,9 @@ impl Client {
     }
 
     /// Standard library compatible method for writing multiple buffers to a file.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn write_vectored<'a>(
         &'a self,
         file: &'a mut (impl UringTarget + Sync + Send + ?Sized),
@@ -872,6 +912,9 @@ impl Client {
     }
 
     /// Standard-library compatible method for writing everything in a slice to a file.
+    ///
+    /// # Cancellation safety
+    /// This method is not cancellation-safe.
     pub async fn write_all<'a>(
         &'a self,
         file: &'a mut (impl UringTarget + Sync + Send + ?Sized),
@@ -899,6 +942,9 @@ impl Client {
     }
 
     /// Standard library compatible method for writing a formatted string to a file.
+    ///
+    /// # Cancellation safety
+    /// This method is not cancellation-safe.
     pub async fn write_fmt(
         &self,
         file: &mut (impl UringTarget + Sync + Send + ?Sized),
@@ -908,6 +954,9 @@ impl Client {
     }
 
     /// Standard library compatible method for flushing the file.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn flush<'a>(
         &'a self,
         _file: &'a mut (impl UringTarget + Send + ?Sized),
@@ -917,6 +966,9 @@ impl Client {
 
     /// A more low-level flexible method for seeking to a specific offset in the file, which uses the [`nix`] crate.
     /// This is useful if SEEK_HOLE or SEEK_END is needed.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn seek_ll<'a>(
         &'a self,
         file: &'a mut (impl UringTarget + Send + ?Sized),
@@ -938,6 +990,9 @@ impl Client {
     }
 
     /// Standard library compatible method for seeking to a specific offset in the file.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn seek<'a>(
         &'a self,
         file: &'a mut (impl UringTarget + Send + ?Sized),
@@ -965,6 +1020,9 @@ impl Client {
     /// Synchronize file data and metadata to disk (fsync). This ensures that all data and metadata modifications are flushed to the underlying storage device. Even when using direct I/O, this is necessary to ensure the device itself has flushed any internal caches.
     ///
     /// **Note on ordering**: io_uring does not guarantee ordering between operations. If you need to ensure writes complete before fsync, you should await the write first, then call fsync.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn sync_all<'a>(
         &'a self,
         file: &'a (impl UringTarget + Sync + ?Sized),
@@ -983,6 +1041,9 @@ impl Client {
     }
 
     /// Synchronize file data to disk (fdatasync). This ensures that only data modifications are flushed to the underlying storage device. This is useful for ensuring that data is written but not metadata.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn sync_data<'a>(
         &'a self,
         file: &'a (impl UringTarget + Sync + ?Sized),
@@ -1001,6 +1062,9 @@ impl Client {
     }
 
     /// Standard library compatible method for getting metadata of an open file handle (statx). This is the io_uring equivalent of the low-level [`libc::statx()`] or [`std::fs::File::metadata`] functions.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn metadata<'a>(
         &'a self,
         file: &'a (impl UringTarget + Sync + ?Sized),
@@ -1030,6 +1094,9 @@ impl Client {
     }
 
     /// Retrieves metadata from a file with the path relative to the specified directory file descriptor.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn statx_at<'a>(
         &'a self,
         fd: &'a (impl UringTarget + Sync + ?Sized),
@@ -1067,6 +1134,9 @@ impl Client {
     }
 
     /// Standard library compatible method for getting metadata of a file path after following all symlinks, equivalent to [`std::fs::metadata`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn metadata_path<'a>(
         &'a self,
         path: impl AsRef<Path>,
@@ -1075,6 +1145,9 @@ impl Client {
     }
 
     /// Standard library compatible method for getting metadata of a file path without following any symlinks, equivalent to [`std::fs::symlink_metadata`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn symlink_metadata_path<'a>(
         &'a self,
         path: impl AsRef<Path>,
@@ -1087,6 +1160,9 @@ impl Client {
     }
 
     /// Pre-allocate or deallocate space for a file (fallocate). This can be used to pre-allocate space to avoid fragmentation, punch holes in sparse files, or zero-fill regions. Use `libc::FALLOC_FL_*` constants for mode flags.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn fallocate<'a>(
         &'a self,
         file: &'a (impl UringTarget + Sync + ?Sized),
@@ -1143,6 +1219,9 @@ impl Client {
     }
 
     /// Advise the kernel about expected file access patterns (fadvise). This is a hint to the kernel about how you intend to access a file region. The kernel may use this to optimize readahead, caching, etc. Use `libc::POSIX_FADV_*` constants for advice values.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn fadvise<'a>(
         &'a self,
         file: &'a (impl UringTarget + Sync + ?Sized),
@@ -1199,6 +1278,9 @@ impl Client {
     }
 
     /// Truncate a file to a specified length (ftruncate). If the file is larger than the specified length, the extra data is lost. If the file is smaller, it is extended and the extended part reads as zeros.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn ftruncate<'a>(
         &'a self,
         file: &'a (impl UringTarget + Sync + ?Sized),
@@ -1243,6 +1325,9 @@ impl Client {
     ///
     /// # Notes
     /// - This low-level function does not provide the `O_CLOEXEC` flag by default. This may cause file descriptor leaks, so it is recommended to use [`Self::open_at`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn open_at_ll<'a>(
         &'a self,
         dir_fd: &'a (impl UringTarget + Sync + ?Sized),
@@ -1283,17 +1368,18 @@ impl Client {
     /// Open a file asynchronously using the path syntax. This is the io_uring equivalent of `open(2)`.
     ///
     /// # Arguments
-    ///
     /// * `path` - Path to open (any `CStr`-like type: `&CStr`, `CString`, `c"literal"`).
     /// * `flags` - Open flags from `libc` (e.g., `libc::O_RDONLY`, `libc::O_RDWR | libc::O_CREAT`).
     /// * `mode` - File mode for creation (only used with `O_CREAT`).
     ///
     /// # Returns
-    ///
     /// Returns an `OwnedFd` on success. The fd is automatically closed when dropped.
     ///
     /// # Notes
     /// - This low-level function does not provide the `O_CLOEXEC` flag by default. This may cause file descriptor leaks, so it is recommended to use [`Self::open_path`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn open_path_ll<'a>(
         &'a self,
         path: impl AsRef<Path>,
@@ -1304,6 +1390,9 @@ impl Client {
     }
 
     /// Open a file relative to a directory fd similar to [`Self::open_at_ll`], but with [`O_CLOEXEC`](libc::O_CLOEXEC) flag.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn open_at<'a>(
         &'a self,
         dir_fd: &'a (impl UringTarget + Sync + ?Sized),
@@ -1315,6 +1404,9 @@ impl Client {
     }
 
     /// Open a file using path syntax similar to [`Self::open_at_ll`]. This provides a convenient interface close to the standard library's [`std::fs::OpenOptions`] object, which includes the [`O_CLOEXEC`](libc::O_CLOEXEC) flag to prevent fd leaks.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn open_path<'a>(
         &'a self,
         path: impl AsRef<Path>,
@@ -1326,6 +1418,9 @@ impl Client {
 
     /// Standard library compatible method for opening a file, equivalent to [`std::fs::File::open`] (read-only open API),
     /// which also includes the `O_CLOEXEC` flag to provide parity with the library.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn open<'a>(&'a self, path: impl AsRef<Path>) -> PendingIo<'a, io::Result<OwnedFd>> {
         self.open_at_ll(
             &Self::AT_FDCWD,
@@ -1336,6 +1431,9 @@ impl Client {
     }
 
     /// Standard library compatible method for creating a file or truncate an already existing file, equivalent to [`std::fs::File::create`], which also includes the [`O_CLOEXEC`](libc::O_CLOEXEC) flag to provide parity with the library.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn create<'a>(&'a self, path: impl AsRef<Path>) -> PendingIo<'a, io::Result<OwnedFd>> {
         self.open_at_ll(
             &Self::AT_FDCWD,
@@ -1346,6 +1444,9 @@ impl Client {
     }
 
     /// Standard library compatible method for creating a file and failing if the file already exists, equivalent to [`std::fs::File::create_new`], which also includes the [`O_CLOEXEC`](libc::O_CLOEXEC) flag to provide parity with the library.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn create_new<'a>(&'a self, path: impl AsRef<Path>) -> PendingIo<'a, io::Result<OwnedFd>> {
         self.open_at_ll(
             &Self::AT_FDCWD,
@@ -1361,6 +1462,9 @@ impl Client {
     /// - Handle close errors (which are silently ignored by `OwnedFd::drop`)
     /// - Batch close operations with other io_uring operations
     /// - Avoid blocking the async runtime on close
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn close<'a>(
         &'a self,
         fd: impl IntoRawFd + Sized + Send + 'a,
@@ -1382,7 +1486,10 @@ impl Client {
 
     /// Rename a file relative to directory fds. This is the io_uring equivalent of `renameat2(2)`.
     ///
-    /// Flags can include [`RenameFlags`](nix::fcntl::RenameFlags) constants.
+    /// Flags can include [`RenameFlags`] constants.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn rename_at<'a>(
         &'a self,
         old_dir_fd: &'a (impl UringTarget + Sync + ?Sized),
@@ -1427,6 +1534,9 @@ impl Client {
     }
 
     /// Rename a file asynchronously. This is the io_uring equivalent of `rename(2)`.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn rename<'a>(
         &'a self,
         old_path: impl AsRef<Path>,
@@ -1443,7 +1553,10 @@ impl Client {
 
     /// Delete a file or directory relative to a directory fd. This is the io_uring equivalent of `unlinkat(2)`.
     ///
-    /// Use [`UnlinkatFlags::RemoveDir`](nix::unistd::UnlinkatFlags::RemoveDir) flag to remove directories.
+    /// Use [`UnlinkatFlags::RemoveDir`] flag to remove directories.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn unlink_at<'a>(
         &'a self,
         dir_fd: &'a (impl UringTarget + Sync + ?Sized),
@@ -1471,22 +1584,34 @@ impl Client {
     }
 
     /// Delete a file or empty directory. This is the io_uring equivalent of `unlink(2)`.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn unlink<'a>(&'a self, path: impl AsRef<Path>) -> PendingIo<'a, io::Result<()>> {
         self.unlink_at(&Self::AT_FDCWD, path, UnlinkatFlags::NoRemoveDir)
     }
 
     /// Delete a directory. This is the io_uring equivalent of `rmdir(2)`.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn rmdir<'a>(&'a self, path: impl AsRef<Path>) -> PendingIo<'a, io::Result<()>> {
         self.unlink_at(&Self::AT_FDCWD, path, UnlinkatFlags::RemoveDir)
     }
 
     /// Delete a directory. Alias for [`Self::rmdir`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     #[inline]
     pub fn remove_dir<'a>(&'a self, path: impl AsRef<Path>) -> PendingIo<'a, io::Result<()>> {
         self.rmdir(path)
     }
 
     /// Create a directory relative to a directory fd. This is the io_uring equivalent of `mkdirat(2)`.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn mkdir_at<'a>(
         &'a self,
         dir_fd: &'a (impl UringTarget + Sync + ?Sized),
@@ -1523,6 +1648,9 @@ impl Client {
     }
 
     /// Create a directory using path syntax. This is the io_uring equivalent of `mkdir(2)`.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn mkdir<'a>(
         &'a self,
         path: impl AsRef<Path>,
@@ -1532,12 +1660,18 @@ impl Client {
     }
 
     /// Standard library compatible method for creating a directory, equivalent to [`std::fs::create_dir`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn create_dir<'a>(&'a self, path: impl AsRef<Path>) -> PendingIo<'a, io::Result<()>> {
         self.mkdir_at(&Self::AT_FDCWD, path, Permissions::from_mode(0o777))
     }
 
     /// Standard library compatible method for ensuring that a directory exists by creating it and all missing parent directories,
     /// equivalent to [`std::fs::create_dir_all`].
+    ///
+    /// # Cancellation safety
+    /// This method is not cancellation-safe.
     // Recursive future intentionally marked as Send to avoid weird error messages, copying paths are relatively cheap
     pub fn create_dir_all<'a>(
         &'a self,
@@ -1580,6 +1714,9 @@ impl Client {
     }
 
     /// Create a directory and all missing parent directories with the specified permissions.
+    ///
+    /// # Cancellation safety
+    /// This method is not cancellation-safe.
     pub fn create_dir_all_with_permissions<'a>(
         &'a self,
         path: impl AsRef<Path>,
@@ -1625,6 +1762,9 @@ impl Client {
     }
 
     /// Create a symbolic link relative to a directory fd. This is the io_uring equivalent of `symlinkat(2)`.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn symlink_at<'a>(
         &'a self,
         target: impl AsRef<Path>,
@@ -1663,6 +1803,9 @@ impl Client {
     }
 
     /// Standard library compatible method for creating a symbolic link, equivalent to [`std::os::unix::fs::symlink`] or `symlink(2)`.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn symlink<'a>(
         &'a self,
         target: impl AsRef<Path>,
@@ -1672,6 +1815,9 @@ impl Client {
     }
 
     /// Create a hard link to the location relative to the target directory at a location relative to the specified directory fd. This is the io_uring equivalent of `linkat(2)`.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn hard_link_at<'a>(
         &'a self,
         old_dir_fd: &'a (impl UringTarget + Sync + ?Sized),
@@ -1748,6 +1894,9 @@ impl Client {
     }
 
     /// Standard library compatible method for creating a hard link using path syntax. This is the io_uring equivalent of `link(2)`.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn hard_link<'a>(
         &'a self,
         old_path: impl AsRef<Path>,
@@ -1763,6 +1912,9 @@ impl Client {
     }
 
     /// Alias for [`Self::fchmod`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     #[inline]
     pub fn set_permissions<'a>(
         &'a self,
@@ -1773,6 +1925,9 @@ impl Client {
     }
 
     /// Set the permissions of an open handle to a file or directory, which is equivalent to [`std::fs::File::set_permissions`] or `fchmod(2)`.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn fchmod<'a>(
         &'a self,
         fd: &'a (impl UringTarget + Sync + ?Sized),
@@ -1788,6 +1943,9 @@ impl Client {
     }
 
     /// Set the permissions of a file or directory relative to a directory fd, which is equivalent to `fchmodat(2)`.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn fchmod_at<'a>(
         &'a self,
         fd: &'a (impl UringTarget + Sync + ?Sized),
@@ -1808,6 +1966,9 @@ impl Client {
     }
 
     /// Set the permissions of a file or directory using path syntax, equivalent to `chmod(2)`.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn chmod<'a>(
         &'a self,
         path: impl AsRef<Path>,
@@ -1822,6 +1983,9 @@ impl Client {
     }
 
     /// Set the permissions of a file or directory using path syntax, but can target a symlink.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn lchmod<'a>(
         &'a self,
         path: impl AsRef<Path>,
@@ -1836,6 +2000,9 @@ impl Client {
     }
 
     /// Set the user and/or group ownership of an open handle to a file or directory, which is equivalent to `fchown(2)`.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn fchown<'a>(
         &'a self,
         fd: &'a (impl UringTarget + Sync + ?Sized),
@@ -1849,6 +2016,9 @@ impl Client {
     }
 
     /// Set the user and/or group ownership of a file or directory relative to a directory fd, which is equivalent to `fchownat(2)`.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn fchown_at<'a>(
         &'a self,
         fd: &'a (impl UringTarget + Sync + ?Sized),
@@ -1865,6 +2035,9 @@ impl Client {
     }
 
     /// Set the user and/or group ownership of a file or directory using path syntax, which is equivalent to `chown(2)`.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn chown<'a>(
         &'a self,
         path: impl AsRef<Path>,
@@ -1881,6 +2054,9 @@ impl Client {
     }
 
     /// Set the user and/ or group ownership of a file or directory using path syntax, but can target a symlink.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn lchown<'a>(
         &'a self,
         path: impl AsRef<Path>,
@@ -1908,6 +2084,9 @@ impl Client {
     }
 
     /// Set file times of an open handle to a file or directory, which is equivalent to [`std::fs::File::set_times`] or `futimens(2)`.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn futimens<'a>(
         &'a self,
         fd: &'a (impl UringTarget + Sync + ?Sized),
@@ -1925,6 +2104,9 @@ impl Client {
     }
 
     /// Set file times of a file or directory using a path relative to a directory fd, which is equivalent to `utimensat(2)`.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn utimens_at<'a>(
         &'a self,
         dir_fd: &'a (impl UringTarget + Sync + ?Sized),
@@ -1947,6 +2129,9 @@ impl Client {
     }
 
     /// Canonicalize a path. This is equivalent to `realpath(3)`.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn canonicalize<'a>(
         &'a self,
         path: impl AsRef<Path>,
@@ -1958,11 +2143,17 @@ impl Client {
     }
 
     /// Read a symbolic link. This is equivalent to `readlink(2)`.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn read_link<'a>(&'a self, path: impl AsRef<Path>) -> PendingIo<'a, io::Result<PathBuf>> {
         self.read_link_at(&Self::AT_FDCWD, path)
     }
 
     /// Read a symbolic link at a relative path to a directory fd, which is equivalent to `readlinkat(2)`.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn read_link_at<'a>(
         &'a self,
         dir_fd: &'a (impl UringTarget + Sync + ?Sized),
@@ -1978,6 +2169,9 @@ impl Client {
     }
 
     /// Read a symbolic link at a file descriptor opened with [`OFlag::O_PATH`] and [`OFlag::O_NOFOLLOW`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn read_link_file<'a>(
         &'a self,
         fd: &'a (impl UringTarget + Sync + ?Sized),
@@ -1986,6 +2180,9 @@ impl Client {
     }
 
     /// Create a device node at a relative path to a directory fd, which is equivalent to `mknodat(2)`.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn mknod_at<'a>(
         &'a self,
         dir_fd: &'a (impl UringTarget + Sync + ?Sized),
@@ -2008,6 +2205,9 @@ impl Client {
     }
 
     /// Create a device node using path syntax, which is equivalent to `mknod(2)`.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn mknod<'a>(
         &'a self,
         path: impl AsRef<Path>,
@@ -2018,6 +2218,9 @@ impl Client {
     }
 
     /// Perform a `fcntl` syscall on a file descriptor, which is equivalent to `fcntl(2)`.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn fcntl<'a>(
         &'a self,
         fd: &'a (impl UringTarget + Sync + ?Sized),
@@ -2030,6 +2233,9 @@ impl Client {
     }
 
     /// Set the status flags of a file descriptor, which is equivalent to `F_SETFL(2)`.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn set_status_flags<'a>(
         &'a self,
         fd: &'a mut (impl UringTarget + Sync + Send + ?Sized),
@@ -2040,6 +2246,9 @@ impl Client {
     }
 
     /// Get the status flags of a file descriptor, which is equivalent to `F_GETFL(2)`.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn get_status_flags<'a>(
         &'a self,
         fd: &'a (impl UringTarget + Sync + ?Sized),
@@ -2049,6 +2258,9 @@ impl Client {
     }
 
     /// Set the descriptor flags of a file descriptor, which is equivalent to `F_SETFD(2)`.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn set_descriptor_flags<'a>(
         &'a self,
         fd: &'a mut (impl UringTarget + Sync + Send + ?Sized),
@@ -2059,6 +2271,9 @@ impl Client {
     }
 
     /// Get the descriptor flags of a file descriptor, which is equivalent to `F_GETFD(2)`.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn get_descriptor_flags<'a>(
         &'a self,
         fd: &'a (impl UringTarget + Sync + ?Sized),
@@ -2068,6 +2283,9 @@ impl Client {
     }
 
     /// Set the nonblocking status flag of a file descriptor.
+    ///
+    /// # Cancellation safety
+    /// This method is not cancellation-safe.
     pub async fn set_nonblocking<'a>(
         &'a self,
         fd: &'a mut (impl UringTarget + Sync + Send + ?Sized),
@@ -2091,6 +2309,9 @@ impl Client {
     }
 
     /// Set the close-on-exec descriptor flag of a file descriptor.
+    ///
+    /// # Cancellation safety
+    /// This method is not cancellation-safe.
     pub async fn set_close_on_exec<'a>(
         &'a self,
         fd: &'a mut (impl UringTarget + Sync + Send + ?Sized),

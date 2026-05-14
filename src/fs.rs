@@ -1,3 +1,5 @@
+//! High-level filesystem operations, which use default [`Client`](crate::client::Client) instances.
+//!
 use nix::{
     fcntl::{AT_FDCWD, OFlag},
     sys::{
@@ -53,13 +55,21 @@ use crate::{
 /// ```
 #[derive(Clone, Debug)]
 pub struct OpenOptions {
+    /// Whether to open the file for reading.
     pub read: bool,
+    /// Whether to open the file for writing.
     pub write: bool,
+    /// Whether to open the file for appending.
     pub append: bool,
+    /// Whether to truncate the file to zero length.
     pub truncate: bool,
+    /// Whether to create the file if it doesn't exist.
     pub create: bool,
+    /// Whether to create the file if it doesn't exist.
     pub create_new: bool,
+    /// The permissions of the file.
     pub permissions: Permissions,
+    /// Custom flags to pass to the underlying `open` syscall.
     pub custom_flags: OFlag,
 }
 
@@ -165,6 +175,9 @@ impl OpenOptions {
     /// Opens a file with the configured options.
     ///
     /// Returns a [`tokio::fs::File`] for async operations.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn open<'a>(&'a self, path: impl AsRef<Path>) -> PendingIo<'a, io::Result<File>> {
         let flags = match self.get_flags() {
             Ok(flags) => flags,
@@ -271,10 +284,18 @@ impl OpenOptions {
     }
 }
 
+/// Asynchronous version of [`std::fs::canonicalize`].
+///
+/// # Cancellation safety
+/// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
 pub fn canonicalize(path: impl AsRef<Path>) -> PendingIo<'static, io::Result<PathBuf>> {
     default::default_client().canonicalize(path)
 }
 
+/// Asynchronous version of [`std::fs::copy`].
+///
+/// # Cancellation safety
+/// This method is not cancellable (runs on a blocking thread).
 pub async fn copy(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> io::Result<u64> {
     // FIXME: Implement an io_uring version, currently we prefer std::fs::copy to take advantage of copy_file_range on supported OSes.
     let source = src.as_ref().to_owned();
@@ -282,6 +303,10 @@ pub async fn copy(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> io::Result<u6
     tokio::task::spawn_blocking(move || std::fs::copy(source, destination)).await?
 }
 
+/// Asynchronous version of [`std::os::unix::fs::chown`].
+///
+/// # Cancellation safety
+/// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
 pub fn chown(
     path: impl AsRef<Path>,
     uid: Option<Uid>,
@@ -290,6 +315,10 @@ pub fn chown(
     default::default_client().chown(path, uid, gid)
 }
 
+/// Asynchronous version of [`std::os::unix::fs::lchown`].
+///
+/// # Cancellation safety
+/// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
 pub fn lchown(
     path: impl AsRef<Path>,
     uid: Option<Uid>,
@@ -298,16 +327,28 @@ pub fn lchown(
     default::default_client().lchown(path, uid, gid)
 }
 
+/// Asynchronous version of [`std::fs::create_dir`].
+///
+/// # Cancellation safety
+/// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
 pub fn create_dir(path: impl AsRef<Path>) -> PendingIo<'static, io::Result<()>> {
     default::default_client().create_dir(path)
 }
 
+/// Asynchronous version of [`std::fs::create_dir_all`].
+///
+/// # Cancellation safety
+/// This method is not cancellation-safe.
 pub fn create_dir_all(
     path: impl AsRef<Path>,
 ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send>> {
     default::default_client().create_dir_all(path)
 }
 
+/// Asynchronous version of [`std::fs::create_dir`] with permissions.
+///
+/// # Cancellation safety
+/// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
 pub fn create_dir_with_permissions(
     path: impl AsRef<Path>,
     permissions: Permissions,
@@ -315,6 +356,10 @@ pub fn create_dir_with_permissions(
     default::default_client().mkdir(path, permissions)
 }
 
+/// Asynchronous version of [`std::fs::create_dir_all`] with permissions.
+///
+/// # Cancellation safety
+/// This method is not cancellation-safe.
 pub fn create_dir_all_with_permissions(
     path: impl AsRef<Path>,
     permissions: Permissions,
@@ -322,6 +367,10 @@ pub fn create_dir_all_with_permissions(
     default::default_client().create_dir_all_with_permissions(path, permissions)
 }
 
+/// Asynchronous version of [`libc::mknod`].
+///
+/// # Cancellation safety
+/// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
 pub fn create_node(
     path: impl AsRef<Path>,
     kind: MknodType,
@@ -330,6 +379,10 @@ pub fn create_node(
     default::default_client().mknod(path, kind, permissions)
 }
 
+/// Asynchronous version of [`std::fs::exists`].
+///
+/// # Cancellation safety
+/// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
 pub fn exists(path: impl AsRef<Path>) -> PendingIo<'static, io::Result<bool>> {
     default::default_client()
         .metadata_path(path)
@@ -340,6 +393,10 @@ pub fn exists(path: impl AsRef<Path>) -> PendingIo<'static, io::Result<bool>> {
         })
 }
 
+/// Asynchronous version of [`std::fs::hard_link`].
+///
+/// # Cancellation safety
+/// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
 pub fn hard_link(
     src: impl AsRef<Path>,
     dst: impl AsRef<Path>,
@@ -347,23 +404,43 @@ pub fn hard_link(
     default::default_client().hard_link(src, dst)
 }
 
+/// Asynchronous version of [`std::fs::metadata`].
+///
+/// # Cancellation safety
+/// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
 pub fn metadata(path: impl AsRef<Path>) -> PendingIo<'static, io::Result<Metadata>> {
     default::default_client().metadata_path(path)
 }
 
+/// Asynchronous version of [`std::fs::symlink_metadata`].
+///
+/// # Cancellation safety
+/// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
 pub fn symlink_metadata(path: impl AsRef<Path>) -> PendingIo<'static, io::Result<Metadata>> {
     default::default_client().symlink_metadata_path(path)
 }
 
+/// Asynchronous version of [`std::fs::read_dir`].
+///
+/// # Cancellation safety
+/// This method is not cancellable (runs on a blocking thread).
 pub async fn read_dir(path: impl AsRef<Path>) -> io::Result<tokio::fs::ReadDir> {
     // FIXME: This function depends on tokio
     tokio::fs::read_dir(path).await
 }
 
+/// Asynchronous version of [`std::fs::read_link`].
+///
+/// # Cancellation safety
+/// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
 pub fn read_link(path: impl AsRef<Path>) -> PendingIo<'static, io::Result<PathBuf>> {
     default::default_client().read_link(path)
 }
 
+/// Asynchronous version of [`std::fs::read_to_string`].
+///
+/// # Cancellation safety
+/// This method is not cancellation-safe.
 pub async fn read_to_string(path: impl AsRef<Path>) -> io::Result<String> {
     let mut file = OpenOptions::new()
         .read(true)
@@ -378,10 +455,18 @@ pub async fn read_to_string(path: impl AsRef<Path>) -> io::Result<String> {
     Ok(buf)
 }
 
+/// Asynchronous version of [`std::fs::remove_dir`].
+///
+/// # Cancellation safety
+/// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
 pub fn remove_dir(path: impl AsRef<Path>) -> PendingIo<'static, io::Result<()>> {
     default::default_client().rmdir(path)
 }
 
+/// Asynchronous version of [`std::fs::remove_dir_all`].
+///
+/// # Cancellation safety
+/// This method is not cancellation-safe.
 pub async fn remove_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
     let client = default::default_client();
     let metadata = client
@@ -446,14 +531,26 @@ async fn remove_dir_all_recursive(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Asynchronous version of [`std::fs::remove_file`].
+///
+/// # Cancellation safety
+/// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
 pub fn remove_file(path: impl AsRef<Path>) -> PendingIo<'static, io::Result<()>> {
     default::default_client().unlink(path)
 }
 
+/// Asynchronous version of [`std::fs::rename`].
+///
+/// # Cancellation safety
+/// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
 pub fn rename(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> PendingIo<'static, io::Result<()>> {
     default::default_client().rename(src, dst)
 }
 
+/// Asynchronous version of [`std::os::unix::fs::chown`].
+///
+/// # Cancellation safety
+/// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
 pub fn set_owner(
     path: impl AsRef<Path>,
     uid: Option<Uid>,
@@ -462,6 +559,10 @@ pub fn set_owner(
     default::default_client().chown(path, uid, gid)
 }
 
+/// Asynchronous version of [`std::os::unix::fs::lchown`].
+///
+/// # Cancellation safety
+/// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
 pub fn set_owner_nofollow(
     path: impl AsRef<Path>,
     uid: Option<Uid>,
@@ -470,6 +571,10 @@ pub fn set_owner_nofollow(
     default::default_client().lchown(path, uid, gid)
 }
 
+/// Asynchronous version of [`std::fs::set_permissions`].
+///
+/// # Cancellation safety
+/// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
 pub fn set_permissions(
     path: impl AsRef<Path>,
     permissions: Permissions,
@@ -477,6 +582,10 @@ pub fn set_permissions(
     default::default_client().chmod(path, permissions)
 }
 
+/// Asynchronous version of [`std::fs::set_permissions_nofollow`].
+///
+/// # Cancellation safety
+/// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
 pub fn set_permissions_nofollow(
     path: impl AsRef<Path>,
     permissions: Permissions,
@@ -484,6 +593,10 @@ pub fn set_permissions_nofollow(
     default::default_client().lchmod(path, permissions)
 }
 
+/// Asynchronous version of [`std::fs::set_times`].
+///
+/// # Cancellation safety
+/// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
 pub fn set_times(
     path: impl AsRef<Path>,
     atime: Option<TimeSpec>,
@@ -498,6 +611,10 @@ pub fn set_times(
     )
 }
 
+/// Asynchronous version of [`std::fs::set_times_nofollow`].
+///
+/// # Cancellation safety
+/// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
 pub fn set_times_nofollow(
     path: impl AsRef<Path>,
     atime: Option<TimeSpec>,
@@ -512,6 +629,10 @@ pub fn set_times_nofollow(
     )
 }
 
+/// Asynchronous version of [`std::fs::soft_link`]. The [`symlink`] method should be used instead.
+///
+/// # Cancellation safety
+/// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
 pub fn soft_link(
     target: impl AsRef<Path>,
     link: impl AsRef<Path>,
@@ -519,6 +640,10 @@ pub fn soft_link(
     default::default_client().symlink(target, link)
 }
 
+/// Asynchronous version of [`std::os::unix::fs::symlink`].
+///
+/// # Cancellation safety
+/// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
 pub fn symlink(
     target: impl AsRef<Path>,
     link: impl AsRef<Path>,
@@ -526,6 +651,10 @@ pub fn symlink(
     default::default_client().symlink(target, link)
 }
 
+/// Asynchronous version of [`std::fs::write`].
+///
+/// # Cancellation safety
+/// This method is not cancellation-safe.
 pub async fn write(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> io::Result<()> {
     let mut file = OpenOptions::new()
         .write(true)

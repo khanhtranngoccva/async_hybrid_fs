@@ -1,20 +1,22 @@
-// We define custom buffer traits rather than using `Vec<u8>` or `Box<[u8]>` directly because:
-//
-// 1. **Aligned allocations**: O_DIRECT requires sector-aligned buffers (typically 512 or 4096 bytes).
-//    `Vec<u8>` only guarantees pointer alignment, not allocation alignment. Custom allocators
-//    can provide properly aligned buffers that implement these traits.
-//
-// 2. **Buffer pools**: High-performance applications reuse buffers to avoid allocation overhead.
-//    Pool-managed buffers can implement these traits directly without conversion.
-//
-// 3. **Specialized memory**: GPU memory, mmap'd regions, or other exotic buffer types can
-//    participate in io_uring operations by implementing these traits.
-//
-// 4. **Zero-copy**: Accepting generic buffers avoids the need to copy data into/out of
-//    a library-owned buffer type.
-//
-// The traits are `unsafe` because implementors must guarantee pointer stability across moves,
-// which is automatically true for heap allocations but NOT for stack arrays.
+//! Custom buffer traits for io_uring operations.
+//! 
+//! We define custom buffer traits rather than using `Vec<u8>` or `Box<[u8]>` directly because:
+//!
+//! 1. **Aligned allocations**: O_DIRECT requires sector-aligned buffers (typically 512 or 4096 bytes).
+//!    `Vec<u8>` only guarantees pointer alignment, not allocation alignment. Custom allocators
+//!    can provide properly aligned buffers that implement these traits.
+//!
+//! 2. **Buffer pools**: High-performance applications reuse buffers to avoid allocation overhead.
+//!    Pool-managed buffers can implement these traits directly without conversion.
+//!
+//! 3. **Specialized memory**: GPU memory, mmap'd regions, or other exotic buffer types can
+//!    participate in io_uring operations by implementing these traits.
+//!
+//! 4. **Zero-copy**: Accepting generic buffers avoids the need to copy data into/out of
+//!    a library-owned buffer type.
+//!
+//! The traits are `unsafe` because implementors must guarantee pointer stability across moves,
+//! which is automatically true for heap allocations but NOT for stack arrays.
 
 use std::{
     io::{IoSlice, IoSliceMut},

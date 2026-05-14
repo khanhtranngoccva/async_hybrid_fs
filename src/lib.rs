@@ -4,37 +4,45 @@
 //!
 //! Unlike other `io_uring` crates which primarily target servers, this library is primarily targeted at applications that can benefit from fewer syscalls and run on end-user/consumer devices like a custom filesystem, on which support for `io_uring` is not guaranteed or `io_uring` is restricted by policy.
 //!
+//! Due to limitations of Rust, the library cannot ensure complete safety, although it tries to prevent most kinds of misuse by providing a safer API. Please see the [usage notes](#usage-notes) for more details before using the library.
+//!
 //! # Feature comparison
-//! This crate is directly based on the `uring_file`(https://docs.rs/uring-file/latest/uring_file) crate by [wilsonzlin](https://github.com/wilsonzlin) and `rio`(https://docs.rs/rio/latest/rio) crate by [spacejam](https://github.com/spacejam), but with some modifications:
+//! This crate is directly based on the [`uring_file`](https://docs.rs/uring-file/latest/uring_file) crate by [wilsonzlin](https://github.com/wilsonzlin) and [`rio`](https://docs.rs/rio/latest/rio) crate by [spacejam](https://github.com/spacejam), but with some modifications:
 //! - Features a more complete set of filesystem APIs, which is a superset of [`std::fs`]. This includes race-free APIs like the "*at" syscall family, as well as the vectored I/O APIs.
 //! - Dynamically detects whether `io_uring` is available on the system supported for the operation, and falls back to the async runtime's methods when it is not.
 //!     - The user may prevent unintentional use of fallback implementations in custom io_uring instances by setting [`UringCfg::allow_fallback`] to `false` if they are running in environments that should guarantee `io_uring`. Doing that will result in an error being returned when `io_uring` is not available, allowing for diagnosis.
 //! - Registered files use safe implementations.
 //!     - They have two variants with different lifetime properties: [`RegisteredFile`] and [`OwnedRegisteredFile`].
 //!     - Both file types are automatically unregistered when they are dropped, and a [`RegisteredFile`] can be upgraded to an [`OwnedRegisteredFile`] to allow the file to be stored independently.
-//! - Pending I/O objects returned from primitive operations ([`PendingIoObject`], e.g. [`Client::write_from`]) is designed to be memory-safe, cancellation-safe and atomic:
-//!     - The APIs takes full advantage of Rust's borrow checker.
-//!     - The io_uring system offers a cancellation mechanism for operations that are in progress, but cancellation might fail because an operation has progressed too far, and waiting for completion is required. Calling the [`PendingIo::cancel`] method handles pitfalls by invoking the cancellation mechanism and waiting for completion and returning the result if necessary.
-//!     - While [`uring_file`] used await points when receiving from completion channels, which may result in use-after-free errors if its pending futures are dropped mid-operation, this library implements low-level futures which invoke [`PendingIo::cancel`] on drop or wait for completion, depending on low-level API capabilities.
-//!     - When multiplexing using macros like [`tokio::select`] with a cancellation token or a timeout timer, futures may be implicitly dropped. If pending I/O object could be polled directly, it may lead to missed completions, which may lead to subtle bugs where states are out of sync with the underlying file descriptor. To counteract that, the [`PendingIo::completion`] method returns a trivially droppable future that can be multiplexed with these futures without triggering the cancellation mechanism.
-//!     - The [`PendingIo::map`] method allows running `FnOnce` code that has to run after the operation is completed, regardless of whether the pending I/O operation is dropped early or not.
-//!         - This is useful for structures where there is a user-mode offset field that requires atomic synchronization with the kernel-mode seek position.
-//!     - [`PendingIo`] objects do not implement [`Future`] by default.
-//!         - If you wish to await the I/O operation directly, you can use the crate feature `pending-io-futures`.
-//!     - The cancellation mechanism uses a dedicated submission queue to prevent deadlocks.
+//! - Pending I/O objects returned from primitive operations ([`PendingIo`], e.g. [`Client::write_from`]) are designed to be as memory-safe and cancellation-safe as possible in Rust.
 //!  
 //! # Requirements
 //! - Tokio runtime with at least the `rt` feature enabled. This is because this library uses Tokio's blocking executor for fallback implementations when `io_uring` is not available or supported for the operation.
+//! - Current-thread Tokio runtimes are supported, but it is recommended to only use this in the context of a multi-threaded runtime (`rt-multi-thread` feature) to avoid blocking the runtime if futures spawned from the operations are cancelled.
 //! ```toml
-//! tokio = { version = "1", features = ["rt", "macros"] }
+//! tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 //! ```
 //!
+//! # Usage notes
+//!
+//! ## Cancellation safety and correctness
+//! - [`PendingIo`] objects are **partially** cancellation-safe. It does so by requiring callers to explicitly generate a trivially cancellable [`Future`] using [`PendingIo::completion`], and call [`PendingIo::cancel`] should something else get in the way, like a cancellation request.
+//! - It is impossible to guarantee complete cancellation safety because io_uring's pending requests are driven by the kernel, which is not compatible with Rust's passive [`Future`] semantics (epoll-based APIs excel in this regard), meaning that [`PendingIo`] requests may be cancelled after they have completed. See "[Async Rust is not safe with io_uring](https://tonbo.io/blog/async-rust-is-not-safe-with-io-uring)" for more details.
+//! - To prevent cancellation unsoundness resulting from this, code that relies on any critical side effects (such as reflecting the internal file's seek position) should use only API methods that return [`PendingIo`] objects, and run these effects only within [`PendingIo::map`].
+//! - Convenience methods return cancellation-unsafe futures, and dropping them results in non-deterministic behavior (e.g. file might be partially written to or read from).
+//! - The `pending-io-futures` feature allows awaiting [`PendingIo`] objects directly, but it sacrifices some cancellation safety because the [`PendingIo`] objects may be implicitly dropped. Therefore, this feature is disabled by default.
+//!
+//! ## Memory safety
+//! - Futures and pending objects generated by this API borrows file descriptors and potentially buffers from the callers, and internal threads, as well as the kernel, reference them until these objects are properly disposed of. Do not use [`core::mem::forget`] on any such objects.
+//!
 //! # Architecture
-//! - If io_uring is available, each client consists of 3 main threads:
-//!     - Two submitter threads for submitting commands to io_uring, one for normal operations and one for cancel operations.
+//! - If `io_uring` is available, each client consists of 2 main threads:
+//!     - One submission thread for submitting commands to io_uring.
 //!     - One reaper thread for handling completions from the completion queue.
-//! - For the default operation mode ([`default_client`] and [`HybridExt`] trait), the library sets up a number of clients equal to the number of logical CPU cores. It then attempts to evenly distribute the operations across the clients in a round-robin mode. This mitigates tail latency from idle clients and reduces the chance for a client's processing queues to overflow.
+//! - Backpressure for `io_uring` is provided with two submission ticket queues. Pending requests will yield if there is no ticket available.
+//! - For the default operation mode ([`default_client`] and [`HybridExt`] trait), the library sets up a number of clients equal to the number of logical CPU cores. It then attempts to evenly distribute the operations across the clients in a round-robin mode (although the chosen client only changes after a client is expected to be fully queued). This mitigates tail latency from idle clients and reduces the chance for a client's processing queues to overflow.
 #![cfg(unix)]
+#![warn(missing_docs)]
 mod borrowed_buf;
 pub mod client;
 mod default;
@@ -90,37 +98,56 @@ pub use fs::OpenOptions;
 pub use iobuf::IoBuf;
 pub use iobuf::IoBufMut;
 
+/// High-level trait for reading operations.
 #[async_trait::async_trait]
 pub trait HybridRead: UringTarget + Sync + Send {
     /// Asynchronous version of [`std::io::Read::read`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     #[inline]
     fn read<'a>(&'a mut self, buf: &'a mut [u8]) -> PendingIo<'a, io::Result<usize>> {
         self.hybrid_read(buf)
     }
 
     /// Alias for [`HybridRead::read`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     fn hybrid_read<'a>(&'a mut self, buf: &'a mut [u8]) -> PendingIo<'a, io::Result<usize>> {
         default_client().read(self, buf)
     }
 
     /// Asynchronous version of [`std::io::Read::read_to_end`].
+    ///
+    /// # Cancellation safety
+    /// This method is not cancellation-safe.
     #[inline]
     async fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
         self.hybrid_read_to_end(buf).await
     }
 
     /// Alias for [`HybridRead::read_to_end`].
+    ///
+    /// # Cancellation safety
+    /// This method is not cancellation-safe.
     async fn hybrid_read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
         default_client().read_to_end(self, buf).await
     }
 
     /// Asynchronous version of [`std::io::Read::read_to_string`].
+    ///
+    /// # Cancellation safety
+    /// This method is not cancellation-safe.
     #[inline]
     async fn read_to_string(&mut self, buf: &mut String) -> io::Result<usize> {
         self.hybrid_read_to_string(buf).await
     }
 
     /// Alias for [`HybridRead::read_to_string`].
+    ///
+    /// # Cancellation safety
+    /// This method is not cancellation-safe.
     async fn hybrid_read_to_string(&mut self, buf: &mut String) -> io::Result<usize> {
         default_client().read_to_string(self, buf).await
     }
@@ -132,11 +159,17 @@ pub trait HybridRead: UringTarget + Sync + Send {
     }
 
     /// Alias for [`HybridRead::read_exact`].
+    ///
+    /// # Cancellation safety
+    /// This method is not cancellation-safe.
     async fn hybrid_read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
         default_client().read_exact(self, buf).await
     }
 
     /// Asynchronous version of [`std::os::unix::fs::FileExt::read_at`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     #[inline]
     fn read_at<'a>(
         &'a self,
@@ -147,6 +180,9 @@ pub trait HybridRead: UringTarget + Sync + Send {
     }
 
     /// Alias for [`HybridRead::read_at`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     fn hybrid_read_at<'a>(
         &'a self,
         buf: &'a mut [u8],
@@ -156,6 +192,9 @@ pub trait HybridRead: UringTarget + Sync + Send {
     }
 
     /// Asynchronous version of [`std::os::unix::fs::FileExt::read_exact_at`].
+    ///
+    /// # Cancellation safety
+    /// This method is not cancellation-safe.
     #[inline]
     async fn read_exact_at(
         &self,
@@ -166,6 +205,9 @@ pub trait HybridRead: UringTarget + Sync + Send {
     }
 
     /// Alias for [`HybridRead::read_exact_at`].
+    ///
+    /// # Cancellation safety
+    /// This method is not cancellation-safe.
     async fn hybrid_read_exact_at(
         &self,
         buf: &mut [u8],
@@ -175,6 +217,9 @@ pub trait HybridRead: UringTarget + Sync + Send {
     }
 
     /// Asynchronous version of [`std::io::Read::read_vectored`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     fn read_vectored<'a>(
         &'a mut self,
         buf: &'a mut [IoSliceMut<'a>],
@@ -183,6 +228,9 @@ pub trait HybridRead: UringTarget + Sync + Send {
     }
 
     /// Alias for [`HybridRead::read_vectored`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     fn hybrid_read_vectored<'a>(
         &'a mut self,
         buf: &'a mut [IoSliceMut<'a>],
@@ -191,6 +239,9 @@ pub trait HybridRead: UringTarget + Sync + Send {
     }
 
     /// Asynchronous version of [`std::os::unix::fs::FileExt::read_vectored_at`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     fn read_vectored_at<'a>(
         &'a self,
         buf: &'a mut [IoSliceMut<'a>],
@@ -200,6 +251,9 @@ pub trait HybridRead: UringTarget + Sync + Send {
     }
 
     /// Alias for [`HybridRead::read_vectored_at`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     fn hybrid_read_vectored_at<'a>(
         &'a self,
         buf: &'a mut [IoSliceMut<'a>],
@@ -229,37 +283,56 @@ pub trait HybridRead: UringTarget + Sync + Send {
     // TODO: Implement bytes(), chain() and take()
 }
 
+/// High-level trait for writing operations.
 #[async_trait::async_trait]
 pub trait HybridWrite: UringTarget + Sync + Send {
     /// Asynchronous version of [`std::io::Write::write`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     #[inline]
     fn write<'a>(&'a mut self, buf: &'a [u8]) -> PendingIo<'a, io::Result<usize>> {
         self.hybrid_write(buf)
     }
 
     /// Alias for [`HybridWrite::write`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     fn hybrid_write<'a>(&'a mut self, buf: &'a [u8]) -> PendingIo<'a, io::Result<usize>> {
         default_client().write(self, buf)
     }
 
     /// Asynchronous version of [`std::io::Write::write_all`].
+    ///
+    /// # Cancellation safety
+    /// This method is not cancellation-safe.
     #[inline]
     async fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
         self.hybrid_write_all(buf).await
     }
 
     /// Alias for [`HybridWrite::write_all`].
+    ///
+    /// # Cancellation safety
+    /// This method is not cancellation-safe.
     async fn hybrid_write_all(&mut self, buf: &[u8]) -> io::Result<()> {
         default_client().write_all(self, buf).await
     }
 
-    /// Asynchronous version of [`std::io::Write::write_all_at`].
+    /// Asynchronous version of [`std::os::unix::fs::FileExt::write_all_at`].
+    ///
+    /// # Cancellation safety
+    /// This method is not cancellation-safe.
     #[inline]
     async fn write_all_at(&self, buf: &[u8], offset: impl TryInto<u64> + Send) -> io::Result<()> {
         self.hybrid_write_all_at(buf, offset).await
     }
 
     /// Alias for [`HybridWrite::write_all_at`].
+    ///
+    /// # Cancellation safety
+    /// This method is not cancellation-safe.
     async fn hybrid_write_all_at(
         &self,
         buf: &[u8],
@@ -268,7 +341,10 @@ pub trait HybridWrite: UringTarget + Sync + Send {
         default_client().write_all_at(self, buf, offset).await
     }
 
-    /// Asynchronous version of [`std::io::Write::write_at`].
+    /// Asynchronous version of [`std::os::unix::fs::FileExt::write_at`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     #[inline]
     fn write_at<'a>(
         &'a self,
@@ -279,6 +355,9 @@ pub trait HybridWrite: UringTarget + Sync + Send {
     }
 
     /// Alias for [`HybridWrite::write_at`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     fn hybrid_write_at<'a>(
         &'a self,
         buf: &'a [u8],
@@ -288,6 +367,9 @@ pub trait HybridWrite: UringTarget + Sync + Send {
     }
 
     /// Asynchronous version of [`std::io::Write::write_vectored`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     fn write_vectored<'a>(
         &'a mut self,
         buf: &'a [IoSlice<'a>],
@@ -296,6 +378,9 @@ pub trait HybridWrite: UringTarget + Sync + Send {
     }
 
     /// Alias for [`HybridWrite::write_vectored`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     fn hybrid_write_vectored<'a>(
         &'a mut self,
         buf: &'a [IoSlice<'a>],
@@ -304,6 +389,9 @@ pub trait HybridWrite: UringTarget + Sync + Send {
     }
 
     /// Asynchronous version of [`std::os::unix::fs::FileExt::write_vectored_at`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     fn write_vectored_at<'a>(
         &'a self,
         buf: &'a [IoSlice<'a>],
@@ -313,6 +401,9 @@ pub trait HybridWrite: UringTarget + Sync + Send {
     }
 
     /// Alias for [`HybridWrite::write_vectored_at`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     fn hybrid_write_vectored_at<'a>(
         &'a self,
         buf: &'a [IoSlice<'a>],
@@ -322,12 +413,18 @@ pub trait HybridWrite: UringTarget + Sync + Send {
     }
 
     /// Asynchronous version of [`std::io::Write::flush`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     #[inline]
     fn flush<'a>(&'a mut self) -> PendingIo<'a, io::Result<()>> {
         self.hybrid_flush()
     }
 
     /// Alias for [`HybridWrite::flush`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     fn hybrid_flush<'a>(&'a mut self) -> PendingIo<'a, io::Result<()>> {
         default_client().flush(self)
     }
@@ -351,20 +448,30 @@ pub trait HybridWrite: UringTarget + Sync + Send {
     }
 }
 
+/// High-level trait for seeking operations.
 #[async_trait::async_trait]
 pub trait HybridSeek: UringTarget + Sync + Send {
     /// Asynchronous version of [`std::io::Seek::seek`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     #[inline]
     fn seek<'a>(&'a mut self, offset: SeekFrom) -> PendingIo<'a, io::Result<u64>> {
         self.hybrid_seek(offset)
     }
 
     /// Alias for [`HybridSeek::seek`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     fn hybrid_seek<'a>(&'a mut self, offset: SeekFrom) -> PendingIo<'a, io::Result<u64>> {
         default_client().seek(self, offset)
     }
 
     /// Low-level method for seeking to a specific offset in the file.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     #[inline]
     fn seek_ll<'a>(
         &'a mut self,
@@ -375,6 +482,9 @@ pub trait HybridSeek: UringTarget + Sync + Send {
     }
 
     /// Alias for [`HybridSeek::seek_ll`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     fn hybrid_seek_ll<'a>(
         &'a mut self,
         whence: nix::unistd::Whence,
@@ -384,8 +494,13 @@ pub trait HybridSeek: UringTarget + Sync + Send {
     }
 }
 
+/// High-level trait for non-data related file operations.
 #[async_trait::async_trait]
 pub trait HybridFile: UringTarget + Sync + Send {
+    /// Asynchronous version of [`std::fs::File::close`].
+    ///
+    /// # Cancellation safety
+    /// This method is uncancelable - it always runs to completion, and blocks if the future is dropped.
     fn close<'a>(self) -> PendingIo<'a, io::Result<()>>
     where
         Self: IntoRawFd + Sized + Send + 'a,
@@ -393,29 +508,44 @@ pub trait HybridFile: UringTarget + Sync + Send {
         default_client().close(self)
     }
 
-    /// Asynchronous version of [`std::io::File::metadata`].
+    /// Asynchronous version of [`std::fs::File::metadata`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     #[inline]
     fn metadata<'a>(&'a self) -> PendingIo<'a, io::Result<Metadata>> {
         self.hybrid_metadata()
     }
 
     /// Alias for [`HybridFile::metadata`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     fn hybrid_metadata<'a>(&'a self) -> PendingIo<'a, io::Result<Metadata>> {
         default_client().metadata(self)
     }
 
-    /// Asynchronous version of [`std::io::File::set_len`].
+    /// Asynchronous version of [`std::fs::File::set_len`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     #[inline]
     fn set_len<'a>(&'a self, size: u64) -> PendingIo<'a, io::Result<()>> {
         self.hybrid_set_len(size)
     }
 
     /// Alias for [`HybridFile::set_len`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     fn hybrid_set_len<'a>(&'a self, size: u64) -> PendingIo<'a, io::Result<()>> {
         default_client().ftruncate(self, size)
     }
 
-    /// Asynchronous version of [`std::io::File::set_times`].
+    /// Asynchronous version of [`std::fs::File::set_times`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     #[inline]
     fn set_times<'a>(
         &'a self,
@@ -426,6 +556,9 @@ pub trait HybridFile: UringTarget + Sync + Send {
     }
 
     /// Alias for [`HybridFile::set_times`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     fn hybrid_set_times<'a>(
         &'a self,
         atime: Option<TimeSpec>,
@@ -434,13 +567,19 @@ pub trait HybridFile: UringTarget + Sync + Send {
         default_client().futimens(self, atime, mtime)
     }
 
-    /// Asynchronous version of [`std::io::File::set_permissions`].
+    /// Asynchronous version of [`std::fs::File::set_permissions`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     #[inline]
     fn set_permissions<'a>(&'a self, permissions: Permissions) -> PendingIo<'a, io::Result<()>> {
         self.hybrid_set_permissions(permissions)
     }
 
     /// Alias for [`HybridFile::set_permissions`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     fn hybrid_set_permissions<'a>(
         &'a self,
         permissions: Permissions,
@@ -449,6 +588,9 @@ pub trait HybridFile: UringTarget + Sync + Send {
     }
 
     /// Asynchronous version of [`std::os::unix::fs::fchown`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     #[inline]
     fn set_owner<'a>(
         &'a self,
@@ -458,7 +600,10 @@ pub trait HybridFile: UringTarget + Sync + Send {
         self.hybrid_set_owner(uid, gid)
     }
 
-    /// Alias for [`HybridFile::set_owner`].    
+    /// Alias for [`HybridFile::set_owner`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     fn hybrid_set_owner<'a>(
         &'a self,
         uid: Option<Uid>,
@@ -468,95 +613,154 @@ pub trait HybridFile: UringTarget + Sync + Send {
     }
 
     /// Method for creating a hard link to the file at the specified path.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     #[inline]
     fn hard_link<'a>(&'a self, new_path: impl AsRef<Path>) -> PendingIo<'a, io::Result<()>> {
         self.hybrid_hard_link(new_path)
     }
 
     /// Alias for [`HybridFile::hard_link`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     fn hybrid_hard_link<'a>(&'a self, new_path: impl AsRef<Path>) -> PendingIo<'a, io::Result<()>> {
         default_client().hard_link_file(self, new_path)
     }
 
     /// Method for reading the target of the symlink file descriptor (requires opening via [`OFlag::O_PATH`] and [`OFlag::O_NOFOLLOW`]).
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     #[inline]
     fn read_link<'a>(&'a self) -> PendingIo<'a, io::Result<PathBuf>> {
         self.hybrid_read_link()
     }
 
     /// Alias for [`HybridFile::read_link`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     fn hybrid_read_link<'a>(&'a self) -> PendingIo<'a, io::Result<PathBuf>> {
         default_client().read_link_file(self)
     }
 
     /// Method for syncing the metadata and data of a file.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     #[inline]
     fn sync_all<'a>(&'a self) -> PendingIo<'a, io::Result<()>> {
         self.hybrid_sync_all()
     }
 
     /// Alias for [`HybridFile::sync_all`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     fn hybrid_sync_all<'a>(&'a self) -> PendingIo<'a, io::Result<()>> {
         default_client().sync_all(self)
     }
 
     /// Method for syncing the data of a file.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     #[inline]
     fn sync_data<'a>(&'a self) -> PendingIo<'a, io::Result<()>> {
         self.hybrid_sync_data()
     }
 
     /// Alias for [`HybridFile::sync_data`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     fn hybrid_sync_data<'a>(&'a self) -> PendingIo<'a, io::Result<()>> {
         default_client().sync_data(self)
     }
 
+    /// Method for setting the nonblocking status flag of a file descriptor.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     #[inline]
     async fn set_nonblocking(&mut self, nonblocking: bool) -> io::Result<()> {
         self.hybrid_set_nonblocking(nonblocking).await
     }
 
-    /// Alias for [`HybridFd::set_nonblocking`].
+    /// Alias for [`HybridFile::set_nonblocking`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     async fn hybrid_set_nonblocking(&mut self, nonblocking: bool) -> io::Result<()> {
         default_client().set_nonblocking(self, nonblocking).await
     }
 
+    /// Method for getting the status flags of a file descriptor.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     #[inline]
     fn get_status_flags<'a>(&'a mut self) -> PendingIo<'a, io::Result<OFlag>> {
         self.hybrid_get_status_flags()
     }
 
-    /// Alias for [`HybridFd::get_flags`].
+    /// Alias for [`HybridFile::get_status_flags`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     fn hybrid_get_status_flags<'a>(&'a mut self) -> PendingIo<'a, io::Result<OFlag>> {
         default_client().get_status_flags(self)
     }
 
+    /// Method for setting the status flags of a file descriptor.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     #[inline]
     fn set_status_flags<'a>(&'a mut self, flags: OFlag) -> PendingIo<'a, io::Result<()>> {
         self.hybrid_set_status_flags(flags)
     }
 
-    /// Alias for [`HybridFd::set_flags`].
+    /// Alias for [`HybridFile::set_status_flags`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     fn hybrid_set_status_flags<'a>(&'a mut self, flags: OFlag) -> PendingIo<'a, io::Result<()>> {
         default_client().set_status_flags(self, flags)
     }
 
+    /// Method for getting the descriptor flags of a file descriptor.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     #[inline]
     fn get_descriptor_flags<'a>(&'a mut self) -> PendingIo<'a, io::Result<FdFlag>> {
         self.hybrid_get_descriptor_flags()
     }
 
-    /// Alias for [`HybridFd::get_descriptor_flags`].
+    /// Alias for [`HybridFile::get_descriptor_flags`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     fn hybrid_get_descriptor_flags<'a>(&'a mut self) -> PendingIo<'a, io::Result<FdFlag>> {
         default_client().get_descriptor_flags(self)
     }
 
+    /// Method for setting the descriptor flags of a file descriptor.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     #[inline]
     fn set_descriptor_flags<'a>(&'a mut self, flags: FdFlag) -> PendingIo<'a, io::Result<()>> {
         self.hybrid_set_descriptor_flags(flags)
     }
 
-    /// Alias for [`HybridFd::set_descriptor_flags`].
+    /// Alias for [`HybridFile::set_descriptor_flags`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     fn hybrid_set_descriptor_flags<'a>(
         &'a mut self,
         flags: FdFlag,
@@ -564,12 +768,19 @@ pub trait HybridFile: UringTarget + Sync + Send {
         default_client().set_descriptor_flags(self, flags)
     }
 
+    /// Method for setting the close-on-exec status flag of a file descriptor.
+    ///
+    /// # Cancellation safety
+    /// This method is not cancellation-safe.
     #[inline]
     async fn set_close_on_exec(&mut self, close_on_exec: bool) -> io::Result<()> {
         self.hybrid_set_close_on_exec(close_on_exec).await
     }
 
-    /// Alias for [`HybridFd::set_close_on_exec`].
+    /// Alias for [`HybridFile::set_close_on_exec`].
+    ///
+    /// # Cancellation safety
+    /// This method is not cancellation-safe.
     async fn hybrid_set_close_on_exec(&mut self, close_on_exec: bool) -> io::Result<()> {
         default_client()
             .set_close_on_exec(self, close_on_exec)
@@ -593,9 +804,13 @@ pub trait HybridFile: UringTarget + Sync + Send {
     }
 }
 
+/// High-level trait for directory operations.
 #[async_trait::async_trait]
 pub trait HybridDir: UringTarget + Sync {
     /// Method for creating a hard link to the file at the specified path relative to the specified directory fd.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     #[inline]
     fn hard_link_at<'a>(
         &'a self,
@@ -607,7 +822,10 @@ pub trait HybridDir: UringTarget + Sync {
         self.hybrid_hard_link_at(old_path, new_dir_fd, new_path, flags)
     }
 
-    /// Alias for [`HybridFile::hard_link_at`].
+    /// Alias for [`HybridDir::hard_link_at`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     fn hybrid_hard_link_at<'a>(
         &'a self,
         old_path: impl AsRef<Path>,
@@ -619,28 +837,43 @@ pub trait HybridDir: UringTarget + Sync {
     }
 
     /// Method for unlinking a file at the specified path relative to the specified directory fd.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     #[inline]
     fn unlink_at<'a>(&'a self, path: impl AsRef<Path>) -> PendingIo<'a, io::Result<()>> {
         self.hybrid_unlink_at(path)
     }
 
     /// Alias for [`HybridDir::unlink_at`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     fn hybrid_unlink_at<'a>(&'a self, path: impl AsRef<Path>) -> PendingIo<'a, io::Result<()>> {
         default_client().unlink_at(self, path, UnlinkatFlags::NoRemoveDir)
     }
 
     /// Method for unlinking a directory at the specified path relative to the specified directory fd.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     #[inline]
     fn remove_dir_at<'a>(&'a self, path: impl AsRef<Path>) -> PendingIo<'a, io::Result<()>> {
         self.hybrid_remove_dir_at(path)
     }
 
     /// Alias for [`HybridDir::remove_dir_at`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     fn hybrid_remove_dir_at<'a>(&'a self, path: impl AsRef<Path>) -> PendingIo<'a, io::Result<()>> {
         default_client().unlink_at(self, path, UnlinkatFlags::RemoveDir)
     }
 
     /// Method for creating a symbolic link at the specified path relative to the specified directory fd.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     #[inline]
     fn symlink_at<'a>(
         &'a self,
@@ -651,6 +884,9 @@ pub trait HybridDir: UringTarget + Sync {
     }
 
     /// Alias for [`HybridDir::symlink_at`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     fn hybrid_symlink_at<'a>(
         &'a self,
         target: impl AsRef<Path>,
@@ -660,6 +896,9 @@ pub trait HybridDir: UringTarget + Sync {
     }
 
     /// Method for renaming a file at the specified path relative to the specified directory fd.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     #[inline]
     fn rename_at<'a>(
         &'a self,
@@ -672,6 +911,9 @@ pub trait HybridDir: UringTarget + Sync {
     }
 
     /// Alias for [`HybridDir::rename_at`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     fn hybrid_rename_at<'a>(
         &'a self,
         old_path: impl AsRef<Path>,
@@ -683,6 +925,9 @@ pub trait HybridDir: UringTarget + Sync {
     }
 
     /// Method for renaming a file at the specified path to a location pointed to by new_path.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     #[inline]
     fn rename<'a>(
         &'a self,
@@ -694,6 +939,9 @@ pub trait HybridDir: UringTarget + Sync {
     }
 
     /// Alias for [`HybridDir::rename`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     fn hybrid_rename<'a>(
         &'a self,
         old_path: impl AsRef<Path>,
@@ -705,6 +953,9 @@ pub trait HybridDir: UringTarget + Sync {
 
     /// Method for opening a file from a relative path to the directory fd.
     /// Unlike the client methods, this method always returns a [`tokio::fs::File`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     #[inline]
     fn open_at<'a>(
         &'a self,
@@ -715,6 +966,9 @@ pub trait HybridDir: UringTarget + Sync {
     }
 
     /// Alias for [`HybridDir::open_at`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     fn hybrid_open_at<'a>(
         &'a self,
         path: impl AsRef<Path>,
@@ -731,6 +985,9 @@ pub trait HybridDir: UringTarget + Sync {
 
     /// Method for creating a file using a relative path to the directory fd.
     /// Unlike the client methods, this method always returns a [`tokio::fs::File`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     #[inline]
     fn create_at<'a>(
         &'a self,
@@ -741,6 +998,9 @@ pub trait HybridDir: UringTarget + Sync {
     }
 
     /// Alias for [`HybridDir::create_at`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     fn hybrid_create_at<'a>(
         &'a self,
         path: impl AsRef<Path>,
@@ -754,6 +1014,9 @@ pub trait HybridDir: UringTarget + Sync {
     /// Method for creating a file using a relative path to the directory fd,
     /// ensuring that the file is always created or an error is returned.
     /// Unlike the client methods, this method always returns a [`tokio::fs::File`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     #[inline]
     fn create_new_at<'a>(
         &'a self,
@@ -764,6 +1027,9 @@ pub trait HybridDir: UringTarget + Sync {
     }
 
     /// Alias method for [`HybridDir::create_new_at`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     fn hybrid_create_new_at<'a>(
         &'a self,
         path: impl AsRef<Path>,
@@ -776,6 +1042,9 @@ pub trait HybridDir: UringTarget + Sync {
     }
 
     /// Method for creating a directory using a relative path to the directory fd.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     #[inline]
     fn create_dir_at<'a>(
         &'a self,
@@ -786,6 +1055,9 @@ pub trait HybridDir: UringTarget + Sync {
     }
 
     /// Alias for [`HybridDir::create_dir_at`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     fn hybrid_create_dir_at<'a>(
         &'a self,
         path: impl AsRef<Path>,
@@ -795,6 +1067,9 @@ pub trait HybridDir: UringTarget + Sync {
     }
 
     /// Method for creating a node at a relative path to the directory fd.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     #[inline]
     fn create_node_at<'a>(
         &'a self,
@@ -806,6 +1081,9 @@ pub trait HybridDir: UringTarget + Sync {
     }
 
     /// Alias for [`HybridDir::create_node_at`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     fn hybrid_create_node_at<'a>(
         &'a self,
         path: impl AsRef<Path>,
@@ -817,12 +1095,18 @@ pub trait HybridDir: UringTarget + Sync {
 
     /// Method for reading the target of the symlink at the specified path relative to the specified directory fd.
     /// If the path is empty, the call is identical to [`HybridFile::read_link`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     #[inline]
     fn read_link_at<'a>(&'a self, path: impl AsRef<Path>) -> PendingIo<'a, io::Result<PathBuf>> {
         default_client().read_link_at(self, path)
     }
 
-    /// Alias for [`HybridFile::read_link_at`].
+    /// Alias for [`HybridDir::read_link_at`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     fn hybrid_read_link_at<'a>(
         &'a self,
         path: impl AsRef<Path>,
@@ -831,6 +1115,7 @@ pub trait HybridDir: UringTarget + Sync {
     }
 }
 
+/// High-level trait for combining I/O subtraits.
 #[async_trait::async_trait]
 pub trait HybridExt:
     UringTarget + HybridRead + HybridWrite + HybridSeek + HybridFile + HybridDir

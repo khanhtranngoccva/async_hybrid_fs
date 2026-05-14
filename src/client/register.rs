@@ -145,12 +145,16 @@ impl UringTarget for OwnedRegisteredFile {
     }
 }
 
+/// Errors that can occur when registering a file.
 #[derive(Error, Debug)]
 pub enum RegisterError {
+    /// io_uring is not supported on the target system.
     #[error("io_uring not supported")]
     IoUringNotSupported,
+    /// Too many files registered.
     #[error("too many files registered")]
     TooManyFilesRegistered,
+    /// I/O error occurred while registering file.
     #[error("I/O error occurred while registering file")]
     IoError(#[from] io::Error),
 }

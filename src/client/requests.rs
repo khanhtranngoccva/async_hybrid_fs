@@ -8,13 +8,18 @@ use std::{
 
 /// A raw target object that can be used by the io_uring client, which represents either a borrowed file descriptor or a borrowed fixed entry.
 ///
-/// A user may obtain a mutable Target object by calling the unsafe [`Client::as_target`](crate::Client::as_target) method on an immutable UringTarget object, which allows bypassing mutable checks to avoid certain overhead.
+/// A user may obtain a mutable Target object by calling the unsafe [`Client::to_target`](crate::client::Client::to_target) method on an immutable UringTarget object, which allows bypassing mutable checks to avoid certain overhead.
 #[derive(Debug, Clone)]
 pub enum Target {
+    /// A borrowed file descriptor.
     Fd(RawFd),
+    /// A borrowed fixed entry.
     Fixed {
+        /// The index of the fixed entry.
         index: u32,
+        /// The raw file descriptor of the fixed entry.
         raw_fd: RawFd,
+        /// The identity of the io_uring instance. If the [`Target`] is used with a different [`Client`](crate::client::Client) instance, the index field is invalid and the file descriptor is used instead.
         uring_identity: Arc<()>,
     },
 }

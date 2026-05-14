@@ -1,3 +1,4 @@
+//! Core client module for asynchronous I/O operations.
 mod completion;
 mod operations;
 pub(crate) mod pending_io;
@@ -34,6 +35,8 @@ pub const URING_LEN_MAX: u64 = 2 * 1024 * 1024 * 1024 - 4096;
 
 /// Maximum number of files that can be registered with a single Uring instance.
 const MAX_REGISTERED_FILES: u32 = 4096;
+
+/// The client instance for asynchronous I/O operations.
 pub struct Client {
     uring: Option<ClientUring>,
     uring_enabled: Arc<AtomicBool>,
@@ -75,10 +78,13 @@ impl Drop for Client {
     }
 }
 
+/// Errors that can occur when building a client.
 #[derive(Debug, thiserror::Error)]
 pub enum ClientBuildError {
+    /// io_uring is not supported on the target system.
     #[error("io-uring not supported")]
     IoUringNotSupported,
+    /// io_uring build failed.
     #[error("io-uring build failed")]
     IoUringBuildFailed(#[from] io::Error),
 }
@@ -115,7 +121,7 @@ pub struct UringCfg {
     /// The kernel will clamp this to the maximum supported size via `IORING_SETUP_CLAMP`.
     ///
     /// If you encounter `ENOMEM` errors during initialization, try reducing this value.
-    /// Defaults to [`DEFAULT_RING_SIZE`] (16384 entries).
+    /// Defaults to [`DEFAULT_OP_QUEUE_SIZE`] (16384 entries).
     pub operation_queue_size: u32,
 
     /// Size of the io_uring submission/completion queues for cancel operations (number of entries).
@@ -124,7 +130,7 @@ pub struct UringCfg {
     /// The kernel will clamp this to the maximum supported size via `IORING_SETUP_CLAMP`.
     ///
     /// If you encounter `ENOMEM` errors during initialization, try reducing this value.
-    /// Defaults to [`DEFAULT_RING_SIZE`] (16384 entries).
+    /// Defaults to [`DEFAULT_CANCEL_QUEUE_SIZE`] (512 entries).
     pub cancel_queue_size: u32,
 
     /// Enable cooperative task running (Linux 5.19+). When enabled, the kernel will only process completions when the application explicitly asks for them, reducing overhead.
@@ -158,6 +164,7 @@ impl Default for UringCfg {
 }
 
 impl Client {
+    /// Builds a new client with the given configuration.
     pub fn build(cfg: UringCfg) -> Result<Client, ClientBuildError> {
         let expected_total_squeue_size = cfg
             .operation_queue_size
@@ -376,6 +383,7 @@ fn ticket_dropper_thread(ticket_dropper: crossbeam_channel::Receiver<Arc<Submiss
     }
 }
 
+/// Trait that represents valid objects as a raw `io_uring` target.
 pub trait UringTarget {
     /// Method for converting the target to a borrowed file descriptor.
     fn as_file_descriptor(&self) -> BorrowedFd<'_>;
@@ -401,8 +409,10 @@ where
     }
 }
 
+/// A boxed [`UringTarget`] object that can be sent and shared between threads.
 pub type BoxedUringTarget<'a> = Box<dyn UringTarget + Send + Sync + 'a>;
 
+/// Implementation of the [`UringTarget`] trait for a boxed [`UringTarget`] object.
 impl<'a> UringTarget for BoxedUringTarget<'a> {
     unsafe fn as_target(&self, _uring_identity: &Arc<()>) -> Target {
         unsafe { self.as_ref().as_target(_uring_identity) }
