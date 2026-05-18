@@ -311,12 +311,11 @@ impl Drop for SubmissionDropper {
     fn drop(&mut self) {
         let mut submission = unsafe { self.uring.submission_shared() };
         submission.sync();
-        // Poison pill is guaranteed to be the last submissible item, so we do not have to worry about entries being submitted and finding that the queue is full.
+        // Poison pill is guaranteed to be the last submissible item unless we are dealing with a panic, so we do not have to worry about entries being submitted and finding that the queue is full.
+        // If we are dealing with a panic and the normal submission queue is full, there is always space in the cancellation queue because its operations finish instantaneously.
         let entry = io_uring::opcode::Nop::new()
             .build()
-            .user_data(SubmissionTicketId::POISON.0)
-            // Take exclusive lock
-            .flags(squeue::Flags::IO_DRAIN);
+            .user_data(SubmissionTicketId::POISON.0);
         while unsafe { submission.push(&entry) }.is_err() {
             // The queue is in latest state, so if we cannot submit, we can safely wait for an event.
             self.uring
@@ -506,6 +505,8 @@ impl<'a> UringTarget for BoxedUringTarget<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::{sync::Arc, time::Duration};
+
     use crate::{Client, UringCfg};
 
     #[tokio::test]
@@ -520,24 +521,30 @@ mod tests {
     async fn submission_thread_panic_should_not_hang() {
         let client = Client::build(UringCfg::default()).expect("failed to build client");
         client.sthread_panic();
-        drop(client);
+        let (mut reader, _writer) = std::io::pipe().expect("failed to create pipe");
+        let mut buf = [0; 64];
+        let mut pending = client.read(&mut reader, &mut buf);
+        let completion = pending.completion().expect("no completion future returned");
+        completion.await.expect_err("completion should fail");
     }
 
     #[tokio::test]
     #[test_log::test]
     async fn completion_thread_panic_should_not_hang() {
-        let client = Client::build(UringCfg::default()).expect("failed to build client");
-        let (mut reader, _writer) = std::io::pipe().expect("failed to create pipe");
-        let mut buf = [0; 64];
-        let mut pending = client.read(&mut reader, &mut buf);
+        let client = Arc::new(Client::build(UringCfg::default()).expect("failed to build client"));
+        let task = tokio::task::spawn({
+            let client = client.clone();
+            async move {
+                let (mut reader, _writer) = std::io::pipe().expect("failed to create pipe");
+                let mut buf = [0; 64];
+                let mut pending = client.read(&mut reader, &mut buf);
+                let completion = pending.completion().expect("no completion future returned");
+                // Trigger the completion future to start.
+                completion.await.expect_err("completion should fail");
+            }
+        });
+        tokio::time::sleep(Duration::from_secs_f64(0.01)).await;
         client.cthread_panic();
-        // The completion thread panicked, so the operation should fail because no messages can ever be received.
-        pending
-            .completion()
-            .expect("no completion future returned")
-            .await
-            .expect_err("completion should fail");
-        drop(pending);
-        drop(client);
+        task.await.expect("task should not panic");
     }
 }
