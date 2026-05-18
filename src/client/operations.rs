@@ -2,7 +2,7 @@ use crate::{
     PendingIo, Target,
     borrowed_buf::BorrowedBuf,
     client::{
-        Client, URING_LEN_MAX, UringTarget,
+        Client, InterruptCommand, URING_LEN_MAX, UringTarget,
         completion::{ReadResult, ReadvResult, WriteResult, WritevResult},
         pending_io::{
             fallback::TokioScopedPendingIo,
@@ -45,7 +45,28 @@ use std::{
 impl Client {
     const AT_FDCWD: BorrowedFd<'static> = unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) };
 
-    fn is_uring_operation_supported(&self, code: u8) -> bool {
+    /// Send a panic signal to the submission thread, allows simulation of OOM on the submission thread.
+    #[allow(unused)]
+    pub(crate) fn sthread_panic(&self) {
+        if let Some(uring) = self.uring.as_ref() {
+            let _ = uring
+                .interrupt_sender
+                .send(InterruptCommand::SubmissionPanic);
+        }
+    }
+
+    /// Send a panic signal to the completion thread, allows simulation of OOM on the completion thread.
+    #[allow(unused)]
+    pub(crate) fn cthread_panic(&self) {
+        if let Some(uring) = self.uring.as_ref() {
+            let _ = uring
+                .interrupt_sender
+                .send(InterruptCommand::CompletionPanic);
+        }
+    }
+
+    /// Check if the specified io_uring operation is supported. See [`io_uring::Probe::is_supported`] for documentation.
+    pub fn is_uring_operation_supported(&self, code: u8) -> bool {
         let uring = match self.uring.as_ref() {
             Some(uring) => uring,
             None => return false,

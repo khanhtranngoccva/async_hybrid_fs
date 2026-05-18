@@ -10,9 +10,14 @@ pub(crate) struct SubmissionTicketId(pub(crate) u64);
 
 impl SubmissionTicketId {
     pub(crate) const POISON: Self = Self(u64::MAX);
+    pub(crate) const COMPLETION_PANIC: Self = Self(u64::MAX - 1);
 
     pub(crate) fn is_poison(&self) -> bool {
         *self == Self::POISON
+    }
+
+    pub(crate) fn is_completion_panic(&self) -> bool {
+        *self == Self::COMPLETION_PANIC
     }
 }
 
@@ -37,7 +42,7 @@ impl SubmissionTicket {
 
 impl Drop for SubmissionTicket {
     fn drop(&mut self) {
-        if self.id.is_poison() {
+        if self.id.is_poison() || self.id.is_completion_panic() {
             return;
         }
         let _ = self.id_tx.send(self.id);
@@ -89,14 +94,6 @@ impl SubmissionTicketQueue {
             starting_id += *size as u64;
         }
         queues
-    }
-
-    /// Create a poison submission ticket.
-    pub(crate) fn poison_ticket(&self) -> SubmissionTicket {
-        SubmissionTicket {
-            id: SubmissionTicketId::POISON,
-            id_tx: self.id_tx.clone(),
-        }
     }
 
     /// Request a submission ticket. If the queue is empty, the caller will block until a ticket is available.

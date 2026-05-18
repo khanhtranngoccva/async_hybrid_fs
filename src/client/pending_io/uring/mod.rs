@@ -19,11 +19,13 @@ pub(crate) mod write_from_vectored;
 use std::{
     fmt::Debug,
     io,
+    ops::{Deref, DerefMut},
     pin::Pin,
     sync::Arc,
     task::{Poll, Waker},
 };
 
+use dashmap::DashMap;
 use io_uring::squeue;
 use parking_lot::{Condvar, Mutex};
 
@@ -32,6 +34,38 @@ use crate::client::{
     ClientUring,
     ticketing::{SubmissionTicket, SubmissionTicketId, SubmissionTicketQueue},
 };
+
+pub(crate) struct PendingMap {
+    inner: DashMap<SubmissionTicketId, UringPendingIoFiller>,
+}
+
+impl PendingMap {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: DashMap::new(),
+        }
+    }
+}
+
+impl Deref for PendingMap {
+    type Target = DashMap<SubmissionTicketId, UringPendingIoFiller>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl DerefMut for PendingMap {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+impl Drop for PendingMap {
+    fn drop(&mut self) {
+        
+    }
+}
 
 // New implementation of pending I/O, universally usable for all operations
 
@@ -116,22 +150,6 @@ impl<'lifetime> UringPendingIoObj<'lifetime> {
         }
     }
 
-    pub(crate) fn poison(uring: &'lifetime ClientUring) -> Self {
-        let entry = io_uring::opcode::Nop::new()
-            .build()
-            .flags(squeue::Flags::IO_DRAIN);
-        Self {
-            state: Arc::new(Mutex::new(UringPendingIoState::new())),
-            transition_cv: Arc::new(Condvar::new()),
-            entry,
-            submission_ticket: Some(Arc::new(
-                uring.normal_submission_ticket_queue.poison_ticket(),
-            )),
-            uring,
-            ticket_queue: &uring.normal_submission_ticket_queue,
-        }
-    }
-
     fn submitter(&self) -> UringPendingIoSubmitter {
         UringPendingIoSubmitter {
             state: self.state.clone(),
@@ -151,30 +169,24 @@ impl<'lifetime> UringPendingIoObj<'lifetime> {
         }
     }
 
-    fn send(&self, submitter: UringPendingIoSubmitter) {
-        self.uring
-            .submission_sender
-            .send(submitter)
-            .expect("submission thread should be running");
-    }
-
-    fn insert_filler(&self, ticket_id: SubmissionTicketId, filler: UringPendingIoFiller) {
-        let preexisting_key = self.uring.pending.insert(ticket_id, filler);
+    fn submit(&mut self, ticket: Arc<SubmissionTicket>) -> bool {
+        let pending_map = match self.uring.pending.upgrade() {
+            Some(map) => map,
+            None => return false,
+        };
+        let ticket_id = ticket.id();
+        self.submission_ticket = Some(ticket);
+        let filler = self.filler();
+        let preexisting_key = pending_map.insert(ticket_id, filler);
         assert!(
             preexisting_key.is_none(),
             "ticket id {} already exists in pending map",
             ticket_id.0
         );
-    }
-
-    fn submit(&mut self, ticket: Arc<SubmissionTicket>) {
-        let ticket_id = ticket.id();
-        self.submission_ticket = Some(ticket);
-        let filler = self.filler();
-        self.insert_filler(ticket_id, filler);
         let submitter = self.submitter();
         // Send the submitter to the submission thread.
-        self.send(submitter);
+        let result = self.uring.submission_sender.send(submitter);
+        result.is_ok()
     }
 }
 
@@ -190,7 +202,7 @@ impl UringPendingIoSubmitter {
     // Mark the operation as submitted.
     pub(crate) fn mark_submitted(self) {
         let mut state = self.state.lock();
-        // The completion thread may race and fill the result prematurely, then we should do nothing.
+        // The completion thread or drop handlers may race and fill the result prematurely, then we should do nothing.
         if state.status == UringPendingIoStatus::Done {
             return;
         }
@@ -208,6 +220,34 @@ impl UringPendingIoSubmitter {
     }
 }
 
+impl Drop for UringPendingIoSubmitter {
+    fn drop(&mut self) {
+        let mut state = self.state.lock();
+        
+        let mut waker = None;
+        let mut to_notify = false;
+        // Items that are not marked as submitted should be marked with an error on drop for panic safety.
+        if state.status == UringPendingIoStatus::Submitting
+            || state.status == UringPendingIoStatus::NotSubmitted
+        {
+            state.status = UringPendingIoStatus::Done;
+            state.result = Some(Err(io::Error::other(
+                "operation was aborted, internal threads may have panicked",
+            )));
+            waker = Some(core::mem::replace(&mut state.waker, Waker::noop().clone()));
+            to_notify = true;
+        };
+        drop(state);
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+        if to_notify {
+            self.transition_cv.notify_one();
+        }
+        
+    }
+}
+
 /// Filler to be sent to the reaper thread for updating the state of the operation.
 pub(crate) struct UringPendingIoFiller {
     state: Arc<Mutex<UringPendingIoState>>,
@@ -218,6 +258,10 @@ pub(crate) struct UringPendingIoFiller {
 impl UringPendingIoFiller {
     pub(crate) fn complete(self, result: io::Result<i32>) {
         let mut state = self.state.lock();
+        // A result cannot be filled twice.
+        if state.status == UringPendingIoStatus::Done {
+            return;
+        }
         state.status = UringPendingIoStatus::Done;
         state.result = Some(result);
         // We would like to remove the ticket, but it blocks the reaper thread.
@@ -226,6 +270,29 @@ impl UringPendingIoFiller {
         drop(state);
         waker.wake();
         self.transition_cv.notify_one();
+    }
+}
+
+impl Drop for UringPendingIoFiller {
+    fn drop(&mut self) {
+        let mut state = self.state.lock();
+        let mut waker = None;
+        let mut to_notify = false;
+        if state.status != UringPendingIoStatus::Done {
+            state.status = UringPendingIoStatus::Done;
+            state.result = Some(Err(io::Error::other(
+                "operation was aborted, internal threads may have panicked",
+            )));
+            waker = Some(core::mem::replace(&mut state.waker, Waker::noop().clone()));
+            to_notify = true;
+        };
+        drop(state);
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+        if to_notify {
+            self.transition_cv.notify_one();
+        }
     }
 }
 
@@ -268,7 +335,11 @@ impl<'lifetime> Future for UringPendingIoObj<'lifetime> {
                 state.status = UringPendingIoStatus::Submitting;
                 state.waker.clone_from(cx.waker());
                 drop(state);
-                inner.submit(ticket);
+                if !inner.submit(ticket) {
+                    return Poll::Ready(Err(io::Error::other(
+                        "operation failed, internal threads may have panicked",
+                    )));
+                }
                 Poll::Pending
             }
             UringPendingIoStatus::Submitting => {
@@ -333,7 +404,11 @@ impl<'lifetime> UringPendingIoObj<'lifetime> {
                     state.status = UringPendingIoStatus::Submitting;
                     drop(state);
                     // Temporarily release the lock to submit the operation - we can do that because the status is marked.
-                    self.submit(ticket);
+                    if !self.submit(ticket) {
+                        return Some(Err(io::Error::other(
+                            "operation failed, internal threads may have panicked",
+                        )));
+                    }
                     state = self.state.lock();
                     continue;
                 }
