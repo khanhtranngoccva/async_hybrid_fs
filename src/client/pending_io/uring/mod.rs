@@ -256,6 +256,10 @@ pub(crate) struct UringPendingIoFiller {
 
 #[hotpath::measure_all]
 impl UringPendingIoFiller {
+    pub(crate) fn status(&self) -> UringPendingIoStatus {
+        self.state.lock().status
+    }
+
     pub(crate) fn complete(self, result: io::Result<i32>) {
         let mut state = self.state.lock();
         // A result cannot be filled twice.

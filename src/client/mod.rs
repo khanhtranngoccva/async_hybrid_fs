@@ -16,15 +16,15 @@ use std::thread::JoinHandle;
 use ticketing::SubmissionTicketQueue;
 
 use dashmap::DashSet;
+use io_uring::IoUring;
 use io_uring::cqueue::Entry as CEntry;
 use io_uring::squeue::Entry as SEntry;
-use io_uring::{IoUring, squeue};
 pub use register::OwnedRegisteredFile;
 pub use register::RegisterError;
 pub use register::RegisteredFile;
 pub use requests::Target;
 
-use crate::client::pending_io::uring::{PendingMap, UringPendingIoSubmitter};
+use crate::client::pending_io::uring::{PendingMap, UringPendingIoStatus, UringPendingIoSubmitter};
 use crate::client::ticketing::SubmissionTicketId;
 
 /// Maximum length for a single io_uring read/write operation.
@@ -208,8 +208,8 @@ impl Client {
         if let Some(mut ring) = ring {
             // Pre-allocate sparse file table for registration (Linux 5.12+). If this fails, file registration won't work but unregistered fds will still function.
             let _ = ring.submitter().register_files_sparse(MAX_REGISTERED_FILES);
-            // Limit squeue to usize::MAX - 2 to avoid conflict with the reserved IDs (u64::MAX and u64::MAX - 1).
-            let actual_total_squeue_size = ring.submission().capacity().min(usize::MAX - 2);
+            // Limit squeue to usize::MAX - 3 to avoid conflict with the reserved IDs.
+            let actual_total_squeue_size = ring.submission().capacity().min(usize::MAX - 3);
             // Investigate the submission queue size.
             let (op_ticket_queue_size, cancel_ticket_queue_size) = if actual_total_squeue_size
                 >= expected_total_squeue_size as usize
@@ -262,7 +262,15 @@ impl Client {
                 .name(String::from("ahfs_worker"))
                 .spawn({
                     let ring = ring.clone();
-                    move || submission_thread(ring, submission_receiver, interrupt_receiver)
+                    let pending_map = pending_map.clone();
+                    move || {
+                        submission_thread(
+                            ring,
+                            pending_map,
+                            submission_receiver,
+                            interrupt_receiver,
+                        )
+                    }
                 })
                 .expect("should spawn thread");
             let cthread = std::thread::Builder::new()
@@ -298,11 +306,12 @@ impl Client {
 /// Dropper for stopping the completion thread by submitting a poison ticket. Should not allocate memory from the heap, and works if the thread either exits normally or panics.
 pub(crate) struct SubmissionDropper {
     uring: Arc<IoUring>,
+    pending_map: Arc<PendingMap>,
 }
 
 impl SubmissionDropper {
-    pub(crate) fn new(uring: Arc<IoUring>) -> Self {
-        Self { uring }
+    pub(crate) fn new(uring: Arc<IoUring>, pending_map: Arc<PendingMap>) -> Self {
+        Self { uring, pending_map }
     }
 }
 
@@ -311,11 +320,36 @@ impl Drop for SubmissionDropper {
     fn drop(&mut self) {
         let mut submission = unsafe { self.uring.submission_shared() };
         submission.sync();
-        // Poison pill is guaranteed to be the last submissible item unless we are dealing with a panic, so we do not have to worry about entries being submitted and finding that the queue is full.
-        // If we are dealing with a panic and the normal submission queue is full, there is always space in the cancellation queue because its operations finish instantaneously.
+        // Cancel everything in the pending map. At this stage, no operations can be marked as submitted anymore, so there is no race condition.
+        // The existence of the cancellation queue where operations are completed instantaneously guarantees that there is always a space for these special operations.
+        for kv in self.pending_map.iter() {
+            let id = kv.key();
+            let filler = kv.value();
+            if filler.status() != UringPendingIoStatus::Submitted {
+                continue;
+            }
+            // Allowing multiple operations to use the same ticket is OK here because we do not expect a response and no discriminator is necessary.
+            let entry = io_uring::opcode::AsyncCancel::new(id.0)
+                .build()
+                .user_data(SubmissionTicketId::POISON_CANCEL.0);
+            while unsafe { submission.push(&entry) }.is_err() {
+                self.uring.submit_and_wait(1).expect(
+                    "failed to wait for empty submission slot and submit cancellation operations",
+                );
+                submission.sync();
+                continue;
+            }
+        }
+        submission.sync();
+        self.uring
+            .submitter()
+            .submit()
+            .expect("failed to submit last batch of cancellation operations");
+        // Poison pill is guaranteed to be the last item, after all operations are done or cancelled. The IO_DRAIN flag ensures that the cancellation have all finished.
         let entry = io_uring::opcode::Nop::new()
             .build()
-            .user_data(SubmissionTicketId::POISON.0);
+            .user_data(SubmissionTicketId::POISON.0)
+            .flags(io_uring::squeue::Flags::IO_DRAIN);
         while unsafe { submission.push(&entry) }.is_err() {
             // The queue is in latest state, so if we cannot submit, we can safely wait for an event.
             self.uring
@@ -340,10 +374,11 @@ pub(crate) enum InterruptCommand {
 /// Thread for batching the io_uring_enter syscall to flush entries to the io_uring instance.
 fn submission_thread(
     ring: Arc<IoUring>,
+    pending_map: Arc<PendingMap>,
     receiver: crossbeam_channel::Receiver<UringPendingIoSubmitter>,
     interrupt: crossbeam_channel::Receiver<InterruptCommand>,
 ) {
-    let _submission_dropper = SubmissionDropper::new(ring.clone());
+    let _submission_dropper = SubmissionDropper::new(ring.clone(), pending_map.clone());
     let mut submission = unsafe { ring.submission_shared() };
     let capacity = submission.capacity();
     let mut queue = VecDeque::with_capacity(capacity);
@@ -452,6 +487,10 @@ fn completion_thread(
             if id.is_poison() {
                 break;
             }
+            // Anonymous cancellation operations, we do not need to respond.
+            if id.is_poison_cancel() {
+                continue;
+            }
             if id.is_completion_panic() {
                 panic!("completion thread intentionally panicked");
             }
@@ -519,13 +558,21 @@ mod tests {
     #[tokio::test]
     #[test_log::test]
     async fn submission_thread_panic_should_not_hang() {
-        let client = Client::build(UringCfg::default()).expect("failed to build client");
+        let client = Arc::new(Client::build(UringCfg::default()).expect("failed to build client"));
+        let task = tokio::task::spawn({
+            let client = client.clone();
+            async move {
+                let (mut reader, _writer) = std::io::pipe().expect("failed to create pipe");
+                let mut buf = [0; 64];
+                let mut pending = client.read(&mut reader, &mut buf);
+                let completion = pending.completion().expect("no completion future returned");
+                // Trigger the completion future to start. Panic in the submission thread should cause any remaining operations to be cancelled.
+                completion.await.expect_err("completion should fail");
+            }
+        });
+        tokio::time::sleep(Duration::from_secs_f64(0.01)).await;
         client.sthread_panic();
-        let (mut reader, _writer) = std::io::pipe().expect("failed to create pipe");
-        let mut buf = [0; 64];
-        let mut pending = client.read(&mut reader, &mut buf);
-        let completion = pending.completion().expect("no completion future returned");
-        completion.await.expect_err("completion should fail");
+        task.await.expect("task should not panic");
     }
 
     #[tokio::test]

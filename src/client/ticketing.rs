@@ -9,11 +9,20 @@ use std::{
 pub(crate) struct SubmissionTicketId(pub(crate) u64);
 
 impl SubmissionTicketId {
+    /// Special operation to signal the submission thread to stop.
+    /// Only sendable after the kernel has registered cancellations for all remaining Submitted operations.
     pub(crate) const POISON: Self = Self(u64::MAX);
-    pub(crate) const COMPLETION_PANIC: Self = Self(u64::MAX - 1);
+    /// Special operation that cancels an operation in the pending operations map with the Submitted status.
+    pub(crate) const POISON_CANCEL: Self = Self(u64::MAX - 1);
+    /// Operation to signal the completion thread to panic.
+    pub(crate) const COMPLETION_PANIC: Self = Self(u64::MAX - 2);
 
     pub(crate) fn is_poison(&self) -> bool {
         *self == Self::POISON
+    }
+
+    pub(crate) fn is_poison_cancel(&self) -> bool {
+        *self == Self::POISON_CANCEL
     }
 
     pub(crate) fn is_completion_panic(&self) -> bool {
@@ -42,7 +51,7 @@ impl SubmissionTicket {
 
 impl Drop for SubmissionTicket {
     fn drop(&mut self) {
-        if self.id.is_poison() || self.id.is_completion_panic() {
+        if self.id.is_poison() || self.id.is_completion_panic() || self.id.is_poison_cancel() {
             return;
         }
         let _ = self.id_tx.send(self.id);
