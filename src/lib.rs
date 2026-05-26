@@ -702,7 +702,7 @@ pub trait HybridFile: UringTarget + Sync + Send {
     /// # Cancellation safety
     /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     #[inline]
-    fn get_status_flags<'a>(&'a mut self) -> PendingIo<'a, io::Result<OFlag>> {
+    fn get_status_flags<'a>(&'a self) -> PendingIo<'a, io::Result<OFlag>> {
         self.hybrid_get_status_flags()
     }
 
@@ -710,7 +710,7 @@ pub trait HybridFile: UringTarget + Sync + Send {
     ///
     /// # Cancellation safety
     /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
-    fn hybrid_get_status_flags<'a>(&'a mut self) -> PendingIo<'a, io::Result<OFlag>> {
+    fn hybrid_get_status_flags<'a>(&'a self) -> PendingIo<'a, io::Result<OFlag>> {
         default_client().get_status_flags(self)
     }
 
@@ -736,7 +736,7 @@ pub trait HybridFile: UringTarget + Sync + Send {
     /// # Cancellation safety
     /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     #[inline]
-    fn get_descriptor_flags<'a>(&'a mut self) -> PendingIo<'a, io::Result<FdFlag>> {
+    fn get_descriptor_flags<'a>(&'a self) -> PendingIo<'a, io::Result<FdFlag>> {
         self.hybrid_get_descriptor_flags()
     }
 
@@ -744,7 +744,7 @@ pub trait HybridFile: UringTarget + Sync + Send {
     ///
     /// # Cancellation safety
     /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
-    fn hybrid_get_descriptor_flags<'a>(&'a mut self) -> PendingIo<'a, io::Result<FdFlag>> {
+    fn hybrid_get_descriptor_flags<'a>(&'a self) -> PendingIo<'a, io::Result<FdFlag>> {
         default_client().get_descriptor_flags(self)
     }
 
