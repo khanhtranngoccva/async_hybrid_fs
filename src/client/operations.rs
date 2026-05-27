@@ -1910,7 +1910,7 @@ impl Client {
             Path::new(""),
             &Self::AT_FDCWD,
             new_path,
-            LinkatFlags::empty(),
+            LinkatFlags::AT_EMPTY_PATH,
         )
     }
 
@@ -1928,7 +1928,7 @@ impl Client {
             old_path,
             &Self::AT_FDCWD,
             new_path,
-            LinkatFlags::empty(),
+            LinkatFlags::AT_EMPTY_PATH,
         )
     }
 
