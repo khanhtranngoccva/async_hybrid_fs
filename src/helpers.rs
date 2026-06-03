@@ -1,11 +1,8 @@
 use std::{
-    collections::{HashMap, HashSet},
     ffi::CString,
-    hash::Hash,
     io,
     os::unix::ffi::OsStrExt,
     path::Path,
-    sync::Arc,
 };
 
 /// Convert a path to a CString for use with io_uring operations.
@@ -80,46 +77,5 @@ where
     } else {
         g.len = g.buf.len();
         ret
-    }
-}
-
-pub(crate) trait StaticInternable: Clone + Eq + Hash {
-    fn create_intern_map() -> HashSet<Arc<Self>>;
-}
-
-pub(crate) struct StaticInterner<T>
-where
-    T: StaticInternable,
-{
-    inner: HashSet<Arc<T>>,
-}
-
-impl<T> StaticInterner<T>
-where
-    T: StaticInternable,
-{
-    pub(crate) fn new() -> Self {
-        Self {
-            inner: T::create_intern_map(),
-        }
-    }
-
-    /// Interns the value and returns a shared reference to it.
-    pub(crate) fn intern(&self, value: T) -> Arc<T> {
-        self.inner
-            .get(&value)
-            .expect("value should be interned")
-            .clone()
-    }
-
-    /// Iterates over the values in the map and retrieves the reference count of each value excluding the reference stored in the map, useful for metrics.
-    ///
-    /// # Notes
-    /// Items in the results are NOT interned so that the reference count remains accurate with multithread calls.
-    pub(crate) fn counts(&self) -> HashMap<T, usize> {
-        self.inner
-            .iter()
-            .map(|v| (v.as_ref().clone(), Arc::strong_count(v).saturating_sub(1)))
-            .collect()
     }
 }

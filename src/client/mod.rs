@@ -6,7 +6,7 @@ mod register;
 mod requests;
 pub(crate) mod ticketing;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::panic::UnwindSafe;
@@ -26,7 +26,6 @@ pub use requests::Target;
 
 use crate::client::pending_io::uring::{PendingMap, UringPendingIoStatus, UringPendingIoSubmitter};
 use crate::client::ticketing::SubmissionTicketId;
-use crate::helpers::StaticInterner;
 
 /// Maximum length for a single io_uring read/write operation.
 ///
@@ -46,7 +45,6 @@ pub(crate) struct ClientUring {
     submission_sender: crossbeam_channel::Sender<UringPendingIoSubmitter>,
     active_requests: Arc<AtomicUsize>,
     op_ticket_queue_size: usize,
-    status_interner: Arc<StaticInterner<UringPendingIoStatus>>,
     uring: Arc<IoUring>,
     probe: io_uring::Probe,
     sthread: JoinHandle<()>,
@@ -157,8 +155,6 @@ pub struct UringMetrics {
     pub active_operations: usize,
     /// Utilization of the io_uring instance.
     pub utilization: f64,
-    /// Status of each operation
-    pub status_counts: HashMap<UringPendingIoStatus, usize>,
 }
 
 impl Default for UringCfg {
@@ -301,7 +297,6 @@ impl Client {
                 submission_sender,
                 uring: ring,
                 active_requests: Arc::new(AtomicUsize::new(0)),
-                status_interner: Arc::new(StaticInterner::new()),
                 op_ticket_queue_size,
                 probe,
                 sthread,

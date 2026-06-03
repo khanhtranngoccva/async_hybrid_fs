@@ -51,12 +51,10 @@ impl Client {
             let active_operations = uring.active_requests.load(Ordering::Relaxed);
             let max_concurrent_operations = uring.op_ticket_queue_size;
             let utilization = active_operations as f64 / max_concurrent_operations as f64;
-            let status_counts = uring.status_interner.counts();
             UringMetrics {
                 max_concurrent_operations,
                 active_operations,
                 utilization,
-                status_counts,
             }
         })
     }
