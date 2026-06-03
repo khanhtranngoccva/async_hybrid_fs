@@ -4,9 +4,6 @@ use nix::fcntl::OFlag;
 use std::cmp;
 use std::io::Read;
 use std::path::Path;
-use std::sync::LazyLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::thread::JoinHandle;
 use tokio::runtime::Handle;
 
 #[allow(unused)]
@@ -106,20 +103,9 @@ pub async fn read_hybrid_multi(
     }
 }
 
-lazy_static::lazy_static! {
-    static ref MONITOR: JoinHandle<()> = std::thread::spawn(|| {
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(1));
-            println!("read_hybrid_default: {:?}", default_client().uring_metrics());
-        }
-    });
-}
-
 #[allow(unused)]
 pub async fn read_hybrid_default(path: impl AsRef<Path>, size: usize) {
-    let client = default_client();
-    MONITOR.is_finished();
-    let fd = client
+    let fd = default_client()
         .open_path(
             path.as_ref(),
             OFlag::O_RDONLY | OFlag::O_CLOEXEC,
@@ -134,7 +120,7 @@ pub async fn read_hybrid_default(path: impl AsRef<Path>, size: usize) {
     let mut size_left = size;
     while size_left > 0 {
         let to_read = cmp::min(size, size_left);
-        let bytes_read = client
+        let bytes_read = default_client()
             .read(&mut file, &mut buffer[..to_read])
             .completion()
             .expect("no completion future returned")
@@ -142,7 +128,7 @@ pub async fn read_hybrid_default(path: impl AsRef<Path>, size: usize) {
             .expect("failed to read");
         size_left -= bytes_read;
     }
-    client
+    default_client()
         .close(file)
         .completion()
         .expect("no completion future returned")

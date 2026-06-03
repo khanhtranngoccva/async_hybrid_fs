@@ -6,10 +6,7 @@ use std::{
     os::unix::ffi::OsStrExt,
     path::Path,
     sync::Arc,
-    thread,
 };
-
-use dashmap::DashSet;
 
 /// Convert a path to a CString for use with io_uring operations.
 pub(crate) fn path_to_cstring(path: &Path) -> io::Result<CString> {
@@ -113,15 +110,6 @@ where
             .get(&value)
             .expect("value should be interned")
             .clone()
-    }
-
-    /// Retrieves the reference count of the value excluding the reference stored in the map, useful for metrics.
-    pub(crate) fn count(&self, value: &T) -> usize {
-        let v = match self.inner.get(value) {
-            Some(v) => v,
-            None => return 0,
-        };
-        Arc::strong_count(v).saturating_sub(1)
     }
 
     /// Iterates over the values in the map and retrieves the reference count of each value excluding the reference stored in the map, useful for metrics.

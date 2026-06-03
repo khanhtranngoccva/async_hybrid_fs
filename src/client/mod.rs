@@ -10,8 +10,8 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::panic::UnwindSafe;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize};
-use std::sync::{Arc, Weak};
 use std::thread::JoinHandle;
 use ticketing::SubmissionTicketQueue;
 
@@ -43,10 +43,7 @@ pub struct Client {
 }
 
 pub(crate) struct ClientUring {
-    normal_submission_ticket_queue: SubmissionTicketQueue,
-    cancel_submission_ticket_queue: SubmissionTicketQueue,
     submission_sender: crossbeam_channel::Sender<UringPendingIoSubmitter>,
-    pending: Weak<PendingMap>,
     active_requests: Arc<AtomicUsize>,
     op_ticket_queue_size: usize,
     status_interner: Arc<StaticInterner<UringPendingIoStatus>>,
@@ -264,18 +261,11 @@ impl Client {
                 (operation_queue_size, cancel_queue_size)
             };
             // Create the ticket queues.
-            let mut ticket_queues = SubmissionTicketQueue::new_multiple(&[
-                op_ticket_queue_size,
-                cancel_ticket_queue_size,
-            ]);
-            let cancel_submission_ticket_queue = ticket_queues
-                .pop()
-                .expect("return result should contain exactly two submission ticket queues");
-            let normal_submission_ticket_queue = ticket_queues
-                .pop()
-                .expect("return result should contain exactly two submission ticket queues");
+            let ticket_queue =
+                SubmissionTicketQueue::new(op_ticket_queue_size, cancel_ticket_queue_size, 0);
+            // Use unbounded - it is better to allow the item to be dumped in memory instantly and perform backpressure inside one of the threads rather than having a newly freed thread signal multiple waiters all at once (unlike normal threads, tasks can be trivially cancelled, so a normal notify_one may lead to missed tickets leading to bugs)
             let (submission_sender, submission_receiver) =
-                crossbeam_channel::bounded::<UringPendingIoSubmitter>(actual_total_squeue_size);
+                crossbeam_channel::unbounded::<UringPendingIoSubmitter>();
             let pending_map = Arc::new(PendingMap::new());
             let ring = Arc::new(ring);
             let (interrupt_sender, interrupt_receiver) =
@@ -290,6 +280,7 @@ impl Client {
                             ring,
                             pending_map,
                             submission_receiver,
+                            ticket_queue,
                             interrupt_receiver,
                         )
                     }
@@ -307,9 +298,6 @@ impl Client {
             let mut probe = io_uring::Probe::new();
             ring.submitter().register_probe(&mut probe)?;
             client.uring = Some(ClientUring {
-                normal_submission_ticket_queue,
-                cancel_submission_ticket_queue,
-                pending: Arc::downgrade(&pending_map),
                 submission_sender,
                 uring: ring,
                 active_requests: Arc::new(AtomicUsize::new(0)),
@@ -341,7 +329,7 @@ impl SubmissionDropper {
 }
 
 impl Drop for SubmissionDropper {
-    // Drop handler in case of exceptions like OOM. Should not allocate memory from the heap
+    // Drop handler. Should not allocate memory from the heap
     fn drop(&mut self) {
         let mut submission = unsafe { self.uring.submission_shared() };
         submission.sync();
@@ -400,15 +388,26 @@ pub(crate) enum InterruptCommand {
 fn submission_thread(
     ring: Arc<IoUring>,
     pending_map: Arc<PendingMap>,
-    receiver: crossbeam_channel::Receiver<UringPendingIoSubmitter>,
+    command_receiver: crossbeam_channel::Receiver<UringPendingIoSubmitter>,
+    ticket_queue: SubmissionTicketQueue,
     interrupt: crossbeam_channel::Receiver<InterruptCommand>,
 ) {
     let _submission_dropper = SubmissionDropper::new(ring.clone(), pending_map.clone());
     let mut submission = unsafe { ring.submission_shared() };
-    let capacity = submission.capacity();
-    let mut queue = VecDeque::with_capacity(capacity);
+    // Set up reserves for batching. If either the command queue or both ticket queues run out, we need to wait.
+    let mut normal_command_queue =
+        VecDeque::with_capacity(ticket_queue.normal_operation_capacity());
+    let mut normal_ticket_queue = VecDeque::with_capacity(ticket_queue.normal_operation_capacity());
+    let mut cancel_command_queue =
+        VecDeque::with_capacity(ticket_queue.cancel_operation_capacity());
+    let mut cancel_ticket_queue = VecDeque::with_capacity(ticket_queue.cancel_operation_capacity());
+    let total_capacity = ticket_queue.total_capacity();
+    let mut ll_entries = VecDeque::with_capacity(total_capacity);
+    let mut command_submitters = VecDeque::with_capacity(total_capacity);
+    // Low-level receiver is necessary for multiplexing
+    let ticket_receiver = ticket_queue.receiver();
     loop {
-        let item = crossbeam_channel::select! {
+        crossbeam_channel::select! {
             recv(interrupt) -> command => {
                 match command {
                     Ok(InterruptCommand::SubmissionPanic) => {
@@ -435,18 +434,87 @@ fn submission_thread(
                     Err(crossbeam_channel::RecvError) => panic!("interrupt channel closed"),
                 }
             }
-            recv(receiver) -> item => {
+            recv(ticket_receiver) -> id => {
+                match id {
+                    Ok(id) => {
+                        let ticket = ticket_queue.create_ticket(id);
+                        if ticket_queue.is_cancel_ticket(&ticket) {
+                            cancel_ticket_queue.push_back(ticket);
+                        } else {
+                            normal_ticket_queue.push_back(ticket);
+                        }
+                    },
+                    Err(crossbeam_channel::RecvError) => break,
+                }
+            }
+            recv(command_receiver) -> item => {
                 match item {
-                    Ok(item) => item,
+                    Ok(item) => {
+                        if item.is_cancel() {
+                            cancel_command_queue.push_back(item);
+                        } else {
+                            normal_command_queue.push_back(item);
+                        }
+                    },
                     Err(crossbeam_channel::RecvError) => break,
                 }
             }
         };
-        queue.push_back(item);
-        queue.extend(receiver.try_iter().take(capacity - 1));
-        for submitter in queue.iter() {
-            let entry = submitter.create_entry();
-            while unsafe { submission.push(&entry) }.is_err() {
+        // Receive additional items from the channels if possible
+        while let Ok(additional_item) = command_receiver.try_recv() {
+            if additional_item.is_cancel() {
+                cancel_command_queue.push_back(additional_item);
+            } else {
+                normal_command_queue.push_back(additional_item);
+            }
+        }
+        while let Ok(additional_id) = ticket_receiver.try_recv() {
+            let ticket = ticket_queue.create_ticket(additional_id);
+            if ticket_queue.is_cancel_ticket(&ticket) {
+                cancel_ticket_queue.push_back(ticket);
+            } else {
+                normal_ticket_queue.push_back(ticket);
+            }
+        }
+        // Generate cancel entries from reserve
+        while !cancel_command_queue.is_empty() && !cancel_ticket_queue.is_empty() {
+            let command = cancel_command_queue
+                .pop_front()
+                .expect("cancel command queue should not be empty");
+            let ticket = cancel_ticket_queue
+                .pop_front()
+                .expect("cancel ticket queue should not be empty");
+            let ticket_id = ticket.id();
+            let entry = command.assign_ticket(Arc::new(ticket));
+            if let Some(entry) = entry {
+                pending_map.insert(ticket_id, command.filler());
+                ll_entries.push_back(entry);
+                command_submitters.push_back(command);
+            }
+        }
+        // Generate normal entries from reserve
+        while !normal_command_queue.is_empty() && !normal_ticket_queue.is_empty() {
+            let command = normal_command_queue
+                .pop_front()
+                .expect("normal command queue should not be empty");
+            let ticket = normal_ticket_queue
+                .pop_front()
+                .expect("normal ticket queue should not be empty");
+            let ticket_id = ticket.id();
+            let entry = command.assign_ticket(Arc::new(ticket));
+            if let Some(entry) = entry {
+                pending_map.insert(ticket_id, command.filler());
+                ll_entries.push_back(entry);
+                command_submitters.push_back(command);
+            }
+        }
+        // If there are no entries to submit, we resume the waiting.
+        if ll_entries.is_empty() {
+            continue;
+        }
+        // Submit entries
+        for ll_entry in ll_entries.drain(..) {
+            while unsafe { submission.push(&ll_entry) }.is_err() {
                 // We need to synchronize the head and tail before retrying because it is stale. However, we do not need to block because the queues restrict the number of active tickets.
                 submission.sync();
                 continue;
@@ -456,8 +524,9 @@ fn submission_thread(
         ring.submitter()
             .submit()
             .expect("failed to perform batch submit");
-        for entry in queue.drain(..) {
-            entry.mark_submitted();
+        // Mark entries as submitted
+        for submitter in command_submitters.drain(..) {
+            submitter.mark_submitted();
         }
     }
 }

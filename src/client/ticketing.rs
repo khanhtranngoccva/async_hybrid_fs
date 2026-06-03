@@ -1,8 +1,3 @@
-use std::{
-    pin::Pin,
-    task::{Context, Poll},
-};
-
 /// The submission ticket ID, which may be used as the user_data field/entry ID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
@@ -34,7 +29,7 @@ impl SubmissionTicketId {
 /// The ticket must be held for the duration of the operation, as when it is dropped, the ticket is returned to the submission queue. Since it is used as the user_data field for cancelling, it must not be given to outside code until the kernel has acknowledged the operation.
 pub(crate) struct SubmissionTicket {
     id: SubmissionTicketId,
-    id_tx: crossfire::MTx<crossfire::mpmc::Array<SubmissionTicketId>>,
+    id_tx: crossbeam_channel::Sender<SubmissionTicketId>,
 }
 
 impl std::fmt::Debug for SubmissionTicket {
@@ -61,74 +56,57 @@ impl Drop for SubmissionTicket {
 /// A queue of submission tickets.
 #[derive(Debug)]
 pub(crate) struct SubmissionTicketQueue {
-    /// Original capacity of the queue.
-    capacity: usize,
-    id_tx: crossfire::MTx<crossfire::mpmc::Array<SubmissionTicketId>>,
-    id_async_rx: crossfire::MAsyncRx<crossfire::mpmc::Array<SubmissionTicketId>>,
-    id_rx: crossfire::MRx<crossfire::mpmc::Array<SubmissionTicketId>>,
-    // /// Inner state of the queue.
-    // state: Arc<Mutex<SubmissionTicketQueueState>>,
-    // /// Condvar for notifying that a ticket is available.
-    // condvar: Arc<Condvar>,
+    normal_op_cap: usize,
+    cancel_op_cap: usize,
+    id_tx: crossbeam_channel::Sender<SubmissionTicketId>,
+    id_rx: crossbeam_channel::Receiver<SubmissionTicketId>,
 }
 
 impl SubmissionTicketQueue {
-    fn new(size: usize, starting_id: u64) -> Self {
-        let (id_tx, id_async_rx) = crossfire::mpmc::bounded_blocking_async(size);
-        let id_rx = id_async_rx.clone().into_blocking();
+    pub(crate) fn new(normal_op_cap: usize, cancel_op_cap: usize, starting_id: u64) -> Self {
+        let size = normal_op_cap + cancel_op_cap;
+        let (id_tx, id_rx) = crossbeam_channel::bounded::<SubmissionTicketId>(size);
         for i in starting_id..starting_id + size as u64 {
-            id_tx.send(SubmissionTicketId(i)).unwrap();
+            id_tx.send(SubmissionTicketId(i)).expect("queue is full");
         }
         Self {
-            capacity: size,
+            normal_op_cap,
+            cancel_op_cap,
             id_tx,
-            id_async_rx,
             id_rx,
         }
     }
 
-    #[allow(unused)]
-    pub(crate) fn capacity(&self) -> usize {
-        self.capacity
+    /// Clones the queue's receiver struct. This is required for crossbeam multiplexing
+    pub(crate) fn receiver(&self) -> crossbeam_channel::Receiver<SubmissionTicketId> {
+        self.id_rx.clone()
     }
 
-    /// Create new submission ticket queues with the given sizes. The queues are pre-populated with the given number of tickets starting with 1,
-    /// and the total number of tickets across all ticket queues must not exceed the length of the io_uring submission queue.
-    /// Panics if the total number of tickets exceeds numeric bounds.
-    pub(crate) fn new_multiple(sizes: &[usize]) -> Vec<Self> {
-        let mut starting_id = 0u64;
-        let mut queues = Vec::with_capacity(sizes.len());
-        for size in sizes {
-            queues.push(Self::new(*size, starting_id));
-            starting_id += *size as u64;
-        }
-        queues
-    }
-
-    /// Request a submission ticket. If the queue is empty, the caller will block until a ticket is available.
-    pub(crate) fn request_submission_ticket(&self) -> SubmissionTicket {
-        let id = self.id_rx.recv().unwrap();
+    /// Creates a submission ticket with the given ID.
+    pub(crate) fn create_ticket(&self, id: SubmissionTicketId) -> SubmissionTicket {
         SubmissionTicket {
             id,
             id_tx: self.id_tx.clone(),
         }
     }
 
-    /// Attempt to request a submission ticket. If the queue is empty, `Poll::Pending` is returned.
-    pub(crate) fn poll_submission_ticket(
-        &self,
-        context: &mut Context<'_>,
-    ) -> Poll<SubmissionTicket> {
-        let mut recv_future = self.id_async_rx.recv();
-        match Pin::new(&mut recv_future).poll(context) {
-            Poll::Ready(Ok(id)) => Poll::Ready(SubmissionTicket {
-                id,
-                id_tx: self.id_tx.clone(),
-            }),
-            Poll::Ready(Err(e)) => {
-                panic!("failed to receive submission ticket: {:?}", e);
-            }
-            Poll::Pending => Poll::Pending,
-        }
+    /// Retrieve the total capacity.
+    pub(crate) fn total_capacity(&self) -> usize {
+        self.normal_op_cap + self.cancel_op_cap
+    }
+
+    /// Retrieve the normal operation capacity.
+    pub(crate) fn normal_operation_capacity(&self) -> usize {
+        self.normal_op_cap
+    }
+
+    /// Retrieve the cancel operation capacity.
+    pub(crate) fn cancel_operation_capacity(&self) -> usize {
+        self.cancel_op_cap
+    }
+
+    /// Checks if the ticket is a cancel operation.
+    pub(crate) fn is_cancel_ticket(&self, ticket: &SubmissionTicket) -> bool {
+        ticket.id.0 >= self.normal_op_cap as u64
     }
 }

@@ -117,7 +117,7 @@ fn read_dev_zero_with_contention_benchmark(c: &mut Criterion) {
             )
             .iter_batched(
                 || {},
-                |_| read::read_hybrid_default_round_robin("/dev/zero", 1024, 100000),
+                |_| read::read_hybrid_default_round_robin("/dev/zero", 1024, 20000),
                 // Avoid file descriptor exhaustion
                 criterion::BatchSize::NumIterations(1),
             )

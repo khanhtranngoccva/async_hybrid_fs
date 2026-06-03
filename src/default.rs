@@ -1,9 +1,7 @@
 use std::num::NonZero;
 use std::sync::Arc;
-use std::sync::LazyLock;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
-use std::thread::JoinHandle;
 
 use crate::UringCfg;
 use crate::client::Client;
@@ -73,10 +71,9 @@ pub fn default_client_owned() -> Arc<Client> {
 
 /// Returns a borrowed reference to one of the default clients. See [`default_client_owned`] for more details.
 pub fn default_client() -> &'static Client {
-    // let client = default_client_owned();
+    let client = default_client_owned();
     // These Client instances live for the entire program duration
-    // unsafe { std::mem::transmute::<&Client, &'static Client>(client.as_ref()) }
-    &DEFAULT_CLIENT
+    unsafe { std::mem::transmute::<&Client, &'static Client>(client.as_ref()) }
 }
 
 /// Sets the maximum number of default client shards that the library will spawn.
