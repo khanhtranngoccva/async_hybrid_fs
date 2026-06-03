@@ -17,6 +17,7 @@ pub(crate) mod write_from;
 pub(crate) mod write_from_vectored;
 
 use std::{
+    collections::HashSet,
     fmt::Debug,
     io,
     ops::{Deref, DerefMut},
@@ -30,9 +31,12 @@ use io_uring::squeue;
 use parking_lot::{Condvar, Mutex};
 
 use super::PendingIoImpl;
-use crate::client::{
-    ClientUring,
-    ticketing::{SubmissionTicket, SubmissionTicketId, SubmissionTicketQueue},
+use crate::{
+    client::{
+        ClientUring,
+        ticketing::{SubmissionTicket, SubmissionTicketId, SubmissionTicketQueue},
+    },
+    helpers::{StaticInternable, StaticInterner},
 };
 
 pub(crate) struct PendingMap {
@@ -62,16 +66,14 @@ impl DerefMut for PendingMap {
 }
 
 impl Drop for PendingMap {
-    fn drop(&mut self) {
-        
-    }
+    fn drop(&mut self) {}
 }
 
 // New implementation of pending I/O, universally usable for all operations
 
 /// Status of the operation. If the operation is not submitted, it is trivially cancellable. If the operation is already submitted (which occurs after the point of retrieving the ticket), it must be waited until `Done`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum UringPendingIoStatus {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UringPendingIoStatus {
     // Not yet submitted. At this point, the operation has not yet received a submission ticket or appeared in the io_uring submission queue.
     NotSubmitted,
     // Submitting. The operation has received a ticket, and is being staged in the submission thread without risking being indefinitely blocked. An operation will have to wait until it is in the Submitted state (registered by io_uring) to be cancellable.
@@ -82,11 +84,22 @@ pub(crate) enum UringPendingIoStatus {
     Done,
 }
 
+impl StaticInternable for UringPendingIoStatus {
+    fn create_intern_map() -> HashSet<Arc<Self>> {
+        HashSet::from_iter([
+            Arc::new(UringPendingIoStatus::NotSubmitted),
+            Arc::new(UringPendingIoStatus::Submitting),
+            Arc::new(UringPendingIoStatus::Submitted),
+            Arc::new(UringPendingIoStatus::Done),
+        ])
+    }
+}
+
 /// Structure for describing the state of the operation.
 #[derive(Debug)]
 pub(crate) struct UringPendingIoState {
     /// The status of the operation.
-    status: UringPendingIoStatus,
+    status: Arc<UringPendingIoStatus>,
     /// Flag whether the cancellation has been triggered or not.
     cancel_triggered: bool,
     /// The waker, used as a condition variable for async code.
@@ -96,9 +109,9 @@ pub(crate) struct UringPendingIoState {
 }
 
 impl UringPendingIoState {
-    fn new() -> Self {
+    fn new(status_interner: &StaticInterner<UringPendingIoStatus>) -> Self {
         Self {
-            status: UringPendingIoStatus::NotSubmitted,
+            status: status_interner.intern(UringPendingIoStatus::NotSubmitted),
             cancel_triggered: false,
             waker: Waker::noop().clone(),
             result: None,
@@ -107,7 +120,7 @@ impl UringPendingIoState {
 
     /// Trigger the cancellation of the operation, and returns a cloned reference to the submission ticket to prevent the ticket from being available prematurely. The reaper still requires a reference to live here so that no operation can steal the ticket.
     fn trigger_cancel(&mut self) -> bool {
-        if self.status != UringPendingIoStatus::Submitted || self.cancel_triggered {
+        if self.status.as_ref() != &UringPendingIoStatus::Submitted || self.cancel_triggered {
             return false;
         }
         self.cancel_triggered = true;
@@ -126,6 +139,7 @@ pub(crate) struct UringPendingIoObj<'lifetime> {
     submission_ticket: Option<Arc<SubmissionTicket>>,
     uring: &'lifetime ClientUring,
     ticket_queue: &'lifetime SubmissionTicketQueue,
+    status_interner: Arc<StaticInterner<UringPendingIoStatus>>,
 }
 
 #[hotpath::measure_all]
@@ -141,12 +155,13 @@ impl<'lifetime> UringPendingIoObj<'lifetime> {
             &uring.normal_submission_ticket_queue
         };
         Self {
-            state: Arc::new(Mutex::new(UringPendingIoState::new())),
+            state: Arc::new(Mutex::new(UringPendingIoState::new(&uring.status_interner))),
             transition_cv: Arc::new(Condvar::new()),
             entry,
             submission_ticket: None,
             uring,
             ticket_queue,
+            status_interner: uring.status_interner.clone(),
         }
     }
 
@@ -159,6 +174,7 @@ impl<'lifetime> UringPendingIoObj<'lifetime> {
                 .submission_ticket
                 .clone()
                 .expect("submission ticket should be assigned"),
+            status_interner: self.status_interner.clone(),
         }
     }
 
@@ -166,6 +182,7 @@ impl<'lifetime> UringPendingIoObj<'lifetime> {
         UringPendingIoFiller {
             state: self.state.clone(),
             transition_cv: self.transition_cv.clone(),
+            status_interner: self.status_interner.clone(),
         }
     }
 
@@ -195,6 +212,7 @@ pub(crate) struct UringPendingIoSubmitter {
     submission_ticket: Arc<SubmissionTicket>,
     transition_cv: Arc<Condvar>,
     entry: squeue::Entry,
+    status_interner: Arc<StaticInterner<UringPendingIoStatus>>,
 }
 
 #[hotpath::measure_all]
@@ -203,10 +221,10 @@ impl UringPendingIoSubmitter {
     pub(crate) fn mark_submitted(self) {
         let mut state = self.state.lock();
         // The completion thread or drop handlers may race and fill the result prematurely, then we should do nothing.
-        if state.status == UringPendingIoStatus::Done {
+        if state.status.as_ref() == &UringPendingIoStatus::Done {
             return;
         }
-        state.status = UringPendingIoStatus::Submitted;
+        state.status = self.status_interner.intern(UringPendingIoStatus::Submitted);
         drop(state);
         // We only need to notify any threads that deals with cancels.
         self.transition_cv.notify_all();
@@ -223,14 +241,14 @@ impl UringPendingIoSubmitter {
 impl Drop for UringPendingIoSubmitter {
     fn drop(&mut self) {
         let mut state = self.state.lock();
-        
+
         let mut waker = None;
         let mut to_notify = false;
         // Items that are not marked as submitted should be marked with an error on drop for panic safety.
-        if state.status == UringPendingIoStatus::Submitting
-            || state.status == UringPendingIoStatus::NotSubmitted
+        if state.status.as_ref() == &UringPendingIoStatus::Submitting
+            || state.status.as_ref() == &UringPendingIoStatus::NotSubmitted
         {
-            state.status = UringPendingIoStatus::Done;
+            state.status = self.status_interner.intern(UringPendingIoStatus::Done);
             state.result = Some(Err(io::Error::other(
                 "operation was aborted, internal threads may have panicked",
             )));
@@ -244,7 +262,6 @@ impl Drop for UringPendingIoSubmitter {
         if to_notify {
             self.transition_cv.notify_one();
         }
-        
     }
 }
 
@@ -252,21 +269,22 @@ impl Drop for UringPendingIoSubmitter {
 pub(crate) struct UringPendingIoFiller {
     state: Arc<Mutex<UringPendingIoState>>,
     transition_cv: Arc<Condvar>,
+    status_interner: Arc<StaticInterner<UringPendingIoStatus>>,
 }
 
 #[hotpath::measure_all]
 impl UringPendingIoFiller {
     pub(crate) fn status(&self) -> UringPendingIoStatus {
-        self.state.lock().status
+        *self.state.lock().status
     }
 
     pub(crate) fn complete(self, result: io::Result<i32>) {
         let mut state = self.state.lock();
         // A result cannot be filled twice.
-        if state.status == UringPendingIoStatus::Done {
+        if *state.status == UringPendingIoStatus::Done {
             return;
         }
-        state.status = UringPendingIoStatus::Done;
+        state.status = self.status_interner.intern(UringPendingIoStatus::Done);
         state.result = Some(result);
         // We would like to remove the ticket, but it blocks the reaper thread.
         // Notify the future or the blocking thread that the operation changed its state.
@@ -282,8 +300,8 @@ impl Drop for UringPendingIoFiller {
         let mut state = self.state.lock();
         let mut waker = None;
         let mut to_notify = false;
-        if state.status != UringPendingIoStatus::Done {
-            state.status = UringPendingIoStatus::Done;
+        if *state.status != UringPendingIoStatus::Done {
+            state.status = self.status_interner.intern(UringPendingIoStatus::Done);
             state.result = Some(Err(io::Error::other(
                 "operation was aborted, internal threads may have panicked",
             )));
@@ -319,7 +337,7 @@ impl<'lifetime> Future for UringPendingIoObj<'lifetime> {
         // IMPORTANT: lock hierarchy: filler state -> submission ticket queue + submission queue + pending map + completion ticket submitter
         let inner = self.get_mut();
         let mut state = inner.state.lock();
-        match state.status {
+        match *state.status {
             UringPendingIoStatus::NotSubmitted => {
                 assert!(
                     inner.submission_ticket.is_none(),
@@ -336,7 +354,9 @@ impl<'lifetime> Future for UringPendingIoObj<'lifetime> {
                         }
                     },
                 };
-                state.status = UringPendingIoStatus::Submitting;
+                state.status = inner
+                    .status_interner
+                    .intern(UringPendingIoStatus::Submitting);
                 state.waker.clone_from(cx.waker());
                 drop(state);
                 if !inner.submit(ticket) {
@@ -397,7 +417,7 @@ impl<'lifetime> UringPendingIoObj<'lifetime> {
     pub(crate) fn wait(&mut self) -> Option<Result<i32, io::Error>> {
         let mut state = self.state.lock();
         loop {
-            match state.status {
+            match *state.status {
                 UringPendingIoStatus::NotSubmitted => {
                     let ticket = match self.submission_ticket.clone() {
                         // The operation may use overridden tickets.
@@ -405,7 +425,9 @@ impl<'lifetime> UringPendingIoObj<'lifetime> {
                         // Blocking call here is OK - the reaper thread cannot see the operation yet.
                         None => Arc::new(self.ticket_queue.request_submission_ticket()),
                     };
-                    state.status = UringPendingIoStatus::Submitting;
+                    state.status = self
+                        .status_interner
+                        .intern(UringPendingIoStatus::Submitting);
                     drop(state);
                     // Temporarily release the lock to submit the operation - we can do that because the status is marked.
                     if !self.submit(ticket) {
@@ -432,7 +454,7 @@ impl<'lifetime> UringPendingIoObj<'lifetime> {
 
     pub(crate) fn cancel_inner(&mut self) -> CancelResult {
         let mut state = self.state.lock();
-        match state.status {
+        match *state.status {
             // The operation is not submitted yet, so we have to do nothing.
             UringPendingIoStatus::NotSubmitted => {
                 return CancelResult::WaitDone(None);

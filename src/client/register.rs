@@ -41,16 +41,19 @@ pub struct RegisteredFile<'a> {
 
 impl<'a> RegisteredFile<'a> {
     /// Upgrade the borrowed file to an owned file, which allows the file to be stored independently.
+    ///
+    /// The old file descriptor will no longer be registered, but still works.
     pub fn try_into_owned(mut self) -> Result<OwnedRegisteredFile, io::Error> {
         let duplicated_fd = self.fd.try_clone_to_owned()?;
         // Reuse the index for the new file descriptor.
-        self._uring
-            .submitter()
-            .register_files_update(self.index.unwrap(), &[duplicated_fd.as_raw_fd()])?;
+        self._uring.submitter().register_files_update(
+            self.index.expect("index should be Some"),
+            &[duplicated_fd.as_raw_fd()],
+        )?;
         // Prevent the index from being dropped by the old file.
-        self.index.take();
+        let index = self.index.take();
         Ok(OwnedRegisteredFile {
-            index: self.index.unwrap(),
+            index: index.expect("index should be Some"),
             fd: Some(duplicated_fd),
             uring_identity: self.uring_identity.clone(),
             _uring: self._uring.clone(),
@@ -76,7 +79,7 @@ impl UringTarget for RegisteredFile<'_> {
     unsafe fn as_target(&self, _uring_identity: &Arc<()>) -> Target {
         if Arc::ptr_eq(&self.uring_identity, _uring_identity) {
             Target::Fixed {
-                index: self.index.unwrap(),
+                index: self.index.expect("index should be Some"),
                 raw_fd: self.fd.as_raw_fd(),
                 uring_identity: self.uring_identity.clone(),
             }
@@ -241,5 +244,54 @@ impl Client {
             _uring: uring.uring.clone(),
             _registered_files: uring.registered_files.clone(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::UringCfg;
+    use tokio::fs::File;
+
+    #[tokio::test]
+    #[test_log::test]
+    async fn test_registered_file_try_into_owned() {
+        let client = Client::build(UringCfg::default()).expect("failed to build client");
+        if !client.is_uring_available_and_active() {
+            log::warn!("io_uring is not supported on the target system");
+            return;
+        }
+        let temp_dir = tempfile::TempDir::new().expect("failed to create temporary directory");
+        let file_path = temp_dir.path().join("test.txt");
+        File::create(&file_path)
+            .await
+            .expect("failed to create file");
+        let fd = File::open(file_path).await.expect("failed to open file");
+        let registered_file = client.register(&fd).expect("failed to register file");
+        let _owned_file = registered_file
+            .try_into_owned()
+            .expect("failed to convert borrowed registered file to owned file");
+    }
+
+    #[tokio::test]
+    #[test_log::test]
+    async fn test_registered_file_owned() {
+        let client = Client::build(UringCfg::default()).expect("failed to build client");
+        if !client.is_uring_available_and_active() {
+            log::warn!("io_uring is not supported on the target system");
+            return;
+        }
+        let temp_dir = tempfile::TempDir::new().expect("failed to create temporary directory");
+        let file_path = temp_dir.path().join("test.txt");
+        File::create(&file_path)
+            .await
+            .expect("failed to create file");
+        let file = File::open(file_path)
+            .await
+            .expect("failed to open file")
+            .into_std()
+            .await;
+        let fd = OwnedFd::from(file);
+        let _owned_file = client.register_owned(fd).expect("failed to register file");
     }
 }

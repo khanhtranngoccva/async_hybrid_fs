@@ -2,7 +2,7 @@ use crate::{
     PendingIo, Target,
     borrowed_buf::BorrowedBuf,
     client::{
-        Client, InterruptCommand, URING_LEN_MAX, UringTarget,
+        Client, InterruptCommand, URING_LEN_MAX, UringMetrics, UringTarget,
         completion::{ReadResult, ReadvResult, WriteResult, WritevResult},
         pending_io::{
             fallback::TokioScopedPendingIo,
@@ -44,6 +44,22 @@ use std::{
 
 impl Client {
     const AT_FDCWD: BorrowedFd<'static> = unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) };
+
+    /// Retrieve io_uring metrics if io_uring is available.
+    pub fn uring_metrics(&self) -> Option<UringMetrics> {
+        self.uring.as_ref().map(|uring| {
+            let active_operations = uring.active_requests.load(Ordering::Relaxed);
+            let max_concurrent_operations = uring.op_ticket_queue_size;
+            let utilization = active_operations as f64 / max_concurrent_operations as f64;
+            let status_counts = uring.status_interner.counts();
+            UringMetrics {
+                max_concurrent_operations,
+                active_operations,
+                utilization,
+                status_counts,
+            }
+        })
+    }
 
     /// Send a panic signal to the submission thread, allows simulation of OOM on the submission thread.
     #[allow(unused)]

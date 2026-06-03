@@ -7,7 +7,7 @@ mod scenarios;
 #[test]
 #[hotpath::main]
 pub fn read_hybrid_default_round_robin() {
-    let r = Runtime::new().unwrap();
+    let r = Runtime::new().expect("failed to create runtime");
     r.block_on(async {
         let path = Path::new("/dev/zero");
         let size = 1024;

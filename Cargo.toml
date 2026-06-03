@@ -41,7 +41,9 @@ pending-io-futures = []
 name = "read_criterion"
 harness = false
 
-
 [profile.samply]
 inherits = "release"
 debug = true
+
+[workspace]
+members = ["benches/memory_footprint"]

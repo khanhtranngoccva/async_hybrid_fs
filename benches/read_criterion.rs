@@ -13,11 +13,11 @@ fn read_dev_zero_benchmark(c: &mut Criterion) {
 
     c.bench_function("read::dev_zero::hybrid", |b| {
         // Note: io_uring client initialization takes a long time.
-        b.to_async(Runtime::new().unwrap())
+        b.to_async(Runtime::new().expect("failed to create runtime"))
             .iter(|| read::read_hybrid(&client, "/dev/zero", 1024))
     });
     c.bench_function("read::dev_zero::tokio", |b| {
-        b.to_async(Runtime::new().unwrap())
+        b.to_async(Runtime::new().expect("failed to create runtime"))
             .iter(|| read::read_tokio("/dev/zero", 1024))
     });
     c.bench_function("read::dev_zero::blocking", |b| {
@@ -30,11 +30,11 @@ fn read_dev_urandom_benchmark(c: &mut Criterion) {
 
     c.bench_function("read::dev_urandom::hybrid", |b| {
         // Note: io_uring client initialization takes a long time.
-        b.to_async(Runtime::new().unwrap())
+        b.to_async(Runtime::new().expect("failed to create runtime"))
             .iter(|| read::read_hybrid(&client, "/dev/urandom", 1024))
     });
     c.bench_function("read::dev_urandom::tokio", |b| {
-        b.to_async(Runtime::new().unwrap())
+        b.to_async(Runtime::new().expect("failed to create runtime"))
             .iter(|| read::read_tokio("/dev/urandom", 1024))
     });
     c.bench_function("read::dev_urandom::blocking", |b| {
@@ -45,11 +45,11 @@ fn read_dev_urandom_benchmark(c: &mut Criterion) {
 fn read_dev_zero_batched_benchmark(c: &mut Criterion) {
     let client = Client::build(UringCfg::default()).expect("failed to build client");
     c.bench_function("read::dev_zero::batched::hybrid", |b| {
-        b.to_async(Runtime::new().unwrap())
+        b.to_async(Runtime::new().expect("failed to create runtime"))
             .iter(|| read::read_hybrid_batched(&client, "/dev/urandom", 1024, 4000))
     });
     c.bench_function("read::dev_zero::batched::tokio", |b| {
-        b.to_async(Runtime::new().unwrap())
+        b.to_async(Runtime::new().expect("failed to create runtime"))
             .iter(|| read::read_tokio_batched("/dev/urandom", 1024, 4000))
     });
     c.bench_function("read::dev_zero::batched::blocking", |b| {
@@ -60,11 +60,11 @@ fn read_dev_zero_batched_benchmark(c: &mut Criterion) {
 fn read_dev_urandom_batched_benchmark(c: &mut Criterion) {
     let client = Client::build(UringCfg::default()).expect("failed to build client");
     c.bench_function("read::dev_urandom::batched::hybrid", |b| {
-        b.to_async(Runtime::new().unwrap())
+        b.to_async(Runtime::new().expect("failed to create runtime"))
             .iter(|| read::read_hybrid_batched(&client, "/dev/urandom", 1024, 4000))
     });
     c.bench_function("read::dev_urandom::batched::tokio", |b| {
-        b.to_async(Runtime::new().unwrap())
+        b.to_async(Runtime::new().expect("failed to create runtime"))
             .iter(|| read::read_tokio_batched("/dev/urandom", 1024, 4000))
     });
     c.bench_function("read::dev_urandom::batched::blocking", |b| {
@@ -75,7 +75,7 @@ fn read_dev_urandom_batched_benchmark(c: &mut Criterion) {
 fn read_dev_zero_with_contention_benchmark(c: &mut Criterion) {
     let client = Client::build(UringCfg::default()).expect("failed to build client");
     c.bench_function("read::dev_zero::with_contention::hybrid", |b| {
-        b.to_async(Runtime::new().unwrap()).iter_batched(
+        b.to_async(Runtime::new().expect("failed to create runtime")).iter_batched(
             || {},
             // This should lead to queue overflowing
             |_| read::read_hybrid_batched(&client, "/dev/zero", 1024, 100000),
@@ -84,7 +84,7 @@ fn read_dev_zero_with_contention_benchmark(c: &mut Criterion) {
         )
     });
     let available_parallelism = thread::available_parallelism()
-        .unwrap_or(NonZero::new(8usize).unwrap())
+        .unwrap_or(NonZero::new(8usize).expect("failed to get available logical threads"))
         .get();
     let multiclients = (0..available_parallelism)
         .map(|_| Client::build(UringCfg::default()).expect("failed to build client"))
@@ -95,7 +95,7 @@ fn read_dev_zero_with_contention_benchmark(c: &mut Criterion) {
                 .enable_all()
                 .worker_threads(multiclients.len())
                 .build()
-                .unwrap(),
+                .expect("failed to create runtime"),
         )
         .iter_batched(
             || {},
@@ -113,7 +113,7 @@ fn read_dev_zero_with_contention_benchmark(c: &mut Criterion) {
                     .enable_all()
                     .worker_threads(available_parallelism)
                     .build()
-                    .unwrap(),
+                    .expect("failed to create runtime"),
             )
             .iter_batched(
                 || {},

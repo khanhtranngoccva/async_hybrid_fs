@@ -1,10 +1,10 @@
-use crate::{HybridFile, HybridRead, HybridSeek, HybridWrite, fs::OpenOptions};
+use crate::{Client, HybridFile, HybridRead, HybridSeek, HybridWrite, UringCfg, fs::OpenOptions};
 use nix::sys::time::TimeSpec;
 use std::{
     io::{IoSlice, IoSliceMut, SeekFrom},
     time::{SystemTime, UNIX_EPOCH},
 };
-use tokio::fs::File;
+use tokio::{fs::File, runtime::Runtime};
 
 #[tokio::test]
 async fn is_uring_available() {
@@ -191,4 +191,26 @@ async fn test_create_dir_all() {
         .await
         .unwrap();
     assert!(temp_dir.path().join("test").join("test2").is_dir());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_fcntl() {
+    let runtime = Runtime::new().unwrap();
+    let task = runtime.spawn(async move {
+        let (read_half, _write_half) = std::io::pipe().expect("should be able to create a pipe");
+        let client = Client::build(UringCfg::default()).expect("failed to build client");
+        let mut registered_read_half = client
+            .register_owned(read_half.into())
+            .expect("should be able to register file");
+        registered_read_half
+            .hybrid_set_nonblocking(true)
+            .await
+            .expect("should be able to set nonblocking");
+        registered_read_half
+            .hybrid_set_nonblocking(false)
+            .await
+            .expect("should be able to set nonblocking");
+    });
+    task.await.unwrap();
+    runtime.shutdown_background();
 }

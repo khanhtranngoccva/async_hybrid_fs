@@ -6,11 +6,11 @@ mod register;
 mod requests;
 pub(crate) mod ticketing;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::panic::UnwindSafe;
-use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize};
 use std::sync::{Arc, Weak};
 use std::thread::JoinHandle;
 use ticketing::SubmissionTicketQueue;
@@ -26,6 +26,7 @@ pub use requests::Target;
 
 use crate::client::pending_io::uring::{PendingMap, UringPendingIoStatus, UringPendingIoSubmitter};
 use crate::client::ticketing::SubmissionTicketId;
+use crate::helpers::StaticInterner;
 
 /// Maximum length for a single io_uring read/write operation.
 ///
@@ -46,6 +47,9 @@ pub(crate) struct ClientUring {
     cancel_submission_ticket_queue: SubmissionTicketQueue,
     submission_sender: crossbeam_channel::Sender<UringPendingIoSubmitter>,
     pending: Weak<PendingMap>,
+    active_requests: Arc<AtomicUsize>,
+    op_ticket_queue_size: usize,
+    status_interner: Arc<StaticInterner<UringPendingIoStatus>>,
     uring: Arc<IoUring>,
     probe: io_uring::Probe,
     sthread: JoinHandle<()>,
@@ -144,6 +148,20 @@ pub struct UringCfg {
 
     /// Allow graceful degradation to non-io_uring mode for systems that do not support it. Note that if io_uring is only partially supported, the client still automatically falls back to non-io_uring mode for unsupported opcodes.   
     pub allow_fallback: bool,
+}
+
+/// Metrics for the io_uring instance.
+/// Note that this does not cover metrics for Tokio pending requests as they are supposed to be dealt with by the runtime.
+#[derive(Debug, Clone)]
+pub struct UringMetrics {
+    /// Maximum number of concurrent operations that the io_uring instance can handle.
+    pub max_concurrent_operations: usize,
+    /// Number of active io_uring operations in the io_uring instance.
+    pub active_operations: usize,
+    /// Utilization of the io_uring instance.
+    pub utilization: f64,
+    /// Status of each operation
+    pub status_counts: HashMap<UringPendingIoStatus, usize>,
 }
 
 impl Default for UringCfg {
@@ -250,8 +268,12 @@ impl Client {
                 op_ticket_queue_size,
                 cancel_ticket_queue_size,
             ]);
-            let cancel_submission_ticket_queue = ticket_queues.pop().unwrap();
-            let normal_submission_ticket_queue = ticket_queues.pop().unwrap();
+            let cancel_submission_ticket_queue = ticket_queues
+                .pop()
+                .expect("return result should contain exactly two submission ticket queues");
+            let normal_submission_ticket_queue = ticket_queues
+                .pop()
+                .expect("return result should contain exactly two submission ticket queues");
             let (submission_sender, submission_receiver) =
                 crossbeam_channel::bounded::<UringPendingIoSubmitter>(actual_total_squeue_size);
             let pending_map = Arc::new(PendingMap::new());
@@ -290,6 +312,9 @@ impl Client {
                 pending: Arc::downgrade(&pending_map),
                 submission_sender,
                 uring: ring,
+                active_requests: Arc::new(AtomicUsize::new(0)),
+                status_interner: Arc::new(StaticInterner::new()),
+                op_ticket_queue_size,
                 probe,
                 sthread,
                 cthread,

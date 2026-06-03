@@ -15,11 +15,14 @@ where
         Some(handle) => match handle.runtime_flavor() {
             RuntimeFlavor::CurrentThread => std::thread::scope(|s| {
                 s.spawn(move || {
-                    let backup_runtime = Builder::new_multi_thread().enable_all().build().unwrap();
+                    let backup_runtime = Builder::new_multi_thread()
+                        .enable_all()
+                        .build()
+                        .expect("failed to create backup runtime");
                     backup_runtime.block_on(future)
                 })
                 .join()
-                .unwrap()
+                .expect("failed to join backup runtime thread")
             }),
             RuntimeFlavor::MultiThread => {
                 tokio::task::block_in_place(move || handle.block_on(future))
@@ -29,7 +32,10 @@ where
             }
         },
         None => {
-            let backup_runtime = Builder::new_multi_thread().enable_all().build().unwrap();
+            let backup_runtime = Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("failed to create backup runtime");
             tokio::task::block_in_place(move || backup_runtime.block_on(future))
         }
     }
