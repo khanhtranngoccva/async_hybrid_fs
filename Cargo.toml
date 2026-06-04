@@ -20,6 +20,7 @@ parking_lot = "0.12.5"
 thiserror = "2.0.18"
 tokio = { version = "1.50.0", features = ["fs", "rt", "sync"] }
 hotpath = "0.15.0"
+visibility = "0.1.1"
 
 [dev-dependencies]
 tempfile = "3.27.0"
@@ -35,6 +36,7 @@ hotpath = ["hotpath/hotpath"]
 hotpath-alloc = ["hotpath/hotpath-alloc"]
 hotpath-tokio = ["hotpath/tokio"]
 pending-io-futures = []
+_low-level = []
 
 [[bench]]
 name = "read_criterion"

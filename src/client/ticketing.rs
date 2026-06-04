@@ -27,7 +27,8 @@ impl SubmissionTicketId {
 
 /// A submission ticket represents a permit to submit an operation to the io_uring submission queue, acting as a backpressure mechanism to prevent having to block using `io_uring_enter`.
 /// The ticket must be held for the duration of the operation, as when it is dropped, the ticket is returned to the submission queue. Since it is used as the user_data field for cancelling, it must not be given to outside code until the kernel has acknowledged the operation.
-pub(crate) struct SubmissionTicket {
+#[cfg_attr(feature = "_low-level", visibility::make(pub))]
+pub struct SubmissionTicket {
     id: SubmissionTicketId,
     id_tx: crossbeam_channel::Sender<SubmissionTicketId>,
 }

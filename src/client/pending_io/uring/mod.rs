@@ -167,6 +167,8 @@ impl<'lifetime> UringPendingIoObj<'lifetime> {
     }
 }
 
+/// Structure for submitting operations to the io_uring submission thread.
+#[cfg_attr(feature = "_low-level", visibility::make(pub))]
 pub(crate) struct UringPendingIoSubmitter {
     state: Arc<Mutex<UringPendingIoState>>,
     transition_cv: Arc<Condvar>,

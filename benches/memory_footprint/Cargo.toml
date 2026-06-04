@@ -5,7 +5,9 @@ edition = "2024"
 
 [dependencies]
 stats_alloc = "0.1.10"
-async_hybrid_fs = { path = "../../" }
+async_hybrid_fs = { path = "../../", features = ["_low-level"] }
 tokio = "1.52.3"
 memory-stats = "1.2.0"
 clap = { version = "4.6.1", features = ["derive"] }
+io-uring = "0.7.12"
+crossbeam-channel = "0.5.15"

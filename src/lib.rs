@@ -1160,3 +1160,10 @@ type _DynCompatibleHybridSeek = Box<dyn HybridSeek>;
 type _DynCompatibleHybridFile = Box<dyn HybridFile>;
 type _DynCompatibleHybridDir = Box<dyn HybridDir>;
 type _DynCompatibleHybridExt = Box<dyn HybridExt>;
+
+#[cfg(feature = "_low-level")]
+/// Low-level structures exposed for various testing purposes
+pub mod ll {
+    pub use crate::client::pending_io::uring::UringPendingIoSubmitter;
+    pub use crate::client::ticketing::SubmissionTicket;
+}

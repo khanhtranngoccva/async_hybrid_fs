@@ -263,6 +263,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
+ "visibility",
 ]
 
 [[package]]
@@ -947,9 +948,9 @@ dependencies = [
 
 [[package]]
 name = "io-uring"
-version = "0.7.11"
+version = "0.7.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fdd7bddefd0a8833b88a4b68f90dae22c7450d11b354198baee3874fd811b344"
+checksum = "4d09b98f7eace8982db770e4408e7470b028ce513ac28fecdc6bf4c30fe92b62"
 dependencies = [
  "bitflags",
  "cfg-if",
@@ -1083,6 +1084,8 @@ version = "0.1.0"
 dependencies = [
  "async_hybrid_fs",
  "clap",
+ "crossbeam-channel",
+ "io-uring",
  "memory-stats",
  "stats_alloc",
  "tokio",
@@ -1795,6 +1798,17 @@ name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
+
+[[package]]
+name = "visibility"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d674d135b4a8c1d7e813e2f8d1c9a58308aee4a680323066025e53132218bd91"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
 
 [[package]]
 name = "walkdir"
