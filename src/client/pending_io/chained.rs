@@ -150,12 +150,11 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{io::pipe, os::fd::AsFd};
-
     use crate::{
-        HybridRead, PendingIo, client::pending_io::fallback::TokioScopedPendingIo, default_client,
+        HybridRead, PendingIo, client::pending_io::fallback::SpawnablePendingIo, default_client,
     };
-    use tokio::sync::oneshot;
+    use std::{io::pipe, os::fd::AsFd};
+    use tokio::{runtime::Handle, sync::oneshot};
 
     #[tokio::test]
     async fn should_not_run_processor_code_if_canceled() {
@@ -180,8 +179,9 @@ mod tests {
 
     #[tokio::test]
     async fn should_run_processor_code_on_drop() {
+        let handle = Handle::current();
         let (tx, rx) = oneshot::channel::<String>();
-        let raw_io = PendingIo::new(TokioScopedPendingIo::new(|| "test"));
+        let raw_io = PendingIo::new(SpawnablePendingIo::new(&handle, || "test"));
         let chained = raw_io.map(|s| tx.send(s.to_uppercase()));
         drop(chained);
         assert_eq!(rx.await.unwrap(), "TEST");
@@ -189,7 +189,8 @@ mod tests {
 
     #[tokio::test]
     async fn should_run_processor_code_on_uncancelables() {
-        let raw_io = PendingIo::new(TokioScopedPendingIo::new(|| "test"));
+        let handle = Handle::current();
+        let raw_io = PendingIo::new(SpawnablePendingIo::new(&handle, || "test"));
         let chained = raw_io.map(|s| s.to_uppercase());
         assert_eq!(chained.cancel().await, Some("TEST".to_string()));
     }

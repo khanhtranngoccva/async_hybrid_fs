@@ -24,8 +24,9 @@ pub use register::RegisterError;
 pub use register::RegisteredFile;
 pub use requests::Target;
 
-use crate::client::pending_io::uring::{PendingMap, UringPendingIoStatus, UringPendingIoSubmitter};
-use crate::client::ticketing::SubmissionTicketId;
+use pending_io::fallback::Spawnable;
+use pending_io::uring::{PendingMap, UringPendingIoStatus, UringPendingIoSubmitter};
+use ticketing::SubmissionTicketId;
 
 /// Maximum length for a single io_uring read/write operation.
 ///
@@ -39,6 +40,7 @@ const MAX_REGISTERED_FILES: u32 = 4096;
 pub struct Client {
     uring: Option<ClientUring>,
     uring_enabled: Arc<AtomicBool>,
+    fallback_spawner: Arc<dyn Spawnable>,
 }
 
 pub(crate) struct ClientUring {
@@ -129,6 +131,9 @@ pub struct UringCfg {
     /// Defaults to [`DEFAULT_CANCEL_QUEUE_SIZE`] (512 entries).
     pub cancel_queue_size: u32,
 
+    /// Fallback spawner for fallback pending I/O operations.
+    pub fallback_spawner: Arc<dyn Spawnable>,
+
     /// Enable cooperative task running (Linux 5.19+). When enabled, the kernel will only process completions when the application explicitly asks for them, reducing overhead.
     pub coop_taskrun: bool,
 
@@ -162,6 +167,13 @@ impl Default for UringCfg {
         Self {
             operation_queue_size: DEFAULT_OP_QUEUE_SIZE,
             cancel_queue_size: DEFAULT_CANCEL_QUEUE_SIZE,
+            fallback_spawner: Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(0)
+                    .thread_name(|_| "ahfs_fallback".to_string())
+                    .build()
+                    .unwrap(),
+            ),
             coop_taskrun: false,
             defer_taskrun: false,
             iopoll: false,
@@ -215,6 +227,7 @@ impl Client {
         let mut client = Client {
             uring: None,
             uring_enabled: Arc::new(AtomicBool::new(true)),
+            fallback_spawner: cfg.fallback_spawner,
         };
         if let Some(mut ring) = ring {
             // Pre-allocate sparse file table for registration (Linux 5.12+). If this fails, file registration won't work but unregistered fds will still function.

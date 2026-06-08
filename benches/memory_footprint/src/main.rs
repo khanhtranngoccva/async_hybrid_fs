@@ -40,25 +40,25 @@ pub async fn test_channel(ready: tokio::sync::oneshot::Sender<()>) {
 pub async fn test_vecdeques(ready: tokio::sync::oneshot::Sender<()>) {
     let normal_cap = 16384 - 512;
     let cancel_cap = 512;
-    let mut normal_command_queue = VecDeque::<UringPendingIoSubmitter>::with_capacity(normal_cap);
-    let mut normal_ticket_queue = VecDeque::<SubmissionTicket>::with_capacity(normal_cap);
-    let mut cancel_command_queue = VecDeque::<UringPendingIoSubmitter>::with_capacity(cancel_cap);
-    let mut cancel_ticket_queue = VecDeque::<SubmissionTicket>::with_capacity(cancel_cap);
-    let mut ll_entries =
+    let mut _normal_command_queue = VecDeque::<UringPendingIoSubmitter>::with_capacity(normal_cap);
+    let mut _normal_ticket_queue = VecDeque::<SubmissionTicket>::with_capacity(normal_cap);
+    let mut _cancel_command_queue = VecDeque::<UringPendingIoSubmitter>::with_capacity(cancel_cap);
+    let mut _cancel_ticket_queue = VecDeque::<SubmissionTicket>::with_capacity(cancel_cap);
+    let mut _ll_entries =
         VecDeque::<io_uring::squeue::Entry>::with_capacity(normal_cap + cancel_cap);
-    let mut command_submitters =
+    let mut _command_submitters =
         VecDeque::<UringPendingIoSubmitter>::with_capacity(normal_cap + cancel_cap);
     ready.send(()).expect("failed to send ready signal");
     std::future::pending().await
 }
 
 pub async fn test_mock_threads(ready: tokio::sync::oneshot::Sender<()>) {
-    let sthread = std::thread::spawn(|| {
+    let _sthread = std::thread::Builder::new().spawn(|| {
         loop {
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
     });
-    let cthread = std::thread::spawn(|| {
+    let _cthread = std::thread::Builder::new().spawn(|| {
         loop {
             std::thread::sleep(std::time::Duration::from_secs(1));
         }

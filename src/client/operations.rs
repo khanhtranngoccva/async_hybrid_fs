@@ -5,7 +5,7 @@ use crate::{
         Client, InterruptCommand, URING_LEN_MAX, UringMetrics, UringTarget,
         completion::{ReadResult, ReadvResult, WriteResult, WritevResult},
         pending_io::{
-            fallback::TokioScopedPendingIo,
+            fallback::SpawnablePendingIo,
             fixed_value::FixedValuePendingIo,
             uring::{
                 close::UringClose, fadvise::UringFadvise, fallocate::UringFallocate,
@@ -77,6 +77,17 @@ impl Client {
                 .interrupt_sender
                 .send(InterruptCommand::CompletionPanic);
         }
+    }
+
+    /// Spawn a fallback pending I/O operation.
+    pub(crate) fn spawn_fallback<'a, T>(
+        &'a self,
+        f: impl FnOnce() -> T + Send + 'a,
+    ) -> PendingIo<'a, T>
+    where
+        T: Send + 'a,
+    {
+        PendingIo::new(SpawnablePendingIo::new(self.fallback_spawner.as_ref(), f))
     }
 
     /// Check if the specified io_uring operation is supported. See [`io_uring::Probe::is_supported`] for documentation.
@@ -169,19 +180,17 @@ impl Client {
             let uring = self.uring.as_ref().expect("uring must be Some");
             PendingIo::new(UringReadIntoAt::new(uring, file, buf, offset))
         } else {
-            PendingIo::new(TokioScopedPendingIo::new(
-                move || -> io::Result<ReadResult<B>> {
-                    let bytes_read = nix::sys::uio::pread(
-                        file.as_file_descriptor(),
-                        unsafe { buf.as_mut_slice_with_uninit().assume_init_mut() },
-                        offset as i64,
-                    )?;
-                    unsafe {
-                        buf.set_len(bytes_read);
-                    }
-                    Ok(ReadResult { buf, bytes_read })
-                },
-            ))
+            self.spawn_fallback(move || -> io::Result<ReadResult<B>> {
+                let bytes_read = nix::sys::uio::pread(
+                    file.as_file_descriptor(),
+                    unsafe { buf.as_mut_slice_with_uninit().assume_init_mut() },
+                    offset as i64,
+                )?;
+                unsafe {
+                    buf.set_len(bytes_read);
+                }
+                Ok(ReadResult { buf, bytes_read })
+            })
         }
     }
 
@@ -249,35 +258,31 @@ impl Client {
             let uring = self.uring.as_ref().expect("uring must be Some");
             PendingIo::new(UringReadIntoVectoredAt::new(uring, file, bufs, offset))
         } else {
-            PendingIo::new(TokioScopedPendingIo::new(
-                move || -> io::Result<ReadvResult<B>> {
-                    let bytes_read = nix::sys::uio::preadv(
-                        file.as_file_descriptor(),
-                        &mut unsafe {
-                            bufs.iter_mut()
-                                .map(|buf| {
-                                    IoSliceMut::new(
-                                        buf.as_mut_slice_with_uninit().assume_init_mut(),
-                                    )
-                                })
-                                .collect::<Vec<_>>()
-                        },
-                        offset as i64,
-                    )?;
-                    let mut cur_bytes_read = bytes_read as usize;
-                    for buf in bufs.iter_mut() {
-                        let bytes_read_into_target = min(buf.capacity(), cur_bytes_read);
-                        unsafe {
-                            buf.set_len(bytes_read_into_target);
-                        }
-                        cur_bytes_read -= bytes_read_into_target;
+            self.spawn_fallback(move || -> io::Result<ReadvResult<B>> {
+                let bytes_read = nix::sys::uio::preadv(
+                    file.as_file_descriptor(),
+                    &mut unsafe {
+                        bufs.iter_mut()
+                            .map(|buf| {
+                                IoSliceMut::new(buf.as_mut_slice_with_uninit().assume_init_mut())
+                            })
+                            .collect::<Vec<_>>()
+                    },
+                    offset as i64,
+                )?;
+                let mut cur_bytes_read = bytes_read as usize;
+                for buf in bufs.iter_mut() {
+                    let bytes_read_into_target = min(buf.capacity(), cur_bytes_read);
+                    unsafe {
+                        buf.set_len(bytes_read_into_target);
                     }
-                    Ok(ReadvResult {
-                        bufs,
-                        bytes_read: bytes_read as usize,
-                    })
-                },
-            ))
+                    cur_bytes_read -= bytes_read_into_target;
+                }
+                Ok(ReadvResult {
+                    bufs,
+                    bytes_read: bytes_read as usize,
+                })
+            })
         }
     }
 
@@ -312,33 +317,32 @@ impl Client {
                 (-1i64) as u64,
             ))
         } else {
-            PendingIo::new(TokioScopedPendingIo::new(
-                || -> io::Result<ReadvResult<B>> {
-                    let bytes_read = nix::sys::uio::readv(
-                        file.as_file_descriptor(),
-                        &mut bufs
-                            .iter_mut()
-                            .map(|buf| {
-                                IoSliceMut::new(unsafe {
-                                    buf.as_mut_slice_with_uninit().assume_init_mut()
-                                })
+            let descriptor = file.as_file_descriptor();
+            self.spawn_fallback(move || -> io::Result<ReadvResult<B>> {
+                let bytes_read = nix::sys::uio::readv(
+                    descriptor,
+                    &mut bufs
+                        .iter_mut()
+                        .map(|buf| {
+                            IoSliceMut::new(unsafe {
+                                buf.as_mut_slice_with_uninit().assume_init_mut()
                             })
-                            .collect::<Vec<_>>(),
-                    )?;
-                    let mut cur_bytes_read = bytes_read as usize;
-                    for buf in bufs.iter_mut() {
-                        let bytes_read_into_target = min(buf.capacity(), cur_bytes_read);
-                        unsafe {
-                            buf.set_len(bytes_read_into_target);
-                        }
-                        cur_bytes_read -= bytes_read_into_target;
+                        })
+                        .collect::<Vec<_>>(),
+                )?;
+                let mut cur_bytes_read = bytes_read as usize;
+                for buf in bufs.iter_mut() {
+                    let bytes_read_into_target = min(buf.capacity(), cur_bytes_read);
+                    unsafe {
+                        buf.set_len(bytes_read_into_target);
                     }
-                    Ok(ReadvResult {
-                        bufs,
-                        bytes_read: bytes_read as usize,
-                    })
-                },
-            ))
+                    cur_bytes_read -= bytes_read_into_target;
+                }
+                Ok(ReadvResult {
+                    bufs,
+                    bytes_read: bytes_read as usize,
+                })
+            })
         }
     }
 
@@ -384,7 +388,7 @@ impl Client {
     /// The buffer is returned along with the number of bytes read. This allows buffer reuse and supports custom allocators (e.g., aligned buffers for O_DIRECT).
     pub fn read_into<'a, B: IoBufMut + 'a>(
         &'a self,
-        file: &'a mut (impl UringTarget + Sync + Send + ?Sized),
+        file: &'a mut (impl UringTarget + Sync + ?Sized),
         mut buf: B,
     ) -> PendingIo<'a, io::Result<ReadResult<B>>> {
         if self.is_uring_available_and_active()
@@ -393,17 +397,16 @@ impl Client {
             let uring = self.uring.as_ref().expect("uring must be Some");
             PendingIo::new(UringReadIntoAt::new(uring, file, buf, (-1i64) as u64))
         } else {
-            PendingIo::new(TokioScopedPendingIo::new(
-                move || -> io::Result<ReadResult<B>> {
-                    let bytes_read = nix::unistd::read(file.as_file_descriptor(), unsafe {
-                        buf.as_mut_slice_with_uninit().assume_init_mut()
-                    })?;
-                    unsafe {
-                        buf.set_len(bytes_read);
-                    }
-                    Ok(ReadResult { buf, bytes_read })
-                },
-            ))
+            let descriptor = file.as_file_descriptor();
+            self.spawn_fallback(move || -> io::Result<ReadResult<B>> {
+                let bytes_read = nix::unistd::read(descriptor, unsafe {
+                    buf.as_mut_slice_with_uninit().assume_init_mut()
+                })?;
+                unsafe {
+                    buf.set_len(bytes_read);
+                }
+                Ok(ReadResult { buf, bytes_read })
+            })
         }
     }
 
@@ -413,7 +416,7 @@ impl Client {
     /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn read<'a>(
         &'a self,
-        file: &'a mut (impl UringTarget + Sync + Send + ?Sized),
+        file: &'a mut (impl UringTarget + Sync + ?Sized),
         buf: &'a mut [u8],
     ) -> PendingIo<'a, io::Result<usize>> {
         match <u32>::try_from(buf.len()) {
@@ -433,7 +436,7 @@ impl Client {
     /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn read_vectored<'a>(
         &'a self,
-        file: &'a mut (impl UringTarget + Sync + Send + ?Sized),
+        file: &'a mut (impl UringTarget + Sync + ?Sized),
         bufs: &'a mut [IoSliceMut<'a>],
     ) -> PendingIo<'a, io::Result<usize>> {
         let transformed: Vec<_> = bufs
@@ -465,7 +468,7 @@ impl Client {
     /// This method is not cancellation-safe.
     pub async fn read_to_end(
         &self,
-        file: &mut (impl UringTarget + Sync + Send + ?Sized),
+        file: &mut (impl UringTarget + Sync + ?Sized),
         buf: &mut Vec<u8>,
     ) -> io::Result<usize> {
         const DEFAULT_BUF_SIZE: usize = 8 * 1024;
@@ -490,7 +493,7 @@ impl Client {
 
         async fn small_probe_read(
             instance: &Client,
-            file: &mut (impl UringTarget + Sync + Send + ?Sized),
+            file: &mut (impl UringTarget + Sync + ?Sized),
             buf: &mut Vec<u8>,
         ) -> io::Result<usize> {
             let mut probe = [0u8; PROBE_SIZE];
@@ -628,7 +631,7 @@ impl Client {
     /// This method is not cancellation-safe.
     pub async fn read_to_string(
         &self,
-        file: &mut (impl UringTarget + Sync + Send + ?Sized),
+        file: &mut (impl UringTarget + Sync + ?Sized),
         str: &mut String,
     ) -> io::Result<usize> {
         unsafe { helpers::append_to_string(str, async |b| self.read_to_end(file, b).await) }.await
@@ -640,7 +643,7 @@ impl Client {
     /// This method is not cancellation-safe.
     pub async fn read_exact(
         &self,
-        file: &mut (impl UringTarget + Sync + Send + ?Sized),
+        file: &mut (impl UringTarget + Sync + ?Sized),
         mut buf: &mut [u8],
     ) -> io::Result<()> {
         while !buf.is_empty() {
@@ -703,19 +706,14 @@ impl Client {
             let uring = self.uring.as_ref().expect("uring must be Some");
             PendingIo::new(UringWriteFromAt::new(uring, file, buf, offset))
         } else {
-            PendingIo::new(TokioScopedPendingIo::new(
-                move || -> io::Result<WriteResult<B>> {
-                    let res = nix::sys::uio::pwrite(
-                        file.as_file_descriptor(),
-                        buf.as_slice(),
-                        offset as i64,
-                    )?;
-                    Ok(WriteResult {
-                        bytes_written: res,
-                        buf,
-                    })
-                },
-            ))
+            let descriptor = file.as_file_descriptor();
+            self.spawn_fallback(move || -> io::Result<WriteResult<B>> {
+                let res = nix::sys::uio::pwrite(descriptor, buf.as_slice(), offset as i64)?;
+                Ok(WriteResult {
+                    bytes_written: res,
+                    buf,
+                })
+            })
         }
     }
 
@@ -762,20 +760,18 @@ impl Client {
             let uring = self.uring.as_ref().expect("uring must be Some");
             PendingIo::new(UringWriteFromVectoredAt::new(uring, file, bufs, offset))
         } else {
-            PendingIo::new(TokioScopedPendingIo::new(
-                move || -> io::Result<WritevResult<B>> {
-                    let slice = bufs
-                        .iter_mut()
-                        .map(|buf| IoSlice::new(buf.as_slice()))
-                        .collect::<Vec<_>>();
-                    let bytes_written =
-                        nix::sys::uio::pwritev(file.as_file_descriptor(), &slice, offset as i64)?;
-                    Ok(WritevResult {
-                        bufs,
-                        bytes_written,
-                    })
-                },
-            ))
+            let descriptor = file.as_file_descriptor();
+            self.spawn_fallback(move || -> io::Result<WritevResult<B>> {
+                let slice = bufs
+                    .iter_mut()
+                    .map(|buf| IoSlice::new(buf.as_slice()))
+                    .collect::<Vec<_>>();
+                let bytes_written = nix::sys::uio::pwritev(descriptor, &slice, offset as i64)?;
+                Ok(WritevResult {
+                    bufs,
+                    bytes_written,
+                })
+            })
         }
     }
 
@@ -853,7 +849,7 @@ impl Client {
     /// The buffer is returned along with the number of bytes written. This allows buffer reuse and supports custom allocators.
     pub fn write_from<'a, B: IoBuf + 'a>(
         &'a self,
-        file: &'a mut (impl UringTarget + Sync + Send + ?Sized),
+        file: &'a mut (impl UringTarget + Sync + ?Sized),
         buf: B,
     ) -> PendingIo<'a, io::Result<WriteResult<B>>> {
         if self.is_uring_available_and_active()
@@ -862,13 +858,11 @@ impl Client {
             let uring = self.uring.as_ref().expect("uring must be Some");
             PendingIo::new(UringWriteFromAt::new(uring, file, buf, (-1i64) as u64))
         } else {
-            PendingIo::new(TokioScopedPendingIo::new(
-                move || -> io::Result<WriteResult<B>> {
-                    let bytes_written =
-                        nix::unistd::write(file.as_file_descriptor(), buf.as_slice())?;
-                    Ok(WriteResult { buf, bytes_written })
-                },
-            ))
+            let descriptor = file.as_file_descriptor();
+            self.spawn_fallback(move || -> io::Result<WriteResult<B>> {
+                let bytes_written = nix::unistd::write(descriptor, buf.as_slice())?;
+                Ok(WriteResult { buf, bytes_written })
+            })
         }
     }
 
@@ -877,7 +871,7 @@ impl Client {
     /// The buffers are returned along with the number of bytes written. This allows buffer reuse and supports custom allocators.
     pub fn write_from_vectored<'a, B: IoBuf + 'a>(
         &'a self,
-        file: &'a mut (impl UringTarget + Sync + Send + ?Sized),
+        file: &'a mut (impl UringTarget + Sync + ?Sized),
         bufs: Vec<B>,
     ) -> PendingIo<'a, io::Result<WritevResult<B>>> {
         let _io_slices_len: u32 = match bufs.len().try_into() {
@@ -900,19 +894,18 @@ impl Client {
                 (-1i64) as u64,
             ))
         } else {
-            PendingIo::new(TokioScopedPendingIo::new(
-                move || -> io::Result<WritevResult<B>> {
-                    let slices = bufs
-                        .iter()
-                        .map(|buf| IoSlice::new(buf.as_slice()))
-                        .collect::<Vec<_>>();
-                    let bytes_written = nix::sys::uio::writev(file.as_file_descriptor(), &slices)?;
-                    Ok(WritevResult {
-                        bufs,
-                        bytes_written,
-                    })
-                },
-            ))
+            let descriptor = file.as_file_descriptor();
+            self.spawn_fallback(move || -> io::Result<WritevResult<B>> {
+                let slices = bufs
+                    .iter()
+                    .map(|buf| IoSlice::new(buf.as_slice()))
+                    .collect::<Vec<_>>();
+                let bytes_written = nix::sys::uio::writev(descriptor, &slices)?;
+                Ok(WritevResult {
+                    bufs,
+                    bytes_written,
+                })
+            })
         }
     }
 
@@ -922,7 +915,7 @@ impl Client {
     /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn write<'a>(
         &'a self,
-        file: &'a mut (impl UringTarget + Sync + Send + ?Sized),
+        file: &'a mut (impl UringTarget + Sync + ?Sized),
         buf: &'a [u8],
     ) -> PendingIo<'a, io::Result<usize>> {
         self.write_from(file, buf)
@@ -935,7 +928,7 @@ impl Client {
     /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn write_vectored<'a>(
         &'a self,
-        file: &'a mut (impl UringTarget + Sync + Send + ?Sized),
+        file: &'a mut (impl UringTarget + Sync + ?Sized),
         bufs: &'a [IoSlice<'a>],
     ) -> PendingIo<'a, io::Result<usize>> {
         let transformed = bufs
@@ -952,7 +945,7 @@ impl Client {
     /// This method is not cancellation-safe.
     pub async fn write_all<'a>(
         &'a self,
-        file: &'a mut (impl UringTarget + Sync + Send + ?Sized),
+        file: &'a mut (impl UringTarget + Sync + ?Sized),
         mut buf: &'a [u8],
     ) -> io::Result<()> {
         while !buf.is_empty() {
@@ -982,7 +975,7 @@ impl Client {
     /// This method is not cancellation-safe.
     pub async fn write_fmt(
         &self,
-        file: &mut (impl UringTarget + Sync + Send + ?Sized),
+        file: &mut (impl UringTarget + Sync + ?Sized),
         args: fmt::Arguments<'_>,
     ) -> io::Result<()> {
         self.write_all(file, args.to_string().as_bytes()).await
@@ -1019,9 +1012,10 @@ impl Client {
                 ))));
             }
         };
-        PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<u64> {
-            Ok(nix::unistd::lseek(file.as_file_descriptor(), offset, whence)? as u64)
-        }))
+        let descriptor = file.as_file_descriptor();
+        self.spawn_fallback(move || -> io::Result<u64> {
+            Ok(nix::unistd::lseek(descriptor, offset, whence)? as u64)
+        })
     }
 
     /// Standard library compatible method for seeking to a specific offset in the file.
@@ -1068,10 +1062,11 @@ impl Client {
             let uring = self.uring.as_ref().expect("uring must be Some");
             PendingIo::new(UringSync::new(uring, file, false))
         } else {
-            PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
-                nix::unistd::fsync(file.as_file_descriptor())?;
+            let descriptor = file.as_file_descriptor();
+            self.spawn_fallback(move || -> io::Result<()> {
+                nix::unistd::fsync(descriptor)?;
                 Ok(())
-            }))
+            })
         }
     }
 
@@ -1089,10 +1084,11 @@ impl Client {
             let uring = self.uring.as_ref().expect("uring must be Some");
             PendingIo::new(UringSync::new(uring, file, true))
         } else {
-            PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
-                nix::unistd::fsync(file.as_file_descriptor())?;
+            let descriptor = file.as_file_descriptor();
+            self.spawn_fallback(move || -> io::Result<()> {
+                nix::unistd::fsync(descriptor)?;
                 Ok(())
-            }))
+            })
         }
     }
 
@@ -1111,20 +1107,19 @@ impl Client {
             PendingIo::new(UringStatx::new(uring, file))
         } else {
             let mut statx_buf = Box::new(MaybeUninit::<libc::statx>::uninit());
-            PendingIo::new(TokioScopedPendingIo::new(
-                move || -> io::Result<Metadata> {
-                    helpers::syscall_cvt(unsafe {
-                        libc::statx(
-                            file.as_file_descriptor().as_raw_fd(),
-                            c"".as_ptr(),
-                            libc::AT_EMPTY_PATH,
-                            libc::STATX_BASIC_STATS,
-                            statx_buf.as_mut_ptr(),
-                        )
-                    })?;
-                    Ok(Metadata(unsafe { (*statx_buf).assume_init() }))
-                },
-            ))
+            let descriptor = file.as_file_descriptor();
+            self.spawn_fallback(move || -> io::Result<Metadata> {
+                helpers::syscall_cvt(unsafe {
+                    libc::statx(
+                        descriptor.as_raw_fd(),
+                        c"".as_ptr(),
+                        libc::AT_EMPTY_PATH,
+                        libc::STATX_BASIC_STATS,
+                        statx_buf.as_mut_ptr(),
+                    )
+                })?;
+                Ok(Metadata(unsafe { (*statx_buf).assume_init() }))
+            })
         }
     }
 
@@ -1151,20 +1146,19 @@ impl Client {
             let uring = self.uring.as_ref().expect("uring must be Some");
             PendingIo::new(UringStatxPath::new(uring, fd, path_cstr, flags))
         } else {
-            PendingIo::new(TokioScopedPendingIo::new(
-                move || -> io::Result<Metadata> {
-                    helpers::syscall_cvt(unsafe {
-                        libc::statx(
-                            fd.as_file_descriptor().as_raw_fd(),
-                            path_cstr.as_ptr(),
-                            flags.bits(),
-                            libc::STATX_BASIC_STATS,
-                            statx_buf.as_mut_ptr(),
-                        )
-                    })?;
-                    Ok(Metadata(unsafe { (*statx_buf).assume_init() }))
-                },
-            ))
+            let descriptor = fd.as_file_descriptor();
+            self.spawn_fallback(move || -> io::Result<Metadata> {
+                helpers::syscall_cvt(unsafe {
+                    libc::statx(
+                        descriptor.as_raw_fd(),
+                        path_cstr.as_ptr(),
+                        flags.bits(),
+                        libc::STATX_BASIC_STATS,
+                        statx_buf.as_mut_ptr(),
+                    )
+                })?;
+                Ok(Metadata(unsafe { (*statx_buf).assume_init() }))
+            })
         }
     }
 
@@ -1241,15 +1235,16 @@ impl Client {
             let uring = self.uring.as_ref().expect("uring must be Some");
             PendingIo::new(UringFallocate::new(uring, file, mode, offset, len))
         } else {
-            PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
+            let descriptor = file.as_file_descriptor();
+            self.spawn_fallback(move || -> io::Result<()> {
                 nix::fcntl::fallocate(
-                    file.as_file_descriptor(),
+                    descriptor,
                     nix::fcntl::FallocateFlags::from_bits_retain(mode.bits()),
                     offset as i64,
                     len as i64,
                 )?;
                 Ok(())
-            }))
+            })
         }
     }
 
@@ -1300,15 +1295,11 @@ impl Client {
             let uring = self.uring.as_ref().expect("uring must be Some");
             PendingIo::new(UringFadvise::new(uring, file, advice, offset, len as i64))
         } else {
-            PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
-                nix::fcntl::posix_fadvise(
-                    file.as_file_descriptor(),
-                    offset as i64,
-                    len as i64,
-                    advice,
-                )?;
+            let descriptor = file.as_file_descriptor();
+            self.spawn_fallback(move || -> io::Result<()> {
+                nix::fcntl::posix_fadvise(descriptor, offset as i64, len as i64, advice)?;
                 Ok(())
-            }))
+            })
         }
     }
 
@@ -1342,10 +1333,11 @@ impl Client {
             let uring = self.uring.as_ref().expect("uring must be Some");
             PendingIo::new(UringFtruncate::new(uring, file, len))
         } else {
-            PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
-                nix::unistd::ftruncate(file.as_file_descriptor(), len as i64)?;
+            let descriptor = file.as_file_descriptor();
+            self.spawn_fallback(move || -> io::Result<()> {
+                nix::unistd::ftruncate(descriptor, len as i64)?;
                 Ok(())
-            }))
+            })
         }
     }
 
@@ -1389,14 +1381,15 @@ impl Client {
             ))
         } else {
             let path_owned = path.as_ref().to_owned();
-            PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<OwnedFd> {
+            let descriptor = dir_fd.as_file_descriptor();
+            self.spawn_fallback(move || -> io::Result<OwnedFd> {
                 Ok(nix::fcntl::openat(
-                    dir_fd.as_file_descriptor(),
+                    descriptor,
                     &path_owned,
                     OFlag::from_bits_retain(flags.bits()),
                     Mode::from_bits_retain(permissions.mode()),
                 )?)
-            }))
+            })
         }
     }
 
@@ -1435,7 +1428,12 @@ impl Client {
         flags: OFlag,
         permissions: Permissions,
     ) -> PendingIo<'a, io::Result<OwnedFd>> {
-        self.open_at_ll(dir_fd, path, flags | OFlag::O_CLOEXEC, permissions)
+        self.open_at_ll(
+            dir_fd,
+            path,
+            flags | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK,
+            permissions,
+        )
     }
 
     /// Open a file using path syntax similar to [`Self::open_at_ll`]. This provides a convenient interface close to the standard library's [`std::fs::OpenOptions`] object, which includes the [`O_CLOEXEC`](libc::O_CLOEXEC) flag to prevent fd leaks.
@@ -1448,7 +1446,12 @@ impl Client {
         flags: OFlag,
         permissions: Permissions,
     ) -> PendingIo<'a, io::Result<OwnedFd>> {
-        self.open_at_ll(&Self::AT_FDCWD, path, flags | OFlag::O_CLOEXEC, permissions)
+        self.open_at_ll(
+            &Self::AT_FDCWD,
+            path,
+            flags | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK,
+            permissions,
+        )
     }
 
     /// Standard library compatible method for opening a file, equivalent to [`std::fs::File::open`] (read-only open API),
@@ -1460,7 +1463,7 @@ impl Client {
         self.open_at_ll(
             &Self::AT_FDCWD,
             path,
-            OFlag::O_RDONLY | OFlag::O_CLOEXEC,
+            OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK,
             Permissions::from_mode(0o666),
         )
     }
@@ -1473,7 +1476,11 @@ impl Client {
         self.open_at_ll(
             &Self::AT_FDCWD,
             path,
-            OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_TRUNC | OFlag::O_CLOEXEC,
+            OFlag::O_WRONLY
+                | OFlag::O_CREAT
+                | OFlag::O_TRUNC
+                | OFlag::O_CLOEXEC
+                | OFlag::O_NONBLOCK,
             Permissions::from_mode(0o666),
         )
     }
@@ -1486,7 +1493,7 @@ impl Client {
         self.open_at_ll(
             &Self::AT_FDCWD,
             path,
-            OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_CLOEXEC,
+            OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK,
             Permissions::from_mode(0o666),
         )
     }
@@ -1510,12 +1517,12 @@ impl Client {
             let uring = self.uring.as_ref().expect("uring must be Some");
             PendingIo::new(UringClose::new(uring, fd))
         } else {
-            let raw_fd = fd.into_raw_fd();
-            let owned_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
-            PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
+            self.spawn_fallback(move || -> io::Result<()> {
+                let raw_fd = fd.into_raw_fd();
+                let owned_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
                 nix::unistd::close(owned_fd)?;
                 Ok(())
-            }))
+            })
         }
     }
 
@@ -1555,16 +1562,18 @@ impl Client {
         } else {
             let old_path_owned = old_path.as_ref().to_owned();
             let new_path_owned = new_path.as_ref().to_owned();
-            PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
+            let old_descriptor = old_dir_fd.as_file_descriptor();
+            let new_descriptor = new_dir_fd.as_file_descriptor();
+            self.spawn_fallback(move || -> io::Result<()> {
                 nix::fcntl::renameat2(
-                    old_dir_fd.as_file_descriptor(),
+                    old_descriptor,
                     &old_path_owned,
-                    new_dir_fd.as_file_descriptor(),
+                    new_descriptor,
                     &new_path_owned,
                     flags,
                 )?;
                 Ok(())
-            }))
+            })
         }
     }
 
@@ -1611,10 +1620,11 @@ impl Client {
             PendingIo::new(UringUnlinkAt::new(uring, dir_fd, path, flags))
         } else {
             let path_owned = path.as_ref().to_owned();
-            PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
-                nix::unistd::unlinkat(dir_fd.as_file_descriptor(), &path_owned, flags)?;
+            let descriptor = dir_fd.as_file_descriptor();
+            self.spawn_fallback(move || -> io::Result<()> {
+                nix::unistd::unlinkat(descriptor, &path_owned, flags)?;
                 Ok(())
-            }))
+            })
         }
     }
 
@@ -1671,14 +1681,15 @@ impl Client {
             ))
         } else {
             let path_owned = path.as_ref().to_owned();
-            PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
+            let descriptor = dir_fd.as_file_descriptor();
+            self.spawn_fallback(move || -> io::Result<()> {
                 nix::sys::stat::mkdirat(
-                    dir_fd.as_file_descriptor(),
+                    descriptor,
                     &path_owned,
                     Mode::from_bits_retain(permissions.mode()),
                 )?;
                 Ok(())
-            }))
+            })
         }
     }
 
@@ -1826,14 +1837,11 @@ impl Client {
         } else {
             let target_owned = target.as_ref().to_owned();
             let link_path_owned = link_path.as_ref().to_owned();
-            PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
-                nix::unistd::symlinkat(
-                    &target_owned,
-                    new_dir_fd.as_file_descriptor(),
-                    &link_path_owned,
-                )?;
+            let descriptor = new_dir_fd.as_file_descriptor();
+            self.spawn_fallback(move || -> io::Result<()> {
+                nix::unistd::symlinkat(&target_owned, descriptor, &link_path_owned)?;
                 Ok(())
-            }))
+            })
         }
     }
 
@@ -1883,16 +1891,18 @@ impl Client {
         } else {
             let old_path_owned = old_path.as_ref().to_owned();
             let new_path_owned = new_path.as_ref().to_owned();
-            PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
+            let old_descriptor = old_dir_fd.as_file_descriptor();
+            let new_descriptor = new_dir_fd.as_file_descriptor();
+            self.spawn_fallback(move || -> io::Result<()> {
                 nix::unistd::linkat(
-                    old_dir_fd.as_file_descriptor(),
+                    old_descriptor,
                     &old_path_owned,
-                    new_dir_fd.as_file_descriptor(),
+                    new_descriptor,
                     &new_path_owned,
                     flags,
                 )?;
                 Ok(())
-            }))
+            })
         }
     }
 
@@ -1968,13 +1978,11 @@ impl Client {
         fd: &'a (impl UringTarget + Sync + ?Sized),
         permissions: Permissions,
     ) -> PendingIo<'a, io::Result<()>> {
-        PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
-            nix::sys::stat::fchmod(
-                fd.as_file_descriptor(),
-                Mode::from_bits_retain(permissions.mode()),
-            )?;
+        let descriptor = fd.as_file_descriptor();
+        self.spawn_fallback(move || -> io::Result<()> {
+            nix::sys::stat::fchmod(descriptor, Mode::from_bits_retain(permissions.mode()))?;
             Ok(())
-        }))
+        })
     }
 
     /// Set the permissions of a file or directory relative to a directory fd, which is equivalent to `fchmodat(2)`.
@@ -1989,15 +1997,16 @@ impl Client {
         flags: FchmodatFlags,
     ) -> PendingIo<'a, io::Result<()>> {
         let path = path.as_ref().to_owned();
-        PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
+        let descriptor = fd.as_file_descriptor();
+        self.spawn_fallback(move || -> io::Result<()> {
             nix::sys::stat::fchmodat(
-                fd.as_file_descriptor(),
+                descriptor,
                 &path,
                 Mode::from_bits_retain(permissions.mode()),
                 flags,
             )?;
             Ok(())
-        }))
+        })
     }
 
     /// Set the permissions of a file or directory using path syntax, equivalent to `chmod(2)`.
@@ -2044,10 +2053,11 @@ impl Client {
         uid: Option<Uid>,
         gid: Option<Gid>,
     ) -> PendingIo<'a, io::Result<()>> {
-        PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
-            nix::unistd::fchown(fd.as_file_descriptor(), uid, gid)?;
+        let descriptor = fd.as_file_descriptor();
+        self.spawn_fallback(move || -> io::Result<()> {
+            nix::unistd::fchown(descriptor, uid, gid)?;
             Ok(())
-        }))
+        })
     }
 
     /// Set the user and/or group ownership of a file or directory relative to a directory fd, which is equivalent to `fchownat(2)`.
@@ -2063,10 +2073,11 @@ impl Client {
         flags: FchownatFlags,
     ) -> PendingIo<'a, io::Result<()>> {
         let path = path.as_ref().to_owned();
-        PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
-            nix::unistd::fchownat(fd.as_file_descriptor(), &path, uid, gid, flags)?;
+        let descriptor = fd.as_file_descriptor();
+        self.spawn_fallback(move || -> io::Result<()> {
+            nix::unistd::fchownat(descriptor, &path, uid, gid, flags)?;
             Ok(())
-        }))
+        })
     }
 
     /// Set the user and/or group ownership of a file or directory using path syntax, which is equivalent to `chown(2)`.
@@ -2128,14 +2139,15 @@ impl Client {
         atime: Option<TimeSpec>,
         mtime: Option<TimeSpec>,
     ) -> PendingIo<'a, io::Result<()>> {
-        PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
+        let descriptor = fd.as_file_descriptor();
+        self.spawn_fallback(move || -> io::Result<()> {
             nix::sys::stat::futimens(
-                fd.as_file_descriptor(),
+                descriptor,
                 &atime.unwrap_or(TimeSpec::UTIME_OMIT),
                 &mtime.unwrap_or(TimeSpec::UTIME_OMIT),
             )?;
             Ok(())
-        }))
+        })
     }
 
     /// Set file times of a file or directory using a path relative to a directory fd, which is equivalent to `utimensat(2)`.
@@ -2151,16 +2163,17 @@ impl Client {
         flags: UtimensatFlags,
     ) -> PendingIo<'a, io::Result<()>> {
         let path = path.as_ref().to_owned();
-        PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
+        let descriptor = dir_fd.as_file_descriptor();
+        self.spawn_fallback(move || -> io::Result<()> {
             nix::sys::stat::utimensat(
-                dir_fd.as_file_descriptor(),
+                descriptor,
                 &path,
                 &atime.unwrap_or(TimeSpec::UTIME_OMIT),
                 &mtime.unwrap_or(TimeSpec::UTIME_OMIT),
                 flags,
             )?;
             Ok(())
-        }))
+        })
     }
 
     /// Canonicalize a path. This is equivalent to `realpath(3)`.
@@ -2172,9 +2185,7 @@ impl Client {
         path: impl AsRef<Path>,
     ) -> PendingIo<'a, io::Result<PathBuf>> {
         let path = path.as_ref().to_owned();
-        PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<PathBuf> {
-            std::fs::canonicalize(&path)
-        }))
+        self.spawn_fallback(move || -> io::Result<PathBuf> { std::fs::canonicalize(&path) })
     }
 
     /// Read a symbolic link. This is equivalent to `readlink(2)`.
@@ -2195,12 +2206,12 @@ impl Client {
         path: impl AsRef<Path>,
     ) -> PendingIo<'a, io::Result<PathBuf>> {
         let path = path.as_ref().to_owned();
-        PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<PathBuf> {
+        self.spawn_fallback(move || -> io::Result<PathBuf> {
             Ok(PathBuf::from(nix::fcntl::readlinkat(
                 dir_fd.as_file_descriptor(),
                 &path,
             )?))
-        }))
+        })
     }
 
     /// Read a symbolic link at a file descriptor opened with [`OFlag::O_PATH`] and [`OFlag::O_NOFOLLOW`].
@@ -2226,17 +2237,18 @@ impl Client {
         permissions: Permissions,
     ) -> PendingIo<'a, io::Result<()>> {
         let path_owned = path.as_ref().to_owned();
-        PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<()> {
+        let descriptor = dir_fd.as_file_descriptor();
+        self.spawn_fallback(move || -> io::Result<()> {
             let (kind, device) = kind.to_sflag_and_device();
             nix::sys::stat::mknodat(
-                dir_fd.as_file_descriptor(),
+                descriptor,
                 &path_owned,
                 kind,
                 Mode::from_bits_retain(permissions.mode()),
                 device.into(),
             )?;
             Ok(())
-        }))
+        })
     }
 
     /// Create a device node using path syntax, which is equivalent to `mknod(2)`.
@@ -2252,7 +2264,7 @@ impl Client {
         self.mknod_at(&Self::AT_FDCWD, path, kind, permissions)
     }
 
-    /// Perform a `fcntl` syscall on a file descriptor, which is equivalent to `fcntl(2)`.
+    /// Perform a low-level `fcntl` syscall on a file descriptor, which is equivalent to `fcntl(2)`.
     ///
     /// # Cancellation safety
     /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
@@ -2261,10 +2273,11 @@ impl Client {
         fd: &'a (impl UringTarget + Sync + ?Sized),
         cmd: FcntlArg<'a>,
     ) -> PendingIo<'a, io::Result<i32>> {
-        PendingIo::new(TokioScopedPendingIo::new(move || -> io::Result<i32> {
-            let res = nix::fcntl::fcntl(fd.as_file_descriptor(), cmd)?;
+        let descriptor = fd.as_file_descriptor();
+        self.spawn_fallback(move || -> io::Result<i32> {
+            let res = nix::fcntl::fcntl(descriptor, cmd)?;
             Ok(res)
-        }))
+        })
     }
 
     /// Set the status flags of a file descriptor, which is equivalent to `F_SETFL(2)`.
@@ -2273,7 +2286,7 @@ impl Client {
     /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn set_status_flags<'a>(
         &'a self,
-        fd: &'a mut (impl UringTarget + Sync + Send + ?Sized),
+        fd: &'a mut (impl UringTarget + Sync + ?Sized),
         flags: OFlag,
     ) -> PendingIo<'a, io::Result<()>> {
         self.fcntl(fd, FcntlArg::F_SETFL(flags))
@@ -2298,7 +2311,7 @@ impl Client {
     /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn set_descriptor_flags<'a>(
         &'a self,
-        fd: &'a mut (impl UringTarget + Sync + Send + ?Sized),
+        fd: &'a mut (impl UringTarget + Sync + ?Sized),
         flags: FdFlag,
     ) -> PendingIo<'a, io::Result<()>> {
         self.fcntl(fd, FcntlArg::F_SETFD(flags))
@@ -2323,7 +2336,7 @@ impl Client {
     /// This method is not cancellation-safe.
     pub async fn set_nonblocking<'a>(
         &'a self,
-        fd: &'a mut (impl UringTarget + Sync + Send + ?Sized),
+        fd: &'a mut (impl UringTarget + Sync + ?Sized),
         nonblocking: bool,
     ) -> io::Result<()> {
         let old_flags = self
@@ -2349,7 +2362,7 @@ impl Client {
     /// This method is not cancellation-safe.
     pub async fn set_close_on_exec<'a>(
         &'a self,
-        fd: &'a mut (impl UringTarget + Sync + Send + ?Sized),
+        fd: &'a mut (impl UringTarget + Sync + ?Sized),
         close_on_exec: bool,
     ) -> io::Result<()> {
         let old_flags = self

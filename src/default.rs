@@ -11,6 +11,7 @@ use lazy_static::lazy_static;
 lazy_static! {
     static ref DEFAULT_CLIENT: Client = Client::build(UringCfg::default()).unwrap();
     static ref DEFAULT_CLIENT_SHARDS: DashMap<usize, Arc<Client>> = DashMap::new();
+    static ref DEFAULT_THREAD_POOL: Arc<rayon::ThreadPool> = Arc::new(rayon::ThreadPoolBuilder::new().build().unwrap());
     static ref PARALLELISM: usize = std::thread::available_parallelism()
         .unwrap_or(NonZero::new(8).unwrap())
         .get();
