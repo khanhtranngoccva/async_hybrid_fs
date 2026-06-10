@@ -57,6 +57,7 @@ mod tests;
 use crate::client::ClientUring;
 use crate::client::pending_io::fixed_value::FixedValuePendingIo;
 use nix::fcntl::AT_FDCWD;
+use nix::fcntl::AtFlags;
 use nix::fcntl::FdFlag;
 use nix::fcntl::OFlag;
 use nix::fcntl::RenameFlags;
@@ -1115,6 +1116,31 @@ pub trait HybridDir: UringTarget + Sync {
         path: impl AsRef<Path>,
     ) -> PendingIo<'a, io::Result<PathBuf>> {
         default_client().read_link_at(self, path)
+    }
+
+    /// Method for querying metadata of an entry relative to the specified directory fd.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
+    #[inline]
+    fn metadata_at<'a>(
+        &'a self,
+        path: impl AsRef<Path>,
+        flags: AtFlags,
+    ) -> PendingIo<'a, io::Result<Metadata>> {
+        self.hybrid_metadata_at(path, flags)
+    }
+
+    /// Alias for [`HybridDir::metadata_at`].
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
+    fn hybrid_metadata_at<'a>(
+        &'a self,
+        path: impl AsRef<Path>,
+        flags: AtFlags,
+    ) -> PendingIo<'a, io::Result<Metadata>> {
+        default_client().statx_at(self, path, flags)
     }
 }
 
