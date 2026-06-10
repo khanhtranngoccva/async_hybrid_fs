@@ -1,9 +1,10 @@
-use std::{
-    ffi::CString,
-    io,
-    os::unix::ffi::OsStrExt,
-    path::Path,
-};
+#![allow(dead_code)]
+#![allow(unused_macros)]
+
+use core::ffi::c_void;
+use core::mem::{align_of, size_of};
+use core::ptr::{NonNull, null, null_mut};
+use std::{ffi::CString, io, os::unix::ffi::OsStrExt, path::Path};
 
 /// Convert a path to a CString for use with io_uring operations.
 pub(crate) fn path_to_cstring(path: &Path) -> io::Result<CString> {
@@ -15,6 +16,7 @@ pub(crate) fn path_to_cstring(path: &Path) -> io::Result<CString> {
     })
 }
 
+/// Convert a syscall result to an `io::Result`
 pub(crate) fn syscall_cvt<R: Into<i64> + Copy>(result: R) -> io::Result<R> {
     if result.into() == -1 {
         Err(io::Error::last_os_error())
@@ -22,6 +24,34 @@ pub(crate) fn syscall_cvt<R: Into<i64> + Copy>(result: R) -> io::Result<R> {
         Ok(result)
     }
 }
+
+/// Retry the given function if it returns an `Interrupted` error
+pub(crate) fn retry_on_eintr<T, F>(mut f: F) -> io::Result<T>
+where
+    F: FnMut() -> io::Result<T>,
+{
+    loop {
+        match f() {
+            Ok(res) => return Ok(res),
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Retry the given async function if it returns an `Interrupted` error
+macro_rules! m_retry_on_eintr {
+    ($f:expr) => {{
+        loop {
+            match $f {
+                Ok(res) => break Ok(res),
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => break Err(e),
+            }
+        }
+    }};
+}
+pub(crate) use m_retry_on_eintr;
 
 // Several `read_to_string` and `read_line` methods in the standard library will
 // append data into a `String` buffer, but we need to be pretty careful when
@@ -78,4 +108,72 @@ where
         g.len = g.buf.len();
         ret
     }
+}
+
+/// Convert a `&T` into a `*const T` without using an `as`.
+#[inline]
+pub(crate) const fn as_ptr<T>(t: &T) -> *const T {
+    t
+}
+
+/// Convert a `&mut T` into a `*mut T` without using an `as`.
+#[inline]
+pub(crate) fn as_mut_ptr<T>(t: &mut T) -> *mut T {
+    t
+}
+
+/// Convert an `Option<&T>` into a possibly-null `*const T`.
+#[inline]
+pub(crate) const fn option_as_ptr<T>(t: Option<&T>) -> *const T {
+    match t {
+        Some(t) => t,
+        None => null(),
+    }
+}
+
+/// Convert an `Option<&mut T>` into a possibly-null `*mut T`.
+#[inline]
+pub(crate) fn option_as_mut_ptr<T>(t: Option<&mut T>) -> *mut T {
+    match t {
+        Some(t) => t,
+        None => null_mut(),
+    }
+}
+
+/// Convert a `*mut c_void` to a `*mut T`, checking that it is not null,
+/// misaligned, or pointing to a region of memory that wraps around the address
+/// space.
+pub(crate) fn check_raw_pointer<T>(value: *mut c_void) -> Option<NonNull<T>> {
+    if (value as usize).checked_add(size_of::<T>()).is_none()
+        || !(value as usize).is_multiple_of(align_of::<T>())
+    {
+        return None;
+    }
+
+    NonNull::new(value.cast())
+}
+
+/// Create a union value containing a default value in one of its arms.
+///
+/// The field names a union field which must have the same size as the union
+/// itself.
+macro_rules! default_union {
+    ($union:ident, $field:ident) => {{
+        let u = $union {
+            $field: Default::default(),
+        };
+
+        // Assert that the given field initializes the whole union.
+        #[cfg(test)]
+        unsafe {
+            let field_value = u.$field;
+            assert_eq!(
+                core::mem::size_of_val(&u),
+                core::mem::size_of_val(&field_value)
+            );
+            const_assert_eq!(memoffset::offset_of_union!($union, $field), 0);
+        }
+
+        u
+    }};
 }

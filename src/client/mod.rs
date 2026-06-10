@@ -6,6 +6,8 @@ mod register;
 mod requests;
 pub(crate) mod ticketing;
 
+pub use completion::{ReadResult, ReadvResult, WriteResult, WritevResult};
+
 use std::collections::VecDeque;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
@@ -27,6 +29,8 @@ pub use requests::Target;
 use pending_io::fallback::Spawnable;
 use pending_io::uring::{PendingMap, UringPendingIoStatus, UringPendingIoSubmitter};
 use ticketing::SubmissionTicketId;
+
+use crate::helpers;
 
 /// Maximum length for a single io_uring read/write operation.
 ///
@@ -362,9 +366,7 @@ impl Drop for SubmissionDropper {
             }
         }
         submission.sync();
-        self.uring
-            .submitter()
-            .submit()
+        helpers::retry_on_eintr(|| self.uring.submitter().submit())
             .expect("failed to submit last batch of cancellation operations");
         // Poison pill is guaranteed to be the last item, after all operations are done or cancelled. The IO_DRAIN flag ensures that the cancellation have all finished.
         let entry = io_uring::opcode::Nop::new()
@@ -373,15 +375,12 @@ impl Drop for SubmissionDropper {
             .flags(io_uring::squeue::Flags::IO_DRAIN);
         while unsafe { submission.push(&entry) }.is_err() {
             // The queue is in latest state, so if we cannot submit, we can safely wait for an event.
-            self.uring
-                .submit_and_wait(1)
+            helpers::retry_on_eintr(|| self.uring.submit_and_wait(1))
                 .expect("failed to wait for empty submission slot");
             submission.sync();
         }
         submission.sync();
-        self.uring
-            .submitter()
-            .submit()
+        helpers::retry_on_eintr(|| self.uring.submitter().submit())
             .expect("failed to submit poison entry");
     }
 }
@@ -529,8 +528,7 @@ fn submission_thread(
             }
         }
         submission.sync();
-        ring.submitter()
-            .submit()
+        helpers::retry_on_eintr(|| ring.submitter().submit())
             .expect("failed to perform batch submit");
         // Mark entries as submitted
         for submitter in command_submitters.drain(..) {
@@ -577,8 +575,7 @@ fn completion_thread(
         loop {
             let e = loop {
                 let Some(entry) = completion.next() else {
-                    ring.submitter()
-                        .submit_and_wait(1)
+                    helpers::retry_on_eintr(|| ring.submitter().submit_and_wait(1))
                         .expect("failed to wait for completion");
                     completion.sync();
                     continue;

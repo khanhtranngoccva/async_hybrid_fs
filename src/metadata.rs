@@ -196,7 +196,7 @@ impl From<Metadata> for libc::statx {
 
 /// Representation of file types. Equivalent to [`std::fs::FileType`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct FileType(u16);
+pub struct FileType(pub(crate) u16);
 
 impl FileType {
     /// Returns `true` if this file type is a directory.

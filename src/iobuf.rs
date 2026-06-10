@@ -1,5 +1,5 @@
 //! Custom buffer traits for io_uring operations.
-//! 
+//!
 //! We define custom buffer traits rather than using `Vec<u8>` or `Box<[u8]>` directly because:
 //!
 //! 1. **Aligned allocations**: O_DIRECT requires sector-aligned buffers (typically 512 or 4096 bytes).
@@ -173,5 +173,49 @@ unsafe impl<'buf> IoBufMut for IoSliceMut<'buf> {
 
     unsafe fn set_len(&mut self, _len: usize) {
         // IoSliceMut has fixed size, capacity == len. Therefore, we do not need to do anything.
+    }
+}
+
+// Blanket IoBuf and IoBufMut implementations for reference types
+unsafe impl<T> IoBuf for &T
+where
+    T: IoBuf + Sync,
+{
+    fn as_ptr(&self) -> *const u8 {
+        <T>::as_ptr(self)
+    }
+
+    fn len(&self) -> usize {
+        <T>::len(self)
+    }
+}
+
+unsafe impl<T> IoBuf for &mut T
+where
+    T: IoBuf + Sync,
+{
+    fn as_ptr(&self) -> *const u8 {
+        <T>::as_ptr(self)
+    }
+
+    fn len(&self) -> usize {
+        <T>::len(self)
+    }
+}
+
+unsafe impl<T> IoBufMut for &mut T
+where
+    T: IoBufMut + Sync,
+{
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        <T>::as_mut_ptr(self)
+    }
+
+    fn capacity(&self) -> usize {
+        <T>::capacity(self)
+    }
+
+    unsafe fn set_len(&mut self, len: usize) {
+        unsafe { <T>::set_len(self, len) }
     }
 }

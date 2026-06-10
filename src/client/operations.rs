@@ -28,6 +28,7 @@ use nix::{
     fcntl::{AtFlags, FallocateFlags, FcntlArg, FdFlag, OFlag, PosixFadviseAdvice, RenameFlags},
     sys::{
         stat::{FchmodatFlags, Mode, UtimensatFlags},
+        statvfs::Statvfs,
         time::TimeSpec,
     },
     unistd::{FchownatFlags, Gid, LinkatFlags, Uid, UnlinkatFlags},
@@ -36,7 +37,7 @@ use std::{
     cmp::{self, min},
     io::{self, IoSlice, IoSliceMut, SeekFrom},
     mem::MaybeUninit,
-    os::fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd},
+    os::fd::{AsRawFd, BorrowedFd, OwnedFd},
     path::{Path, PathBuf},
     pin::Pin,
     sync::atomic::Ordering,
@@ -1507,19 +1508,15 @@ impl Client {
     ///
     /// # Cancellation safety
     /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
-    pub fn close<'a>(
-        &'a self,
-        fd: impl IntoRawFd + Sized + Send + 'a,
-    ) -> PendingIo<'a, io::Result<()>> {
+    pub fn close<'a>(&'a self, fd: impl Into<OwnedFd>) -> PendingIo<'a, io::Result<()>> {
+        let owned_fd = fd.into();
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Close::CODE)
         {
             let uring = self.uring.as_ref().expect("uring must be Some");
-            PendingIo::new(UringClose::new(uring, fd))
+            PendingIo::new(UringClose::new(uring, owned_fd))
         } else {
             self.spawn_fallback(move || -> io::Result<()> {
-                let raw_fd = fd.into_raw_fd();
-                let owned_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
                 nix::unistd::close(owned_fd)?;
                 Ok(())
             })
@@ -1628,7 +1625,7 @@ impl Client {
         }
     }
 
-    /// Delete a file or empty directory. This is the io_uring equivalent of `unlink(2)`.
+    /// Delete a file. This is the io_uring equivalent of `unlink(2)`.
     ///
     /// # Cancellation safety
     /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
@@ -1636,7 +1633,7 @@ impl Client {
         self.unlink_at(&Self::AT_FDCWD, path, UnlinkatFlags::NoRemoveDir)
     }
 
-    /// Delete a directory. This is the io_uring equivalent of `rmdir(2)`.
+    /// Delete an empty directory. This is the io_uring equivalent of `rmdir(2)`.
     ///
     /// # Cancellation safety
     /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
@@ -2277,6 +2274,48 @@ impl Client {
         self.spawn_fallback(move || -> io::Result<i32> {
             let res = nix::fcntl::fcntl(descriptor, cmd)?;
             Ok(res)
+        })
+    }
+
+    /// Query the filesystem that holds the file.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
+    pub fn fstatvfs<'a>(
+        &'a self,
+        fd: &'a (impl UringTarget + Sync + ?Sized),
+    ) -> PendingIo<'a, io::Result<Statvfs>> {
+        let descriptor = fd.as_file_descriptor();
+        self.spawn_fallback(move || -> io::Result<Statvfs> {
+            let res = nix::sys::statvfs::fstatvfs(descriptor)?;
+            Ok(res)
+        })
+    }
+
+    /// Query the filesystem that holds the file at specific path.
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
+    pub fn statvfs<'a>(&'a self, path: impl AsRef<Path>) -> PendingIo<'a, io::Result<Statvfs>> {
+        let path = path.as_ref().to_owned();
+        self.spawn_fallback(move || -> io::Result<Statvfs> {
+            let res = nix::sys::statvfs::statvfs(&path)?;
+            Ok(res)
+        })
+    }
+
+    /// Change process cwd to the directory
+    ///
+    /// # Cancellation safety
+    /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
+    pub fn fchdir<'a>(
+        &'a self,
+        dir: &'a (impl UringTarget + Sync + ?Sized),
+    ) -> PendingIo<'a, io::Result<()>> {
+        let descriptor = dir.as_file_descriptor();
+        self.spawn_fallback(move || {
+            nix::unistd::fchdir(descriptor)?;
+            Ok(())
         })
     }
 

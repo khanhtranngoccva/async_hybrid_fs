@@ -2,7 +2,13 @@ use crate::{
     ClientUring,
     client::pending_io::{PendingIoImpl, uring::UringPendingIoObj},
 };
-use std::{io, marker::PhantomData, os::fd::IntoRawFd, pin::Pin, task::Poll};
+use std::{
+    io,
+    marker::PhantomData,
+    os::fd::{IntoRawFd, OwnedFd},
+    pin::Pin,
+    task::Poll,
+};
 
 struct CompletionState<'a> {
     raw: UringPendingIoObj<'a>,
@@ -10,7 +16,7 @@ struct CompletionState<'a> {
 
 struct Completion<'req, 'a, Target>
 where
-    Target: IntoRawFd + Sized + Send,
+    Target: Into<OwnedFd> + Sized + Send,
 {
     state: Option<CompletionState<'a>>,
     request: &'req mut UringClose<'a, Target>,
@@ -18,7 +24,7 @@ where
 
 impl<'req, 'a, Target> Completion<'req, 'a, Target>
 where
-    Target: IntoRawFd + Sized + Send,
+    Target: Into<OwnedFd> + Sized + Send,
 {
     pub(crate) fn new(
         request: &'req mut UringClose<'a, Target>,
@@ -33,7 +39,7 @@ where
 
 impl<'req, 'a, Target> Future for Completion<'req, 'a, Target>
 where
-    Target: IntoRawFd + Sized + Send,
+    Target: Into<OwnedFd> + Sized + Send,
 {
     type Output = io::Result<()>;
 
@@ -53,11 +59,14 @@ where
     }
 }
 
-impl<'req, 'a, Target> Unpin for Completion<'req, 'a, Target> where Target: IntoRawFd + Sized + Send {}
+impl<'req, 'a, Target> Unpin for Completion<'req, 'a, Target> where
+    Target: Into<OwnedFd> + Sized + Send
+{
+}
 
 impl<'req, 'a, Target> Drop for Completion<'req, 'a, Target>
 where
-    Target: IntoRawFd + Sized + Send,
+    Target: Into<OwnedFd> + Sized + Send,
 {
     fn drop(&mut self) {
         self.request.state = self.state.take()
@@ -68,7 +77,7 @@ where
 /// When the future is dropped, the operation is waited for blocking mode (because it is not possible to return the fd back to the user in the original form).
 pub struct UringClose<'a, Target>
 where
-    Target: IntoRawFd + Sized + Send,
+    Target: Into<OwnedFd> + Sized + Send,
 {
     state: Option<CompletionState<'a>>,
     _client: &'a ClientUring,
@@ -77,14 +86,16 @@ where
 
 impl<'a, Target> UringClose<'a, Target>
 where
-    Target: IntoRawFd + Sized + Send,
+    Target: Into<OwnedFd> + Sized + Send,
 {
     pub(crate) fn new(client: &'a ClientUring, target: Target) -> Self {
+        let owned_fd = target.into();
+        let raw_fd = owned_fd.into_raw_fd();
         Self {
             state: Some(CompletionState {
                 raw: UringPendingIoObj::new(
                     client,
-                    super::build_op_fd_only!(Target::Fd(target.into_raw_fd()), |fd| {
+                    super::build_op_fd_only!(Target::Fd(raw_fd), |fd| {
                         io_uring::opcode::Close::new(fd).build()
                     }),
                 ),
@@ -98,7 +109,7 @@ where
 #[async_trait::async_trait]
 impl<'a, Target> PendingIoImpl<Result<(), io::Error>> for UringClose<'a, Target>
 where
-    Target: IntoRawFd + Sized + Send,
+    Target: Into<OwnedFd> + Sized + Send,
 {
     fn _completion<'req>(
         &'req mut self,
@@ -127,11 +138,11 @@ where
     }
 }
 
-impl<'a, Target> Unpin for UringClose<'a, Target> where Target: IntoRawFd + Sized + Send {}
+impl<'a, Target> Unpin for UringClose<'a, Target> where Target: Into<OwnedFd> + Sized + Send {}
 
 impl<'a, Target> Drop for UringClose<'a, Target>
 where
-    Target: IntoRawFd + Sized + Send,
+    Target: Into<OwnedFd> + Sized + Send,
 {
     fn drop(&mut self) {
         let _ = self._cancel();

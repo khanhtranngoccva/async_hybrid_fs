@@ -1,14 +1,17 @@
 //! High-level filesystem operations, which use default [`Client`](crate::client::Client) instances.
 //!
+use futures::StreamExt;
 use nix::{
     fcntl::{AT_FDCWD, OFlag},
     sys::{
         stat::{Mode, UtimensatFlags},
+        statvfs::Statvfs,
         time::TimeSpec,
     },
-    unistd::{Gid, Uid},
+    unistd::{Gid, Uid, UnlinkatFlags},
 };
 use std::{
+    ffi::OsStr,
     io,
     path::{Path, PathBuf},
     pin::Pin,
@@ -16,7 +19,7 @@ use std::{
 use tokio::fs::File;
 
 use crate::{
-    PendingIo,
+    Dir, PendingIo, ReadDirOwnedWithParent,
     client::pending_io::fixed_value::FixedValuePendingIo,
     default::{self},
     metadata::{Metadata, MknodType, Permissions},
@@ -424,9 +427,18 @@ pub fn symlink_metadata(path: impl AsRef<Path>) -> PendingIo<'static, io::Result
 ///
 /// # Cancellation safety
 /// This method is not cancellable (runs on a blocking thread).
-pub async fn read_dir(path: impl AsRef<Path>) -> io::Result<tokio::fs::ReadDir> {
-    // FIXME: This function depends on tokio
-    tokio::fs::read_dir(path).await
+pub async fn read_dir(path: impl AsRef<Path>) -> io::Result<ReadDirOwnedWithParent> {
+    let dir_file = OpenOptions::new()
+        .read(true)
+        .custom_flags(OFlag::O_DIRECTORY.bits())
+        .open(path.as_ref())
+        .completion()
+        .expect("no completion future returned")
+        .await?
+        .try_into_std()
+        .expect("file does not have any inflight operations");
+    let dir = Dir::new(dir_file)?;
+    Ok(dir.into_stream().with_parent(path))
 }
 
 /// Asynchronous version of [`std::fs::read_link`].
@@ -469,65 +481,125 @@ pub fn remove_dir(path: impl AsRef<Path>) -> PendingIo<'static, io::Result<()>> 
 /// This method is not cancellation-safe.
 pub async fn remove_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
     let client = default::default_client();
-    let metadata = client
-        .metadata_path(path.as_ref())
-        .completion()
-        .expect("no completion future returned")
-        .await?;
-    let filetype = metadata.file_type();
-    if filetype.is_symlink() {
-        client
-            .unlink(path)
-            .completion()
-            .expect("no completion future returned")
-            .await
-    } else {
-        remove_dir_all_recursive(path.as_ref()).await
-    }
-}
 
-async fn remove_dir_all_recursive(path: &Path) -> io::Result<()> {
-    let client = default::default_client();
-    let mut dir = read_dir(path).await?;
-    loop {
-        let entry_res = dir.next_entry().await;
-        let child = match entry_res {
-            Ok(Some(entry)) => entry,
-            Ok(None) => break,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e),
-        };
-        match child.file_type().await {
-            Ok(file_type) if file_type.is_dir() => {
-                match Box::pin(remove_dir_all_recursive(&child.path())).await {
-                    Ok(_) => continue,
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                    Err(e) => return Err(e),
-                }
-            }
-            Ok(_) => match client
-                .unlink(child.path())
-                .completion()
-                .expect("no completion future returned")
-                .await
-            {
-                Ok(_) => continue,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(e),
-            },
-            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    match client
-        .rmdir(path)
+    let dir = match client
+        .open_path(
+            path.as_ref(),
+            OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW,
+            Permissions::from_mode(0),
+        )
         .completion()
         .expect("no completion future returned")
         .await
     {
-        Ok(_) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
+        Ok(dir) => dir,
+        // Ignore not a directory error (to pair with the std API)
+        Err(e) if e.kind() == io::ErrorKind::NotADirectory => return Ok(()),
+        // We are encountering a symlink
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+            client
+                .unlink(path)
+                .completion()
+                .expect("no completion future returned")
+                .await?;
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
+    let mut dir = Dir::new(dir)?;
+    remove_dir_contents_recursive(&mut dir).await
+}
+
+/// Remove the contents of a directory recursively. While in this mode, io::ErrorKind::NotFound is ignored.
+async fn remove_dir_contents_recursive(dir: &mut Dir) -> io::Result<()> {
+    let mut stream = dir.stream();
+    loop {
+        let entry_res = stream.next().await;
+        let child = match entry_res {
+            None => break,
+            Some(Ok(entry)) => entry,
+            Some(Err(e)) if e.kind() == io::ErrorKind::NotFound => continue,
+            Some(Err(e)) => return Err(e),
+        };
+        match Box::pin(unlink_at_recursive(
+            &mut stream,
+            child.file_name(),
+            Some(child.file_type().is_dir()),
+        ))
+        .await
+        {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+async fn unlink_at_recursive(
+    dir: &mut Dir,
+    child_name: &OsStr,
+    mut is_child_dir_hint: Option<bool>,
+) -> io::Result<()> {
+    let client = default::default_client();
+    loop {
+        // If it is not certain that the child item is not a directory, we must do the dir check.
+        if is_child_dir_hint != Some(false) {
+            let mut child_dir = match client
+                .open_at(
+                    dir,
+                    child_name,
+                    OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW,
+                    Permissions::from_mode(0),
+                )
+                .completion()
+                .expect("no completion future returned")
+                .await
+            {
+                Ok(f) => Some(Dir::new(f)?),
+                Err(e) if e.kind() == io::ErrorKind::NotADirectory => None,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => return Err(e),
+            };
+            // Update the hint to reflect it.
+            is_child_dir_hint = Some(child_dir.is_some());
+            if let Some(child_dir) = &mut child_dir {
+                match Box::pin(remove_dir_contents_recursive(child_dir)).await {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                };
+            }
+        }
+        match client
+            .unlink_at(
+                dir,
+                child_name,
+                if is_child_dir_hint.expect("is_child_dir_hint must be Some") {
+                    UnlinkatFlags::RemoveDir
+                } else {
+                    UnlinkatFlags::NoRemoveDir
+                },
+            )
+            .completion()
+            .expect("no completion future returned")
+            .await
+        {
+            Ok(_) => return Ok(()),
+            // Try again as a directory
+            Err(e) if e.kind() == io::ErrorKind::IsADirectory => {
+                is_child_dir_hint = Some(true);
+                continue;
+            }
+            // Try again as a non-directory
+            Err(e) if e.kind() == io::ErrorKind::NotADirectory => {
+                is_child_dir_hint = Some(false);
+                continue;
+            }
+            // Ignore not found error
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
     }
 }
 
@@ -649,6 +721,14 @@ pub fn symlink(
     link: impl AsRef<Path>,
 ) -> PendingIo<'static, io::Result<()>> {
     default::default_client().symlink(target, link)
+}
+
+/// Asynchronous version of [`nix::sys::statvfs::statvfs`]
+///
+/// # Cancellation safety
+/// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
+pub fn vfs_metadata(path: impl AsRef<Path>) -> PendingIo<'static, io::Result<Statvfs>> {
+    default::default_client().statvfs(path)
 }
 
 /// Asynchronous version of [`std::fs::write`].

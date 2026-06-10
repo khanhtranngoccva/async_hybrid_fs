@@ -112,6 +112,13 @@ impl OwnedRegisteredFile {
     }
 }
 
+impl From<OwnedRegisteredFile> for OwnedFd {
+    fn from(mut file: OwnedRegisteredFile) -> OwnedFd {
+        file._cleanup();
+        file.fd.take().expect("fd removal can only be called once")
+    }
+}
+
 impl IntoRawFd for OwnedRegisteredFile {
     fn into_raw_fd(mut self) -> RawFd {
         self._cleanup();
