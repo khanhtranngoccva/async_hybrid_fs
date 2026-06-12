@@ -112,6 +112,7 @@ pub use default::default_client_owned;
 pub use default::get_max_default_shards;
 pub use default::set_max_default_shards;
 pub use fs::OpenOptions;
+pub use futures::StreamExt;
 pub use iobuf::IoBuf;
 pub use iobuf::IoBufMut;
 
