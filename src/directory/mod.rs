@@ -79,8 +79,7 @@ impl Dir {
     /// Use the directory as an asynchronous stream
     pub fn stream<'a>(&'a mut self) -> ReadDir<'a> {
         ReadDir {
-            // SAFETY: If the stream is being polled, the directory can't be accessed
-            dir: unsafe { std::mem::transmute::<&mut Dir, &'a mut Dir>(self) },
+            dir: unsafe { std::mem::transmute::<&mut Dir, &'a Dir>(self) },
             stream: async_stream::stream! {
                 let client = default_client();
                 while let Some(entry) = client.read_dir_libc(self).await {
@@ -95,7 +94,6 @@ impl Dir {
     /// Convert the directory into an owned asynchronous stream
     pub fn into_stream(self) -> ReadDirOwned {
         let mut boxed = Box::new(self);
-        // SAFETY: If the stream is being polled, the directory can't be accessed
         let escaped = unsafe { std::mem::transmute::<&mut Dir, &'static mut Dir>(boxed.as_mut()) };
         ReadDirOwned {
             stream: Some(
@@ -140,8 +138,8 @@ pub struct ReadDir<'a> {
     stream: BoxStream<'a, io::Result<DirEntry>>,
     // Read special entries ("." and "..")
     read_special_entries: bool,
-    // Backing pointer for the stream, used to retrieve the directory fd for certain operations
-    dir: &'a mut Dir,
+    // Backing fd for the stream, used to retrieve the directory fd for certain operations
+    dir: &'a Dir,
 }
 
 impl<'a> Stream for ReadDir<'a> {

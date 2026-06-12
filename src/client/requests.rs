@@ -58,7 +58,6 @@ pub(crate) struct IovecArray(pub(crate) Vec<iovec>);
 
 // SAFETY: The iovec slice is owned by the caller's future, which awaits completion, the pointer is only accessed by the kernel threads
 unsafe impl Send for IovecArray {}
-unsafe impl Sync for IovecArray {}
 
 impl Deref for IovecArray {
     type Target = [iovec];
