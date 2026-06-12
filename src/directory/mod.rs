@@ -3,9 +3,9 @@
 use std::{
     ffi::{CStr, OsStr, OsString},
     io,
-    ops::{Deref, DerefMut},
+    ops::Deref,
     os::{
-        fd::{AsFd, BorrowedFd, OwnedFd},
+        fd::{AsFd, BorrowedFd, IntoRawFd, OwnedFd, RawFd},
         unix::ffi::OsStrExt,
     },
     path::{Path, PathBuf},
@@ -28,8 +28,6 @@ use nix::unistd::Whence;
 
 /// A directory stream.
 pub struct Dir {
-    /// The `OwnedFd` that we read directory entries from.
-    fd: OwnedFd,
     /// Have we seen any errors in this iteration?
     any_errors: bool,
     /// Should we rewind the stream on the next iteration?
@@ -38,6 +36,8 @@ pub struct Dir {
     buf: Vec<u8>,
     /// Where we are in the buffer.
     pos: usize,
+    /// The `OwnedFd` that we read directory entries from.
+    fd: Option<OwnedFd>,
 }
 
 impl Dir {
@@ -51,7 +51,7 @@ impl Dir {
     #[inline]
     fn _new(fd: OwnedFd) -> io::Result<Self> {
         Ok(Self {
-            fd,
+            fd: Some(fd),
             any_errors: false,
             rewind: false,
             buf: Vec::new(),
@@ -94,19 +94,20 @@ impl Dir {
 
     /// Convert the directory into an owned asynchronous stream
     pub fn into_stream(self) -> ReadDirOwned {
-        let mut pinned = Box::pin(self);
+        let mut boxed = Box::new(self);
         // SAFETY: If the stream is being polled, the directory can't be accessed
-        let escaped =
-            unsafe { std::mem::transmute::<&mut Dir, &'static mut Dir>(pinned.as_mut().get_mut()) };
+        let escaped = unsafe { std::mem::transmute::<&mut Dir, &'static mut Dir>(boxed.as_mut()) };
         ReadDirOwned {
-            stream: async_stream::stream! {
-                let client = default_client();
-                while let Some(entry) = client.read_dir_libc(escaped).await {
-                    yield entry;
+            stream: Some(
+                async_stream::stream! {
+                    let client = default_client();
+                    while let Some(entry) = client.read_dir_libc(escaped).await {
+                        yield entry;
+                    }
                 }
-            }
-            .boxed(),
-            dir: pinned,
+                .boxed(),
+            ),
+            dir: Some(boxed),
             read_special_entries: false,
         }
     }
@@ -114,7 +115,22 @@ impl Dir {
 
 impl AsFd for Dir {
     fn as_fd(&self) -> BorrowedFd<'_> {
-        self.fd.as_fd()
+        self.fd.as_ref().unwrap().as_fd()
+    }
+}
+
+impl From<Dir> for OwnedFd {
+    fn from(mut dir: Dir) -> OwnedFd {
+        dir.fd.take().expect("directory fd should be Some")
+    }
+}
+
+impl IntoRawFd for Dir {
+    fn into_raw_fd(mut self) -> RawFd {
+        self.fd
+            .take()
+            .expect("directory fd should be Some")
+            .into_raw_fd()
     }
 }
 
@@ -124,35 +140,24 @@ pub struct ReadDir<'a> {
     stream: BoxStream<'a, io::Result<DirEntry>>,
     // Read special entries ("." and "..")
     read_special_entries: bool,
-    // Backing pointer for the stream
+    // Backing pointer for the stream, used to retrieve the directory fd for certain operations
     dir: &'a mut Dir,
 }
 
 impl<'a> Stream for ReadDir<'a> {
     type Item = io::Result<DirEntry>;
 
+    // Retrieve the next directory entry
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let inner = self.get_mut();
         poll_dir_stream(&mut inner.stream, cx, &mut inner.read_special_entries)
     }
 }
 
+// AsFd is sound to implement because the OwnedFd field is immutable and has stable address
 impl<'a> AsFd for ReadDir<'a> {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.dir.as_fd()
-    }
-}
-
-impl<'a> Deref for ReadDir<'a> {
-    type Target = Dir;
-    fn deref(&self) -> &Self::Target {
-        self.dir
-    }
-}
-
-impl<'a> DerefMut for ReadDir<'a> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.dir
     }
 }
 
@@ -185,6 +190,8 @@ pub struct ReadDirWithParent<'a> {
 
 impl<'a> Stream for ReadDirWithParent<'a> {
     type Item = io::Result<DirEntryWithParent>;
+
+    // Retrieve the next directory entry with the parent path
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Pin::new(&mut self.inner)
             .poll_next(cx)
@@ -201,19 +208,6 @@ impl<'a> AsFd for ReadDirWithParent<'a> {
     }
 }
 
-impl<'a> Deref for ReadDirWithParent<'a> {
-    type Target = Dir;
-    fn deref(&self) -> &Self::Target {
-        self.inner.dir
-    }
-}
-
-impl<'a> DerefMut for ReadDirWithParent<'a> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.inner.dir
-    }
-}
-
 impl<'a> ReadDirWithParent<'a> {
     /// Read special entries ("." and "..")
     pub fn with_read_special_entries(self, read_special_entries: bool) -> ReadDirWithParent<'a> {
@@ -227,42 +221,66 @@ impl<'a> ReadDirWithParent<'a> {
 /// Owned structure for iterating over a directory
 pub struct ReadDirOwned {
     // Stream for the directory entries
-    stream: BoxStream<'static, io::Result<DirEntry>>,
+    stream: Option<BoxStream<'static, io::Result<DirEntry>>>,
     // Read special entries ("." and "..")
     read_special_entries: bool,
     // Backing pointer for the stream
-    dir: Pin<Box<Dir>>,
+    dir: Option<Box<Dir>>,
 }
 
 impl Stream for ReadDirOwned {
     type Item = io::Result<DirEntry>;
 
+    // Retrieve the next directory entry
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let inner = self.get_mut();
-        poll_dir_stream(&mut inner.stream, cx, &mut inner.read_special_entries)
+        poll_dir_stream(
+            inner.stream.as_mut().unwrap(),
+            cx,
+            &mut inner.read_special_entries,
+        )
     }
 }
 
+// AsFd is sound to implement because the OwnedFd field is immutable and has stable address, other methods are unusable as long as the stream exists
 impl AsFd for ReadDirOwned {
     fn as_fd(&self) -> BorrowedFd<'_> {
-        self.dir.as_fd()
+        self.dir.as_ref().unwrap().as_fd()
     }
 }
 
-impl Deref for ReadDirOwned {
-    type Target = Dir;
-    fn deref(&self) -> &Self::Target {
-        &self.dir
+impl From<Dir> for ReadDirOwned {
+    fn from(dir: Dir) -> Self {
+        dir.into_stream()
     }
 }
 
-impl DerefMut for ReadDirOwned {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.dir
+impl From<ReadDirOwned> for Dir {
+    fn from(dir: ReadDirOwned) -> Self {
+        dir.into_dir()
+    }
+}
+
+impl From<ReadDirOwned> for OwnedFd {
+    fn from(dir: ReadDirOwned) -> Self {
+        dir.into_dir().into()
+    }
+}
+
+impl IntoRawFd for ReadDirOwned {
+    fn into_raw_fd(self) -> RawFd {
+        self.into_dir().into_raw_fd()
     }
 }
 
 impl ReadDirOwned {
+    /// Convert the stream into a directory
+    pub fn into_dir(mut self) -> Dir {
+        drop(self.stream.take());
+        let pinned = self.dir.take().unwrap();
+        *pinned
+    }
+
     /// Convert the directory into an owned asynchronous stream with path of the parent directory
     pub fn with_parent(self, parent: impl AsRef<Path>) -> ReadDirOwnedWithParent {
         ReadDirOwnedWithParent {
@@ -290,6 +308,8 @@ pub struct ReadDirOwnedWithParent {
 
 impl Stream for ReadDirOwnedWithParent {
     type Item = io::Result<DirEntryWithParent>;
+
+    // Retrieve the next directory entry with the parent path
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Pin::new(&mut self.inner)
             .poll_next(cx)
@@ -306,20 +326,30 @@ impl AsFd for ReadDirOwnedWithParent {
     }
 }
 
-impl Deref for ReadDirOwnedWithParent {
-    type Target = ReadDirOwned;
-    fn deref(&self) -> &Self::Target {
-        &self.inner
+impl From<ReadDirOwnedWithParent> for Dir {
+    fn from(dir: ReadDirOwnedWithParent) -> Self {
+        dir.into_dir()
     }
 }
 
-impl DerefMut for ReadDirOwnedWithParent {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
+impl From<ReadDirOwnedWithParent> for OwnedFd {
+    fn from(dir: ReadDirOwnedWithParent) -> Self {
+        dir.into_dir().into()
+    }
+}
+
+impl IntoRawFd for ReadDirOwnedWithParent {
+    fn into_raw_fd(self) -> RawFd {
+        self.into_dir().into_raw_fd()
     }
 }
 
 impl ReadDirOwnedWithParent {
+    /// Convert into the inner directory
+    pub fn into_dir(self) -> Dir {
+        self.inner.into_dir()
+    }
+
     /// Read special entries ("." and "..")
     pub fn with_read_special_entries(self, read_special_entries: bool) -> ReadDirOwnedWithParent {
         ReadDirOwnedWithParent {
@@ -408,7 +438,7 @@ impl Client {
         dir.rewind = false;
         dir.pos = dir.buf.len();
         helpers::m_retry_on_eintr! {
-            self.seek_ll(&mut dir.fd, Whence::SeekSet, offset)
+            self.seek_ll(&mut dir.fd.as_ref().unwrap().as_fd(), Whence::SeekSet, offset)
                 .map(|r| {
                     r.inspect_err(|e| {
                         // Should catch errors and mark directory as dirty even when the pending I/O object is dropped
@@ -437,7 +467,7 @@ impl Client {
         if dir.rewind {
             dir.rewind = false;
             let seek_res = helpers::m_retry_on_eintr! {
-                self.seek_ll(&mut dir.fd, Whence::SeekSet, 0)
+                self.seek_ll(&mut dir.fd.as_ref().unwrap().as_fd(), Whence::SeekSet, 0)
                     .map(|r| {
                         r.inspect_err(|e| {
                             if e.kind() == io::ErrorKind::Interrupted {
@@ -584,7 +614,7 @@ impl Client {
         match helpers::m_retry_on_eintr! {
             {
                 let borrowed = unsafe { std::mem::transmute::<&mut [u8], &mut [u8]>(dir.buf.as_mut_slice()) };
-                self.getdents(&dir.fd, borrowed)
+                self.getdents(&dir.fd.as_ref().unwrap().as_fd(), borrowed)
                     .map(|r| {
                         r.inspect_err(|e| {
                             if e.kind() == io::ErrorKind::Interrupted {

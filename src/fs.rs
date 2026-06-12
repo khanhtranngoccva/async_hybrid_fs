@@ -13,6 +13,7 @@ use nix::{
 use std::{
     ffi::OsStr,
     io,
+    os::fd::{AsFd, BorrowedFd},
     path::{Path, PathBuf},
     pin::Pin,
 };
@@ -481,7 +482,6 @@ pub fn remove_dir(path: impl AsRef<Path>) -> PendingIo<'static, io::Result<()>> 
 /// This method is not cancellation-safe.
 pub async fn remove_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
     let client = default::default_client();
-
     let dir = match client
         .open_path(
             path.as_ref(),
@@ -521,8 +521,9 @@ async fn remove_dir_contents_recursive(dir: &mut Dir) -> io::Result<()> {
             Some(Err(e)) if e.kind() == io::ErrorKind::NotFound => continue,
             Some(Err(e)) => return Err(e),
         };
+        let stream_fd = stream.as_fd();
         match Box::pin(unlink_at_recursive(
-            &mut stream,
+            &stream_fd,
             child.file_name(),
             Some(child.file_type().is_dir()),
         ))
@@ -537,7 +538,7 @@ async fn remove_dir_contents_recursive(dir: &mut Dir) -> io::Result<()> {
 }
 
 async fn unlink_at_recursive(
-    dir: &mut Dir,
+    dir: &BorrowedFd<'_>,
     child_name: &OsStr,
     mut is_child_dir_hint: Option<bool>,
 ) -> io::Result<()> {
