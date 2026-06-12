@@ -50,17 +50,9 @@ where
         let inner = self.get_mut();
         let mut state = inner.state.take().expect("state must be Some");
         match Pin::new(&mut state.raw).poll(cx) {
-            Poll::Ready(Ok(bytes_read)) => {
-                unsafe {
-                    state.buf.set_len(bytes_read as usize);
-                }
-                Poll::Ready({
-                    Ok(ReadResult {
-                        buf: state.buf,
-                        bytes_read: bytes_read as usize,
-                    })
-                })
-            }
+            Poll::Ready(Ok(bytes_read)) => Poll::Ready(Ok(unsafe {
+                ReadResult::new(state.buf, bytes_read as usize)
+            })),
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             Poll::Pending => {
                 inner.state = Some(state);
@@ -159,14 +151,8 @@ where
             Some(state) => {
                 let res = state.raw.cancel_async().await.map(|r| {
                     r.map(|bytes_read| {
-                        let mut state = self.completion_state.take().expect("state must be Some");
-                        unsafe {
-                            state.buf.set_len(bytes_read as usize);
-                        }
-                        ReadResult {
-                            buf: state.buf,
-                            bytes_read: bytes_read as usize,
-                        }
+                        let state = self.completion_state.take().expect("state must be Some");
+                        unsafe { ReadResult::new(state.buf, bytes_read as usize) }
                     })
                 });
                 self.completion_state = None;
@@ -181,14 +167,8 @@ where
             Some(state) => {
                 let res = state.raw.cancel().map(|r| {
                     r.map(|bytes_read| {
-                        let mut state = self.completion_state.take().expect("state must be Some");
-                        unsafe {
-                            state.buf.set_len(bytes_read as usize);
-                        }
-                        ReadResult {
-                            buf: state.buf,
-                            bytes_read: bytes_read as usize,
-                        }
+                        let state = self.completion_state.take().expect("state must be Some");
+                        unsafe { ReadResult::new(state.buf, bytes_read as usize) }
                     })
                 });
                 self.completion_state = None;

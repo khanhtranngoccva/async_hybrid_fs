@@ -71,38 +71,43 @@ impl Dir {
         default_client().seek_dir(self, offset).await
     }
 
-    /// Read the next entry from the directory
+    /// Read the next entry from the directory (excluding any special entries)
     pub fn read(&mut self) -> impl Future<Output = Option<io::Result<DirEntry>>> + Send {
         default_client().read_dir(self)
     }
 
     /// Use the directory as an asynchronous stream
     pub fn stream<'a>(&'a mut self) -> ReadDir<'a> {
-        // SAFETY: Only one of two borrows are accessed at any time
         ReadDir {
+            // SAFETY: If the stream is being polled, the directory can't be accessed
             dir: unsafe { std::mem::transmute::<&mut Dir, &'a mut Dir>(self) },
             stream: async_stream::stream! {
-                while let Some(entry) = self.read().await {
+                let client = default_client();
+                while let Some(entry) = client.read_dir_libc(self).await {
                     yield entry;
                 }
             }
             .boxed(),
+            read_special_entries: false,
         }
     }
 
     /// Convert the directory into an owned asynchronous stream
     pub fn into_stream(self) -> ReadDirOwned {
         let mut pinned = Box::pin(self);
+        // SAFETY: If the stream is being polled, the directory can't be accessed
         let escaped =
             unsafe { std::mem::transmute::<&mut Dir, &'static mut Dir>(pinned.as_mut().get_mut()) };
         ReadDirOwned {
             stream: async_stream::stream! {
-                while let Some(entry) = escaped.read().await {
+                let client = default_client();
+                while let Some(entry) = client.read_dir_libc(escaped).await {
                     yield entry;
                 }
             }
             .boxed(),
             dir: pinned,
+            read_special_entries: false,
         }
     }
 }
@@ -117,6 +122,8 @@ impl AsFd for Dir {
 pub struct ReadDir<'a> {
     // Stream for the directory entries
     stream: BoxStream<'a, io::Result<DirEntry>>,
+    // Read special entries ("." and "..")
+    read_special_entries: bool,
     // Backing pointer for the stream
     dir: &'a mut Dir,
 }
@@ -124,8 +131,9 @@ pub struct ReadDir<'a> {
 impl<'a> Stream for ReadDir<'a> {
     type Item = io::Result<DirEntry>;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.stream).poll_next(cx)
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let inner = self.get_mut();
+        poll_dir_stream(&mut inner.stream, cx, &mut inner.read_special_entries)
     }
 }
 
@@ -152,27 +160,33 @@ impl<'a> ReadDir<'a> {
     /// Convert the directory into an asynchronous stream with path of the parent directory
     pub fn with_parent(self, parent: impl AsRef<Path>) -> ReadDirWithParent<'a> {
         ReadDirWithParent {
+            inner: self,
+            parent: parent.as_ref().to_owned(),
+        }
+    }
+
+    /// Read special entries ("." and "..")
+    pub fn with_read_special_entries(self, read_special_entries: bool) -> ReadDir<'a> {
+        ReadDir {
             stream: self.stream,
             dir: self.dir,
-            parent: parent.as_ref().to_owned(),
+            read_special_entries,
         }
     }
 }
 
 /// Structure for iterating over a directory, with access to the parent dir path
 pub struct ReadDirWithParent<'a> {
-    // Stream for the directory entries
-    stream: BoxStream<'a, io::Result<DirEntry>>,
-    // Backing pointer for the stream
-    dir: &'a mut Dir,
     // Path to the parent directory
     parent: PathBuf,
+    // Inner object for the directory entries
+    inner: ReadDir<'a>,
 }
 
 impl<'a> Stream for ReadDirWithParent<'a> {
     type Item = io::Result<DirEntryWithParent>;
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.stream)
+        Pin::new(&mut self.inner)
             .poll_next(cx)
             .map_ok(|entry| DirEntryWithParent {
                 entry,
@@ -183,20 +197,30 @@ impl<'a> Stream for ReadDirWithParent<'a> {
 
 impl<'a> AsFd for ReadDirWithParent<'a> {
     fn as_fd(&self) -> BorrowedFd<'_> {
-        self.dir.as_fd()
+        self.inner.as_fd()
     }
 }
 
 impl<'a> Deref for ReadDirWithParent<'a> {
     type Target = Dir;
     fn deref(&self) -> &Self::Target {
-        self.dir
+        self.inner.dir
     }
 }
 
 impl<'a> DerefMut for ReadDirWithParent<'a> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.dir
+        self.inner.dir
+    }
+}
+
+impl<'a> ReadDirWithParent<'a> {
+    /// Read special entries ("." and "..")
+    pub fn with_read_special_entries(self, read_special_entries: bool) -> ReadDirWithParent<'a> {
+        ReadDirWithParent {
+            inner: self.inner.with_read_special_entries(read_special_entries),
+            parent: self.parent,
+        }
     }
 }
 
@@ -204,6 +228,8 @@ impl<'a> DerefMut for ReadDirWithParent<'a> {
 pub struct ReadDirOwned {
     // Stream for the directory entries
     stream: BoxStream<'static, io::Result<DirEntry>>,
+    // Read special entries ("." and "..")
+    read_special_entries: bool,
     // Backing pointer for the stream
     dir: Pin<Box<Dir>>,
 }
@@ -211,8 +237,9 @@ pub struct ReadDirOwned {
 impl Stream for ReadDirOwned {
     type Item = io::Result<DirEntry>;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.stream).poll_next(cx)
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let inner = self.get_mut();
+        poll_dir_stream(&mut inner.stream, cx, &mut inner.read_special_entries)
     }
 }
 
@@ -243,12 +270,22 @@ impl ReadDirOwned {
             parent: parent.as_ref().to_owned(),
         }
     }
+
+    /// Read special entries ("." and "..")
+    pub fn with_read_special_entries(self, read_special_entries: bool) -> ReadDirOwned {
+        ReadDirOwned {
+            stream: self.stream,
+            dir: self.dir,
+            read_special_entries,
+        }
+    }
 }
 
 /// Owned structure for iterating over a directory, with access to the parent dir path
 pub struct ReadDirOwnedWithParent {
-    inner: ReadDirOwned,
     parent: PathBuf,
+    // Inner object for the directory entries
+    inner: ReadDirOwned,
 }
 
 impl Stream for ReadDirOwnedWithParent {
@@ -282,8 +319,18 @@ impl DerefMut for ReadDirOwnedWithParent {
     }
 }
 
+impl ReadDirOwnedWithParent {
+    /// Read special entries ("." and "..")
+    pub fn with_read_special_entries(self, read_special_entries: bool) -> ReadDirOwnedWithParent {
+        ReadDirOwnedWithParent {
+            inner: self.inner.with_read_special_entries(read_special_entries),
+            parent: self.parent,
+        }
+    }
+}
+
 /// A directory entry.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DirEntry {
     d_ino: u64,
     d_type: u8,
@@ -320,6 +367,7 @@ impl DirEntry {
 }
 
 /// A directory entry with path of the original parent directory
+#[derive(Debug, Clone)]
 pub struct DirEntryWithParent {
     entry: DirEntry,
     parent: PathBuf,
@@ -378,8 +426,11 @@ impl Client {
         }
     }
 
-    /// Read the next entry from the directory
-    pub async fn read_dir(&self, dir: &mut Dir) -> Option<io::Result<DirEntry>> {
+    /// Read the next entry from the directory using the low-level API
+    ///
+    /// # Notes
+    /// - Return entries contain special entries like "." and "..", as well as deleted entries (marked with ino == 0).
+    pub async fn read_dir_ll(&self, dir: &mut Dir) -> Option<io::Result<DirEntry>> {
         if dir.any_errors {
             return None;
         }
@@ -478,6 +529,42 @@ impl Client {
         }))
     }
 
+    /// Read the next entry from the directory (including special entries like "." and "..").
+    ///
+    /// # Notes
+    /// - This API pairs with [`libc::readdir`].
+    /// - Return entries contain special entries like "." and "..", excluding deleted entries.
+    pub async fn read_dir_libc(&self, dir: &mut Dir) -> Option<io::Result<DirEntry>> {
+        loop {
+            let entry = match self.read_dir_ll(dir).await {
+                Some(Ok(entry)) => entry,
+                Some(Err(e)) => return Some(Err(e)),
+                None => return None,
+            };
+            if entry.ino() == 0 {
+                // println!("skipped deleted entry: {:?}", entry);
+                continue;
+            }
+            break Some(Ok(entry));
+        }
+    }
+
+    /// Read the next entry from the directory, excluding special entries
+    pub async fn read_dir(&self, dir: &mut Dir) -> Option<io::Result<DirEntry>> {
+        loop {
+            let entry = match self.read_dir_libc(dir).await {
+                Some(Ok(entry)) => entry,
+                Some(Err(e)) => return Some(Err(e)),
+                None => return None,
+            };
+            let filename = entry.file_name();
+            if filename == OsStr::new(".") || filename == OsStr::new("..") {
+                continue;
+            }
+            break Some(Ok(entry));
+        }
+    }
+
     async fn read_dir_more(&self, dir: &mut Dir) -> Option<io::Result<()>> {
         // The first few times we're called, we allocate a relatively small
         // buffer, because many directories are small. If we're called more,
@@ -495,22 +582,26 @@ impl Client {
         }
         dir.buf.resize(dir.buf.capacity(), 0);
         match helpers::m_retry_on_eintr! {
-            self.getdents(&dir.fd, &mut dir.buf)
-                .map(|r| {
-                    r.inspect_err(|e| {
-                        if e.kind() == io::ErrorKind::Interrupted {
-                            return;
-                        }
-                        dir.any_errors = true;
+            {
+                let borrowed = unsafe { std::mem::transmute::<&mut [u8], &mut [u8]>(dir.buf.as_mut_slice()) };
+                self.getdents(&dir.fd, borrowed)
+                    .map(|r| {
+                        r.inspect_err(|e| {
+                            if e.kind() == io::ErrorKind::Interrupted {
+                                return;
+                            }
+                            dir.any_errors = true;
+                        })
+                        .map(|result| {
+                            dir.pos = 0;
+                            dir.buf.resize(result.bytes_read, 0);
+                            result.bytes_read
+                        })
                     })
-                    .map(|result| {
-                        dir.pos = 0;
-                        result.bytes_read
-                    })
-                })
-                .completion()
-                .expect("no completion future returned")
-                .await
+                    .completion()
+                    .expect("no completion future returned")
+                    .await
+            }
         } {
             Ok(0) => None,
             Ok(_nread) => Some(Ok(())),
@@ -538,10 +629,30 @@ impl Client {
                     buffer.capacity().min(u32::MAX as usize) as u32,
                 )
             })?;
-            Ok(ReadResult {
-                buf: buffer,
-                bytes_read: result as usize,
-            })
+            Ok(unsafe { ReadResult::new(buffer, result as usize) })
         })
+    }
+}
+
+fn poll_dir_stream(
+    mut stream: &mut BoxStream<'_, io::Result<DirEntry>>,
+    cx: &mut Context<'_>,
+    read_special_entries: &mut bool,
+) -> Poll<Option<io::Result<DirEntry>>> {
+    loop {
+        match Pin::new(&mut stream).poll_next(cx) {
+            Poll::Ready(Some(Ok(entry))) => {
+                if !*read_special_entries
+                    && (entry.file_name() == OsStr::new(".")
+                        || entry.file_name() == OsStr::new(".."))
+                {
+                    continue;
+                }
+                return Poll::Ready(Some(Ok(entry)));
+            }
+            Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
+            Poll::Ready(None) => return Poll::Ready(None),
+            Poll::Pending => return Poll::Pending,
+        }
     }
 }

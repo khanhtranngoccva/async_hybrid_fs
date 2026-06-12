@@ -34,7 +34,7 @@ use nix::{
     unistd::{FchownatFlags, Gid, LinkatFlags, Uid, UnlinkatFlags},
 };
 use std::{
-    cmp::{self, min},
+    cmp::{self},
     io::{self, IoSlice, IoSliceMut, SeekFrom},
     mem::MaybeUninit,
     os::fd::{AsRawFd, BorrowedFd, OwnedFd},
@@ -187,10 +187,7 @@ impl Client {
                     unsafe { buf.as_mut_slice_with_uninit().assume_init_mut() },
                     offset as i64,
                 )?;
-                unsafe {
-                    buf.set_len(bytes_read);
-                }
-                Ok(ReadResult { buf, bytes_read })
+                Ok(unsafe { ReadResult::new(buf, bytes_read) })
             })
         }
     }
@@ -271,18 +268,7 @@ impl Client {
                     },
                     offset as i64,
                 )?;
-                let mut cur_bytes_read = bytes_read as usize;
-                for buf in bufs.iter_mut() {
-                    let bytes_read_into_target = min(buf.capacity(), cur_bytes_read);
-                    unsafe {
-                        buf.set_len(bytes_read_into_target);
-                    }
-                    cur_bytes_read -= bytes_read_into_target;
-                }
-                Ok(ReadvResult {
-                    bufs,
-                    bytes_read: bytes_read as usize,
-                })
+                Ok(unsafe { ReadvResult::new(bufs, bytes_read) })
             })
         }
     }
@@ -331,18 +317,7 @@ impl Client {
                         })
                         .collect::<Vec<_>>(),
                 )?;
-                let mut cur_bytes_read = bytes_read as usize;
-                for buf in bufs.iter_mut() {
-                    let bytes_read_into_target = min(buf.capacity(), cur_bytes_read);
-                    unsafe {
-                        buf.set_len(bytes_read_into_target);
-                    }
-                    cur_bytes_read -= bytes_read_into_target;
-                }
-                Ok(ReadvResult {
-                    bufs,
-                    bytes_read: bytes_read as usize,
-                })
+                Ok(unsafe { ReadvResult::new(bufs, bytes_read) })
             })
         }
     }
@@ -403,10 +378,7 @@ impl Client {
                 let bytes_read = nix::unistd::read(descriptor, unsafe {
                     buf.as_mut_slice_with_uninit().assume_init_mut()
                 })?;
-                unsafe {
-                    buf.set_len(bytes_read);
-                }
-                Ok(ReadResult { buf, bytes_read })
+                Ok(unsafe { ReadResult::new(buf, bytes_read) })
             })
         }
     }
@@ -709,11 +681,8 @@ impl Client {
         } else {
             let descriptor = file.as_file_descriptor();
             self.spawn_fallback(move || -> io::Result<WriteResult<B>> {
-                let res = nix::sys::uio::pwrite(descriptor, buf.as_slice(), offset as i64)?;
-                Ok(WriteResult {
-                    bytes_written: res,
-                    buf,
-                })
+                let bytes_written = nix::sys::uio::pwrite(descriptor, buf.as_slice(), offset as i64)?;
+                Ok(WriteResult::new(buf, bytes_written))
             })
         }
     }
@@ -727,7 +696,7 @@ impl Client {
     pub fn write_from_vectored_at<'a, B: IoBuf + 'a>(
         &'a self,
         file: &'a (impl UringTarget + Sync + ?Sized),
-        mut bufs: Vec<B>,
+        bufs: Vec<B>,
         offset: impl TryInto<u64>,
     ) -> PendingIo<'a, io::Result<WritevResult<B>>> {
         let offset: u64 = match offset.try_into() {
@@ -764,14 +733,14 @@ impl Client {
             let descriptor = file.as_file_descriptor();
             self.spawn_fallback(move || -> io::Result<WritevResult<B>> {
                 let slice = bufs
-                    .iter_mut()
-                    .map(|buf| IoSlice::new(buf.as_slice()))
+                    .iter()
+                    .map(|buf| {
+                        let b = buf.as_slice();
+                        IoSlice::new(b)
+                    })
                     .collect::<Vec<_>>();
                 let bytes_written = nix::sys::uio::pwritev(descriptor, &slice, offset as i64)?;
-                Ok(WritevResult {
-                    bufs,
-                    bytes_written,
-                })
+                Ok(WritevResult::new(bufs, bytes_written))
             })
         }
     }
@@ -862,7 +831,7 @@ impl Client {
             let descriptor = file.as_file_descriptor();
             self.spawn_fallback(move || -> io::Result<WriteResult<B>> {
                 let bytes_written = nix::unistd::write(descriptor, buf.as_slice())?;
-                Ok(WriteResult { buf, bytes_written })
+                Ok(WriteResult::new(buf, bytes_written))
             })
         }
     }
@@ -902,10 +871,8 @@ impl Client {
                     .map(|buf| IoSlice::new(buf.as_slice()))
                     .collect::<Vec<_>>();
                 let bytes_written = nix::sys::uio::writev(descriptor, &slices)?;
-                Ok(WritevResult {
-                    bufs,
-                    bytes_written,
-                })
+                Ok(WritevResult::new(bufs, bytes_written))
+
             })
         }
     }

@@ -2,7 +2,6 @@ use crate::client::pending_io::PendingIoImpl;
 use crate::client::pending_io::uring::UringPendingIoObj;
 use crate::client::requests::IovecArray;
 use crate::{ClientUring, UringTarget, client::completion::ReadvResult, iobuf::IoBufMut};
-use std::cmp::min;
 use std::{io, pin::Pin, sync::Arc, task::Poll};
 
 struct CompletionState<'a, Buf> {
@@ -37,24 +36,6 @@ where
     }
 }
 
-fn convert_result<Buf>(mut bufs: Vec<Buf>, bytes_read: i32) -> ReadvResult<Buf>
-where
-    Buf: IoBufMut,
-{
-    let mut cur_bytes_read = bytes_read as usize;
-    for buf in bufs.iter_mut() {
-        let bytes_read_into_target = min(buf.capacity(), cur_bytes_read);
-        unsafe {
-            buf.set_len(bytes_read_into_target);
-        }
-        cur_bytes_read -= bytes_read_into_target;
-    }
-    ReadvResult {
-        bufs,
-        bytes_read: bytes_read as usize,
-    }
-}
-
 impl<'req, 'a, Target, Buf> Future for Completion<'req, 'a, Target, Buf>
 where
     Target: UringTarget + Sync + ?Sized,
@@ -69,7 +50,9 @@ where
         let inner = self.get_mut();
         let mut state = inner.state.take().expect("state must be Some");
         match Pin::new(&mut state.raw).poll(cx) {
-            Poll::Ready(Ok(bytes_read)) => Poll::Ready(Ok(convert_result(state.bufs, bytes_read))),
+            Poll::Ready(Ok(bytes_read)) => Poll::Ready(Ok(unsafe {
+                ReadvResult::new(state.bufs, bytes_read as usize)
+            })),
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             Poll::Pending => {
                 inner.state = Some(state);
@@ -181,7 +164,7 @@ where
                 let res = state.raw.cancel_async().await.map(|r| {
                     r.map(|bytes_read| {
                         let state = self.completion_state.take().expect("state must be Some");
-                        convert_result(state.bufs, bytes_read)
+                        unsafe { ReadvResult::new(state.bufs, bytes_read as usize) }
                     })
                 });
                 self.completion_state = None;
@@ -197,7 +180,7 @@ where
                 let res = state.raw.cancel().map(|r| {
                     r.map(|bytes_read| {
                         let state = self.completion_state.take().expect("state must be Some");
-                        convert_result(state.bufs, bytes_read)
+                        unsafe { ReadvResult::new(state.bufs, bytes_read as usize) }
                     })
                 });
                 self.completion_state = None;

@@ -1,6 +1,8 @@
 use crate::{Client, HybridFile, HybridRead, HybridSeek, HybridWrite, UringCfg, fs::OpenOptions};
+use futures::StreamExt;
 use nix::sys::time::TimeSpec;
 use std::{
+    collections::HashSet,
     io::{IoSlice, IoSliceMut, SeekFrom},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -191,6 +193,33 @@ async fn test_create_dir_all() {
         .await
         .unwrap();
     assert!(temp_dir.path().join("test").join("test2").is_dir());
+}
+
+#[tokio::test]
+async fn test_read_dir() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let mut files = HashSet::new();
+    for i in 0..10 {
+        let filename = format!("test{i}.txt");
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .open(temp_dir.path().join(&filename))
+            .completion()
+            .expect("no completion future returned")
+            .await
+            .unwrap();
+        file.hybrid_write_all(b"Hello, world!").await.unwrap();
+        drop(file);
+        files.insert(filename);
+    }
+    let mut actual_files = HashSet::new();
+    let mut read_dir = crate::fs::read_dir(temp_dir.path()).await.unwrap();
+    while let Some(entry) = read_dir.next().await {
+        let entry = entry.unwrap();
+        actual_files.insert(entry.file_name().to_string_lossy().to_string());
+    }
+    assert_eq!(actual_files, files);
 }
 
 #[tokio::test(flavor = "multi_thread")]

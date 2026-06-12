@@ -50,10 +50,9 @@ where
         let inner = self.get_mut();
         let mut state = inner.state.take().expect("state must be Some");
         match Pin::new(&mut state.raw).poll(cx) {
-            Poll::Ready(res) => Poll::Ready(res.map(|bytes_written| WritevResult {
-                bufs: state.bufs,
-                bytes_written: bytes_written as usize,
-            })),
+            Poll::Ready(res) => Poll::Ready(
+                res.map(|bytes_written| WritevResult::new(state.bufs, bytes_written as usize)),
+            ),
             Poll::Pending => {
                 inner.state = Some(state);
                 Poll::Pending
@@ -165,10 +164,7 @@ where
                 let res = state.raw.cancel_async().await.map(|r| {
                     r.map(|bytes_written| {
                         let state = self.completion_state.take().expect("state must be Some");
-                        WritevResult {
-                            bufs: state.bufs,
-                            bytes_written: bytes_written as usize,
-                        }
+                        WritevResult::new(state.bufs, bytes_written as usize)
                     })
                 });
                 self.completion_state = None;
@@ -184,10 +180,7 @@ where
                 let res = state.raw.cancel().map(|r| {
                     r.map(|bytes_written| {
                         let state = self.completion_state.take().expect("state must be Some");
-                        WritevResult {
-                            bufs: state.bufs,
-                            bytes_written: bytes_written as usize,
-                        }
+                        WritevResult::new(state.bufs, bytes_written as usize)
                     })
                 });
                 self.completion_state = None;
