@@ -265,6 +265,8 @@ impl UringPendingIoFiller {
         }
         state.status = UringPendingIoStatus::Done;
         state.result = Some(result);
+        // Drop the ticket here so that the tickets can be freed even on a blocked runtime.
+        drop(state.submission_ticket.take());
         // We would like to remove the ticket, but it blocks the reaper thread.
         // Notify the future or the blocking thread that the operation changed its state.
         let waker = core::mem::replace(&mut state.waker, Waker::noop().clone());
