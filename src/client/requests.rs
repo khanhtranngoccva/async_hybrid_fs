@@ -1,7 +1,9 @@
 use crate::UringTarget;
+#[cfg(target_os = "linux")]
 use libc::iovec;
+#[cfg(target_os = "linux")]
+use std::ops::Deref;
 use std::{
-    ops::Deref,
     os::fd::{BorrowedFd, RawFd},
     sync::Arc,
 };
@@ -54,11 +56,14 @@ impl UringTarget for Target {
     }
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) struct IovecArray(pub(crate) Vec<iovec>);
 
 // SAFETY: The iovec slice is owned by the caller's future, which awaits completion, the pointer is only accessed by the kernel threads
+#[cfg(target_os = "linux")]
 unsafe impl Send for IovecArray {}
 
+#[cfg(target_os = "linux")]
 impl Deref for IovecArray {
     type Target = [iovec];
     fn deref(&self) -> &Self::Target {

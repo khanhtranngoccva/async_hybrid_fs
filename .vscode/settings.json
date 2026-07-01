@@ -2,5 +2,6 @@
     "rust-analyzer.cargo.features": [
         "pending-io-futures",
         "_low-level"
-    ]
+    ],
+    // "rust-analyzer.cargo.target": "aarch64-apple-darwin"
 }

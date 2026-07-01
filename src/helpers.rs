@@ -51,6 +51,7 @@ macro_rules! m_retry_on_eintr {
         }
     }};
 }
+#[allow(unused)]
 pub(crate) use m_retry_on_eintr;
 
 // Several `read_to_string` and `read_line` methods in the standard library will

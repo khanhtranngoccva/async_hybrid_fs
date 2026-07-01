@@ -49,6 +49,7 @@
 mod borrowed_buf;
 pub mod client;
 mod default;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod directory;
 pub mod fs;
 mod helpers;
@@ -58,12 +59,14 @@ mod runtime;
 #[cfg(test)]
 mod tests;
 
+#[cfg(target_os = "linux")]
 use crate::client::ClientUring;
 use crate::client::pending_io::fixed_value::FixedValuePendingIo;
 use nix::fcntl::AT_FDCWD;
 use nix::fcntl::AtFlags;
 use nix::fcntl::FdFlag;
 use nix::fcntl::OFlag;
+#[cfg(target_os = "linux")]
 use nix::fcntl::RenameFlags;
 use nix::sys::statvfs::Statvfs;
 use nix::sys::time::TimeSpec;
@@ -76,6 +79,7 @@ use std::io::PipeReader;
 use std::io::PipeWriter;
 use std::io::SeekFrom;
 use std::io::{self};
+#[cfg(target_os = "linux")]
 use std::os::fd::AsFd;
 use std::os::fd::BorrowedFd;
 use std::os::fd::OwnedFd;
@@ -96,10 +100,13 @@ pub use crate::metadata::MknodType;
 pub use crate::metadata::Permissions;
 pub use client::Client;
 pub use client::ClientBuildError;
+#[cfg(target_os = "linux")]
 pub use client::OwnedRegisteredFile;
 pub use client::ReadResult;
 pub use client::ReadvResult;
+#[cfg(target_os = "linux")]
 pub use client::RegisterError;
+#[cfg(target_os = "linux")]
 pub use client::RegisteredFile;
 pub use client::Target;
 pub use client::UringCfg;
@@ -817,6 +824,7 @@ pub trait HybridFile: UringTarget + Sync + Send {
     }
 
     /// Register a file for use with the global io_uring instance.
+    #[cfg(target_os = "linux")]
     fn register<'a>(&'a self) -> Result<RegisteredFile<'a>, RegisterError>
     where
         Self: AsFd,
@@ -825,6 +833,7 @@ pub trait HybridFile: UringTarget + Sync + Send {
     }
 
     /// Register a file for use with the global io_uring instance.
+    #[cfg(target_os = "linux")]
     fn register_owned(self) -> Result<OwnedRegisteredFile, (RegisterError, OwnedFd)>
     where
         Self: Into<OwnedFd> + Sized,
@@ -934,9 +943,15 @@ pub trait HybridDir: UringTarget + Sync {
         old_path: impl AsRef<Path>,
         new_dir_fd: &'a (impl UringTarget + Sync + ?Sized),
         new_path: impl AsRef<Path>,
-        flags: RenameFlags,
+        #[cfg(target_os = "linux")] flags: RenameFlags,
     ) -> PendingIo<'a, io::Result<()>> {
-        self.hybrid_rename_at(old_path, new_dir_fd, new_path, flags)
+        self.hybrid_rename_at(
+            old_path,
+            new_dir_fd,
+            new_path,
+            #[cfg(target_os = "linux")]
+            flags,
+        )
     }
 
     /// Alias for [`HybridDir::rename_at`].
@@ -948,9 +963,16 @@ pub trait HybridDir: UringTarget + Sync {
         old_path: impl AsRef<Path>,
         new_dir_fd: &'a (impl UringTarget + Sync + ?Sized),
         new_path: impl AsRef<Path>,
-        flags: RenameFlags,
+        #[cfg(target_os = "linux")] flags: RenameFlags,
     ) -> PendingIo<'a, io::Result<()>> {
-        default_client().rename_at(self, old_path, new_dir_fd, new_path, flags)
+        default_client().rename_at(
+            self,
+            old_path,
+            new_dir_fd,
+            new_path,
+            #[cfg(target_os = "linux")]
+            flags,
+        )
     }
 
     /// Method for renaming a file at the specified path to a location pointed to by new_path.
@@ -962,9 +984,14 @@ pub trait HybridDir: UringTarget + Sync {
         &'a self,
         old_path: impl AsRef<Path>,
         new_path: impl AsRef<Path>,
-        flags: RenameFlags,
+        #[cfg(target_os = "linux")] flags: RenameFlags,
     ) -> PendingIo<'a, io::Result<()>> {
-        self.hybrid_rename(old_path, new_path, flags)
+        self.hybrid_rename(
+            old_path,
+            new_path,
+            #[cfg(target_os = "linux")]
+            flags,
+        )
     }
 
     /// Alias for [`HybridDir::rename`].
@@ -975,9 +1002,16 @@ pub trait HybridDir: UringTarget + Sync {
         &'a self,
         old_path: impl AsRef<Path>,
         new_path: impl AsRef<Path>,
-        flags: RenameFlags,
+        #[cfg(target_os = "linux")] flags: RenameFlags,
     ) -> PendingIo<'a, io::Result<()>> {
-        default_client().rename_at(self, old_path, &AT_FDCWD, new_path, flags)
+        default_client().rename_at(
+            self,
+            old_path,
+            &AT_FDCWD,
+            new_path,
+            #[cfg(target_os = "linux")]
+            flags,
+        )
     }
 
     /// Method for opening a file from a relative path to the directory fd.
@@ -1219,7 +1253,9 @@ hybrid_impl!(PipeReader);
 hybrid_impl!(PipeWriter);
 
 // Implementations for crate types
+#[cfg(target_os = "linux")]
 hybrid_impl!(RegisteredFile<'_>);
+#[cfg(target_os = "linux")]
 hybrid_impl!(OwnedRegisteredFile);
 hybrid_impl!(Target);
 // Directories do not support raw reading.
@@ -1237,6 +1273,8 @@ type _DynCompatibleHybridExt = Box<dyn HybridExt>;
 #[cfg(feature = "_low-level")]
 /// Low-level structures exposed for various testing purposes
 pub mod ll {
+    #[cfg(target_os = "linux")]
     pub use crate::client::pending_io::uring::UringPendingIoSubmitter;
+    #[cfg(target_os = "linux")]
     pub use crate::client::ticketing::SubmissionTicket;
 }

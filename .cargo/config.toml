@@ -1,0 +1,3 @@
+include = [
+    { path = "cross-compilation.toml", optional = true }
+]

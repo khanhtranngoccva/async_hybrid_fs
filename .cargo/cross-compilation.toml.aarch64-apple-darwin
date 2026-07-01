@@ -1,0 +1,7 @@
+[target.aarch64-apple-darwin] 
+linker = ~/SDK/osxcross/target/bin/aarch64-apple-darwin25.1-clang 
+ar = ~/SDK/osxcross/target/bin/aarch64-apple-darwin25.1-ar 
+[env]
+# Need this flag for compatibility with osxcross
+OSXCROSS_PKG_CONFIG_USE_NATIVE_VARIABLES="1"
+PKG_CONFIG_SYSROOT_DIR="~/SDK/osxcross/target"

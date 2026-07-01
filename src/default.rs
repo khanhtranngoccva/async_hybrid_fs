@@ -9,9 +9,10 @@ use dashmap::DashMap;
 use lazy_static::lazy_static;
 
 lazy_static! {
-    static ref DEFAULT_CLIENT: Client = Client::build(UringCfg::default()).unwrap();
+    static ref DEFAULT_CLIENT: Arc<Client> = Arc::new(Client::build(UringCfg::default()).unwrap());
     static ref DEFAULT_CLIENT_SHARDS: DashMap<usize, Arc<Client>> = DashMap::new();
-    static ref DEFAULT_THREAD_POOL: Arc<rayon::ThreadPool> = Arc::new(rayon::ThreadPoolBuilder::new().build().unwrap());
+    static ref DEFAULT_THREAD_POOL: Arc<rayon::ThreadPool> =
+        Arc::new(rayon::ThreadPoolBuilder::new().build().unwrap());
     static ref PARALLELISM: usize = std::thread::available_parallelism()
         .unwrap_or(NonZero::new(8).unwrap())
         .get();
@@ -23,6 +24,7 @@ lazy_static! {
 /// # Notes
 /// - The library starts with a single default client shard. More of them can be spawned by calling [`set_max_default_shards`].
 /// - The algorithm picks clients from left to right to prevent channel starvation. It attempts to perform a basic check whether an operation should be staged, and if no free client is found, it picks the client with the least utilization.
+#[cfg(target_os = "linux")]
 pub fn default_client_owned() -> Arc<Client> {
     let max_shards = MAX_DEFAULT_SHARDS.load(Ordering::Relaxed);
     let mut all_shards_metrics = Vec::with_capacity(max_shards);
@@ -68,6 +70,12 @@ pub fn default_client_owned() -> Arc<Client> {
         })
         .unwrap();
     clients[picked_client_index].clone()
+}
+
+/// Returns an owned reference to the default client.
+#[cfg(not(target_os = "linux"))]
+pub fn default_client_owned() -> Arc<Client> {
+    DEFAULT_CLIENT.clone()
 }
 
 /// Returns a borrowed reference to one of the default clients. See [`default_client_owned`] for more details.

@@ -1,5 +1,7 @@
-use crate::{IoBuf, IoBufMut, client::pending_io::uring::UringPendingIoFiller};
-use std::{cmp::min, io};
+#[cfg(target_os = "linux")]
+use crate::client::pending_io::uring::UringPendingIoFiller;
+use crate::{IoBuf, IoBufMut};
+use std::cmp::min;
 
 /// Result of a read operation: the buffer and actual bytes read.
 pub struct ReadResult<B> {
@@ -91,7 +93,9 @@ where
     }
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn handle_completion(filler: UringPendingIoFiller, result: i32) {
+    use std::io;
     let result: io::Result<i32> = if result < 0 {
         Err(io::Error::from_raw_os_error(-result))
     } else {

@@ -264,7 +264,8 @@ impl OpenOptions {
             truncate: flags.contains(OFlag::O_TRUNC),
             create: flags.contains(OFlag::O_CREAT),
             create_new: flags.contains(OFlag::O_EXCL),
-            permissions: Permissions::from_mode(mode.bits()),
+            #[allow(clippy::unnecessary_cast)]
+            permissions: Permissions::from_mode(mode.bits() as u32),
             custom_flags: flags & !Self::get_managed_flags(),
         }
     }

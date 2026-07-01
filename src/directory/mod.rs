@@ -1,5 +1,4 @@
-//! Asynchronous port of Rustix's directory structure for Linux
-#![cfg(target_os = "linux")]
+//! Asynchronous port of Rustix's directory structure
 use std::{
     ffi::{CStr, OsStr, OsString},
     io,
@@ -483,6 +482,7 @@ impl Client {
                 return Some(Err(e));
             }
         }
+        #[cfg(target_os = "linux")]
         let z = linux_dirent64 {
             d_ino: 0_u64,
             d_off: 0_i64,
@@ -490,11 +490,23 @@ impl Client {
             d_reclen: 0_u16,
             d_name: Default::default(),
         };
+        #[cfg(target_os = "macos")]
+        let z = libc::dirent {
+            d_ino: 0_u64,
+            d_seekoff: 0_u64,
+            d_reclen: 0_u16,
+            d_namlen: 0_u16,
+            d_type: 0_u8,
+            d_name: [0; _],
+        };
         let base = as_ptr(&z) as usize;
         let offsetof_d_reclen = (as_ptr(&z.d_reclen) as usize) - base;
         let offsetof_d_name = (as_ptr(&z.d_name) as usize) - base;
         let offsetof_d_ino = (as_ptr(&z.d_ino) as usize) - base;
+        #[cfg(target_os = "linux")]
         let offsetof_d_off = (as_ptr(&z.d_off) as usize) - base;
+        #[cfg(target_os = "macos")]
+        let offsetof_d_off = (as_ptr(&z.d_seekoff) as usize) - base;
         let offsetof_d_type = (as_ptr(&z.d_type) as usize) - base;
 
         // Test if we need more entries, and if so, read more.
@@ -649,6 +661,7 @@ impl Client {
         // FIXME: getdents not yet supported in io_uring
         self.spawn_fallback(move || {
             let descriptor = target.as_file_descriptor();
+            #[cfg(target_os = "linux")]
             let result = helpers::syscall_cvt(unsafe {
                 libc::syscall(
                     libc::SYS_getdents64,
@@ -657,9 +670,33 @@ impl Client {
                     buffer.capacity().min(u32::MAX as usize) as u32,
                 )
             })?;
+            #[cfg(target_os = "macos")]
+            let result = {
+                let mut offset: libc::off_t = 0;
+                // https://github.com/apple-open-source-mirror/Libc/blob/5e566be7a7047360adfb35ffc44c6a019a854bea/gen/FreeBSD/readdir.c#L97
+                helpers::syscall_cvt(unsafe {
+                    use std::os::fd::AsRawFd;
+                    __getdirentries64(
+                        descriptor.as_raw_fd(),
+                        buffer.as_mut_ptr() as *mut _,
+                        buffer.capacity().min(u32::MAX as usize),
+                        &mut offset,
+                    )
+                })?
+            };
             Ok(unsafe { ReadResult::new(buffer, result as usize) })
         })
     }
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn __getdirentries64(
+        fd: libc::c_int,
+        buf: *mut libc::c_void,
+        bufsize: libc::size_t,
+        basep: *mut libc::off_t,
+    ) -> libc::c_long;
 }
 
 fn poll_dir_stream(

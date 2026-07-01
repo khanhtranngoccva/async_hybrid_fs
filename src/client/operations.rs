@@ -1,31 +1,40 @@
 use crate::{
-    PendingIo, Target,
+    PendingIo,
     borrowed_buf::BorrowedBuf,
     client::{
-        Client, InterruptCommand, URING_LEN_MAX, UringMetrics, UringTarget,
+        Client, URING_LEN_MAX, UringTarget,
         completion::{ReadResult, ReadvResult, WriteResult, WritevResult},
-        pending_io::{
-            fallback::SpawnablePendingIo,
-            fixed_value::FixedValuePendingIo,
-            uring::{
-                close::UringClose, fadvise::UringFadvise, fallocate::UringFallocate,
-                ftruncate::UringFtruncate, link_at::UringLinkAt, mkdir_at::UringMkdirAt,
-                open_at::UringOpenAt, read_into::UringReadIntoAt,
-                read_into_vectored::UringReadIntoVectoredAt, rename_at::UringRenameAt,
-                statx::UringStatx, statx_path::UringStatxPath, symlink_at::UringSymlinkAt,
-                sync::UringSync, unlink_at::UringUnlinkAt, write_from::UringWriteFromAt,
-                write_from_vectored::UringWriteFromVectoredAt,
-            },
-        },
+        pending_io::{fallback::SpawnablePendingIo, fixed_value::FixedValuePendingIo},
     },
     helpers,
     iobuf::{IoBuf, IoBufMut},
     metadata::{Metadata, MknodType, Permissions},
 };
+
 use core::fmt;
+
+#[cfg(target_os = "linux")]
+use crate::Target;
+#[cfg(target_os = "linux")]
+use crate::client::UringMetrics;
+#[cfg(target_os = "linux")]
+use crate::client::pending_io::uring::{
+    close::UringClose, fadvise::UringFadvise, fallocate::UringFallocate, ftruncate::UringFtruncate,
+    link_at::UringLinkAt, mkdir_at::UringMkdirAt, open_at::UringOpenAt, read_into::UringReadIntoAt,
+    read_into_vectored::UringReadIntoVectoredAt, rename_at::UringRenameAt, statx::UringStatx,
+    statx_path::UringStatxPath, symlink_at::UringSymlinkAt, sync::UringSync,
+    unlink_at::UringUnlinkAt, write_from::UringWriteFromAt,
+    write_from_vectored::UringWriteFromVectoredAt,
+};
+#[cfg(target_os = "linux")]
+use crate::client::uring_background::InterruptCommand;
+#[cfg(target_os = "linux")]
 use io_uring::opcode;
+#[cfg(target_os = "linux")]
+use nix::fcntl::{FallocateFlags, PosixFadviseAdvice, RenameFlags};
+
 use nix::{
-    fcntl::{AtFlags, FallocateFlags, FcntlArg, FdFlag, OFlag, PosixFadviseAdvice, RenameFlags},
+    fcntl::{AtFlags, FcntlArg, FdFlag, OFlag},
     sys::{
         stat::{FchmodatFlags, Mode, UtimensatFlags},
         statvfs::Statvfs,
@@ -33,6 +42,8 @@ use nix::{
     },
     unistd::{FchownatFlags, Gid, LinkatFlags, Uid, UnlinkatFlags},
 };
+#[cfg(target_os = "linux")]
+use std::sync::atomic::Ordering;
 use std::{
     cmp::{self},
     io::{self, IoSlice, IoSliceMut, SeekFrom},
@@ -40,13 +51,13 @@ use std::{
     os::fd::{AsRawFd, BorrowedFd, OwnedFd},
     path::{Path, PathBuf},
     pin::Pin,
-    sync::atomic::Ordering,
 };
 
 impl Client {
     const AT_FDCWD: BorrowedFd<'static> = unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) };
 
     /// Retrieve io_uring metrics if io_uring is available.
+    #[cfg(target_os = "linux")]
     pub fn uring_metrics(&self) -> Option<UringMetrics> {
         self.uring.as_ref().map(|uring| {
             let active_operations = uring.active_requests.load(Ordering::Relaxed);
@@ -62,6 +73,7 @@ impl Client {
 
     /// Send a panic signal to the submission thread, allows simulation of OOM on the submission thread.
     #[allow(unused)]
+    #[cfg(target_os = "linux")]
     pub(crate) fn sthread_panic(&self) {
         if let Some(uring) = self.uring.as_ref() {
             let _ = uring
@@ -72,6 +84,7 @@ impl Client {
 
     /// Send a panic signal to the completion thread, allows simulation of OOM on the completion thread.
     #[allow(unused)]
+    #[cfg(target_os = "linux")]
     pub(crate) fn cthread_panic(&self) {
         if let Some(uring) = self.uring.as_ref() {
             let _ = uring
@@ -92,6 +105,7 @@ impl Client {
     }
 
     /// Check if the specified io_uring operation is supported. See [`io_uring::Probe::is_supported`] for documentation.
+    #[cfg(target_os = "linux")]
     pub fn is_uring_operation_supported(&self, code: u8) -> bool {
         let uring = match self.uring.as_ref() {
             Some(uring) => uring,
@@ -101,11 +115,13 @@ impl Client {
     }
 
     /// Check if io_uring is available and active.
+    #[cfg(target_os = "linux")]
     pub fn is_uring_available_and_active(&self) -> bool {
         self.uring.is_some() && self.uring_enabled.load(Ordering::Relaxed)
     }
 
     /// Enable or disable io_uring dynamically, which is useful if the target system does not allow io_uring for security reasons. If disabled, the client will fall back to using [`tokio::task::spawn_blocking`] for all operations.
+    #[cfg(target_os = "linux")]
     pub fn enable_uring_operation(&self, enabled: bool) {
         self.uring_enabled.store(enabled, Ordering::Relaxed);
     }
@@ -115,6 +131,7 @@ impl Client {
     /// # Safety
     /// This method bypasses the borrow checker's restrictions.
     /// You must ensure that the file descriptor and index remains valid (e.g. by keeping the original object).
+    #[cfg(target_os = "linux")]
     pub unsafe fn to_target(&self, target: &(impl UringTarget + ?Sized)) -> Target {
         match &self.uring {
             None => Target::Fd(target.as_file_descriptor().as_raw_fd()),
@@ -175,21 +192,21 @@ impl Client {
                 "offset exceeds i64::MAX",
             ))));
         }
+        #[cfg(target_os = "linux")]
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Read::CODE)
         {
             let uring = self.uring.as_ref().expect("uring must be Some");
-            PendingIo::new(UringReadIntoAt::new(uring, file, buf, offset))
-        } else {
-            self.spawn_fallback(move || -> io::Result<ReadResult<B>> {
-                let bytes_read = nix::sys::uio::pread(
-                    file.as_file_descriptor(),
-                    unsafe { buf.as_mut_slice_with_uninit().assume_init_mut() },
-                    offset as i64,
-                )?;
-                Ok(unsafe { ReadResult::new(buf, bytes_read) })
-            })
+            return PendingIo::new(UringReadIntoAt::new(uring, file, buf, offset));
         }
+        self.spawn_fallback(move || -> io::Result<ReadResult<B>> {
+            let bytes_read = nix::sys::uio::pread(
+                file.as_file_descriptor(),
+                unsafe { buf.as_mut_slice_with_uninit().assume_init_mut() },
+                offset as i64,
+            )?;
+            Ok(unsafe { ReadResult::new(buf, bytes_read) })
+        })
     }
 
     /// Standard-library compatible method for reading from a file at the specified offset using a zero-copy buffer.
@@ -250,27 +267,27 @@ impl Client {
                 ))));
             }
         };
+        #[cfg(target_os = "linux")]
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Readv::CODE)
         {
             let uring = self.uring.as_ref().expect("uring must be Some");
-            PendingIo::new(UringReadIntoVectoredAt::new(uring, file, bufs, offset))
-        } else {
-            self.spawn_fallback(move || -> io::Result<ReadvResult<B>> {
-                let bytes_read = nix::sys::uio::preadv(
-                    file.as_file_descriptor(),
-                    &mut unsafe {
-                        bufs.iter_mut()
-                            .map(|buf| {
-                                IoSliceMut::new(buf.as_mut_slice_with_uninit().assume_init_mut())
-                            })
-                            .collect::<Vec<_>>()
-                    },
-                    offset as i64,
-                )?;
-                Ok(unsafe { ReadvResult::new(bufs, bytes_read) })
-            })
+            return PendingIo::new(UringReadIntoVectoredAt::new(uring, file, bufs, offset));
         }
+        self.spawn_fallback(move || -> io::Result<ReadvResult<B>> {
+            let bytes_read = nix::sys::uio::preadv(
+                file.as_file_descriptor(),
+                &mut unsafe {
+                    bufs.iter_mut()
+                        .map(|buf| {
+                            IoSliceMut::new(buf.as_mut_slice_with_uninit().assume_init_mut())
+                        })
+                        .collect::<Vec<_>>()
+                },
+                offset as i64,
+            )?;
+            Ok(unsafe { ReadvResult::new(bufs, bytes_read) })
+        })
     }
 
     /// Read into multiple user-provided buffers at the internal seek cursor and advance the seek position. This is the primitive read operation that accepts any buffer type implementing [`IoBufMut`].
@@ -293,33 +310,31 @@ impl Client {
                 ))));
             }
         };
+        #[cfg(target_os = "linux")]
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Readv::CODE)
         {
             let uring = self.uring.as_ref().expect("uring must be Some");
-            PendingIo::new(UringReadIntoVectoredAt::new(
+            return PendingIo::new(UringReadIntoVectoredAt::new(
                 uring,
                 file,
                 bufs,
                 (-1i64) as u64,
-            ))
-        } else {
-            let descriptor = file.as_file_descriptor();
-            self.spawn_fallback(move || -> io::Result<ReadvResult<B>> {
-                let bytes_read = nix::sys::uio::readv(
-                    descriptor,
-                    &mut bufs
-                        .iter_mut()
-                        .map(|buf| {
-                            IoSliceMut::new(unsafe {
-                                buf.as_mut_slice_with_uninit().assume_init_mut()
-                            })
-                        })
-                        .collect::<Vec<_>>(),
-                )?;
-                Ok(unsafe { ReadvResult::new(bufs, bytes_read) })
-            })
+            ));
         }
+        let descriptor = file.as_file_descriptor();
+        self.spawn_fallback(move || -> io::Result<ReadvResult<B>> {
+            let bytes_read = nix::sys::uio::readv(
+                descriptor,
+                &mut bufs
+                    .iter_mut()
+                    .map(|buf| {
+                        IoSliceMut::new(unsafe { buf.as_mut_slice_with_uninit().assume_init_mut() })
+                    })
+                    .collect::<Vec<_>>(),
+            )?;
+            Ok(unsafe { ReadvResult::new(bufs, bytes_read) })
+        })
     }
 
     /// Standard-library compatible method for reading from a file at the specified offset using a zero-copy buffer, ensuring that the entire buffer is filled.
@@ -367,20 +382,20 @@ impl Client {
         file: &'a mut (impl UringTarget + Sync + ?Sized),
         mut buf: B,
     ) -> PendingIo<'a, io::Result<ReadResult<B>>> {
+        #[cfg(target_os = "linux")]
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Read::CODE)
         {
             let uring = self.uring.as_ref().expect("uring must be Some");
-            PendingIo::new(UringReadIntoAt::new(uring, file, buf, (-1i64) as u64))
-        } else {
-            let descriptor = file.as_file_descriptor();
-            self.spawn_fallback(move || -> io::Result<ReadResult<B>> {
-                let bytes_read = nix::unistd::read(descriptor, unsafe {
-                    buf.as_mut_slice_with_uninit().assume_init_mut()
-                })?;
-                Ok(unsafe { ReadResult::new(buf, bytes_read) })
-            })
+            return PendingIo::new(UringReadIntoAt::new(uring, file, buf, (-1i64) as u64));
         }
+        let descriptor = file.as_file_descriptor();
+        self.spawn_fallback(move || -> io::Result<ReadResult<B>> {
+            let bytes_read = nix::unistd::read(descriptor, unsafe {
+                buf.as_mut_slice_with_uninit().assume_init_mut()
+            })?;
+            Ok(unsafe { ReadResult::new(buf, bytes_read) })
+        })
     }
 
     /// Standard library compatible method for reading from a file using a zero-copy buffer and the file's internal seek cursor.
@@ -673,18 +688,18 @@ impl Client {
                 "offset exceeds i64::MAX",
             ))));
         }
+        #[cfg(target_os = "linux")]
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Write::CODE)
         {
             let uring = self.uring.as_ref().expect("uring must be Some");
-            PendingIo::new(UringWriteFromAt::new(uring, file, buf, offset))
-        } else {
-            let descriptor = file.as_file_descriptor();
-            self.spawn_fallback(move || -> io::Result<WriteResult<B>> {
-                let bytes_written = nix::sys::uio::pwrite(descriptor, buf.as_slice(), offset as i64)?;
-                Ok(WriteResult::new(buf, bytes_written))
-            })
+            return PendingIo::new(UringWriteFromAt::new(uring, file, buf, offset));
         }
+        let descriptor = file.as_file_descriptor();
+        self.spawn_fallback(move || -> io::Result<WriteResult<B>> {
+            let bytes_written = nix::sys::uio::pwrite(descriptor, buf.as_slice(), offset as i64)?;
+            Ok(WriteResult::new(buf, bytes_written))
+        })
     }
 
     /// Write multiple buffers to a file at the specified offset. Accepts any buffer type implementing [`IoBuf`].
@@ -724,25 +739,25 @@ impl Client {
                 ))));
             }
         };
+        #[cfg(target_os = "linux")]
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Writev::CODE)
         {
             let uring = self.uring.as_ref().expect("uring must be Some");
-            PendingIo::new(UringWriteFromVectoredAt::new(uring, file, bufs, offset))
-        } else {
-            let descriptor = file.as_file_descriptor();
-            self.spawn_fallback(move || -> io::Result<WritevResult<B>> {
-                let slice = bufs
-                    .iter()
-                    .map(|buf| {
-                        let b = buf.as_slice();
-                        IoSlice::new(b)
-                    })
-                    .collect::<Vec<_>>();
-                let bytes_written = nix::sys::uio::pwritev(descriptor, &slice, offset as i64)?;
-                Ok(WritevResult::new(bufs, bytes_written))
-            })
+            return PendingIo::new(UringWriteFromVectoredAt::new(uring, file, bufs, offset));
         }
+        let descriptor = file.as_file_descriptor();
+        self.spawn_fallback(move || -> io::Result<WritevResult<B>> {
+            let slice = bufs
+                .iter()
+                .map(|buf| {
+                    let b = buf.as_slice();
+                    IoSlice::new(b)
+                })
+                .collect::<Vec<_>>();
+            let bytes_written = nix::sys::uio::pwritev(descriptor, &slice, offset as i64)?;
+            Ok(WritevResult::new(bufs, bytes_written))
+        })
     }
 
     /// Standard library compatible method for writing to a file using a zero-copy buffer and an offset.
@@ -822,18 +837,18 @@ impl Client {
         file: &'a mut (impl UringTarget + Sync + ?Sized),
         buf: B,
     ) -> PendingIo<'a, io::Result<WriteResult<B>>> {
+        #[cfg(target_os = "linux")]
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Write::CODE)
         {
             let uring = self.uring.as_ref().expect("uring must be Some");
-            PendingIo::new(UringWriteFromAt::new(uring, file, buf, (-1i64) as u64))
-        } else {
-            let descriptor = file.as_file_descriptor();
-            self.spawn_fallback(move || -> io::Result<WriteResult<B>> {
-                let bytes_written = nix::unistd::write(descriptor, buf.as_slice())?;
-                Ok(WriteResult::new(buf, bytes_written))
-            })
+            return PendingIo::new(UringWriteFromAt::new(uring, file, buf, (-1i64) as u64));
         }
+        let descriptor = file.as_file_descriptor();
+        self.spawn_fallback(move || -> io::Result<WriteResult<B>> {
+            let bytes_written = nix::unistd::write(descriptor, buf.as_slice())?;
+            Ok(WriteResult::new(buf, bytes_written))
+        })
     }
 
     /// Write multiple buffers to a file using the file's internal seek cursor. Accepts any buffer type implementing [`IoBuf`].
@@ -853,28 +868,27 @@ impl Client {
                 ))));
             }
         };
+        #[cfg(target_os = "linux")]
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Writev::CODE)
         {
             let uring = self.uring.as_ref().expect("uring must be Some");
-            PendingIo::new(UringWriteFromVectoredAt::new(
+            return PendingIo::new(UringWriteFromVectoredAt::new(
                 uring,
                 file,
                 bufs,
                 (-1i64) as u64,
-            ))
-        } else {
-            let descriptor = file.as_file_descriptor();
-            self.spawn_fallback(move || -> io::Result<WritevResult<B>> {
-                let slices = bufs
-                    .iter()
-                    .map(|buf| IoSlice::new(buf.as_slice()))
-                    .collect::<Vec<_>>();
-                let bytes_written = nix::sys::uio::writev(descriptor, &slices)?;
-                Ok(WritevResult::new(bufs, bytes_written))
-
-            })
+            ));
         }
+        let descriptor = file.as_file_descriptor();
+        self.spawn_fallback(move || -> io::Result<WritevResult<B>> {
+            let slices = bufs
+                .iter()
+                .map(|buf| IoSlice::new(buf.as_slice()))
+                .collect::<Vec<_>>();
+            let bytes_written = nix::sys::uio::writev(descriptor, &slices)?;
+            Ok(WritevResult::new(bufs, bytes_written))
+        })
     }
 
     /// Standard library compatible method for writing a single buffer to a file.
@@ -1024,18 +1038,18 @@ impl Client {
         &'a self,
         file: &'a (impl UringTarget + Sync + ?Sized),
     ) -> PendingIo<'a, io::Result<()>> {
+        #[cfg(target_os = "linux")]
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Fsync::CODE)
         {
             let uring = self.uring.as_ref().expect("uring must be Some");
-            PendingIo::new(UringSync::new(uring, file, false))
-        } else {
-            let descriptor = file.as_file_descriptor();
-            self.spawn_fallback(move || -> io::Result<()> {
-                nix::unistd::fsync(descriptor)?;
-                Ok(())
-            })
+            return PendingIo::new(UringSync::new(uring, file, false));
         }
+        let descriptor = file.as_file_descriptor();
+        self.spawn_fallback(move || -> io::Result<()> {
+            nix::unistd::fsync(descriptor)?;
+            Ok(())
+        })
     }
 
     /// Synchronize file data to disk (fdatasync). This ensures that only data modifications are flushed to the underlying storage device. This is useful for ensuring that data is written but not metadata.
@@ -1046,18 +1060,18 @@ impl Client {
         &'a self,
         file: &'a (impl UringTarget + Sync + ?Sized),
     ) -> PendingIo<'a, io::Result<()>> {
+        #[cfg(target_os = "linux")]
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Fsync::CODE)
         {
             let uring = self.uring.as_ref().expect("uring must be Some");
-            PendingIo::new(UringSync::new(uring, file, true))
-        } else {
-            let descriptor = file.as_file_descriptor();
-            self.spawn_fallback(move || -> io::Result<()> {
-                nix::unistd::fsync(descriptor)?;
-                Ok(())
-            })
+            return PendingIo::new(UringSync::new(uring, file, true));
         }
+        let descriptor = file.as_file_descriptor();
+        self.spawn_fallback(move || -> io::Result<()> {
+            nix::unistd::fsync(descriptor)?;
+            Ok(())
+        })
     }
 
     /// Standard library compatible method for getting metadata of an open file handle (statx). This is the io_uring equivalent of the low-level [`libc::statx()`] or [`std::fs::File::metadata`] functions.
@@ -1068,27 +1082,43 @@ impl Client {
         &'a self,
         file: &'a (impl UringTarget + Sync + ?Sized),
     ) -> PendingIo<'a, io::Result<Metadata>> {
+        #[cfg(target_os = "linux")]
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Statx::CODE)
         {
             let uring = self.uring.as_ref().expect("uring must be Some");
-            PendingIo::new(UringStatx::new(uring, file))
-        } else {
-            let mut statx_buf = Box::new(MaybeUninit::<libc::statx>::uninit());
-            let descriptor = file.as_file_descriptor();
-            self.spawn_fallback(move || -> io::Result<Metadata> {
-                helpers::syscall_cvt(unsafe {
+            return PendingIo::new(UringStatx::new(uring, file));
+        }
+        let descriptor = file.as_file_descriptor();
+        self.spawn_fallback(move || -> io::Result<Metadata> {
+            let mut stat_buf = {
+                #[cfg(target_os = "linux")]
+                {
+                    Box::new(MaybeUninit::<libc::statx>::uninit())
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    Box::new(MaybeUninit::<libc::stat>::uninit())
+                }
+            };
+            helpers::syscall_cvt(unsafe {
+                #[cfg(target_os = "linux")]
+                {
                     libc::statx(
                         descriptor.as_raw_fd(),
                         c"".as_ptr(),
                         libc::AT_EMPTY_PATH,
                         libc::STATX_BASIC_STATS,
-                        statx_buf.as_mut_ptr(),
+                        stat_buf.as_mut_ptr(),
                     )
-                })?;
-                Ok(Metadata(unsafe { (*statx_buf).assume_init() }))
-            })
-        }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    libc::fstat(descriptor.as_raw_fd(), stat_buf.as_mut_ptr())
+                }
+            })?;
+            Ok(Metadata(unsafe { (*stat_buf).assume_init() }))
+        })
     }
 
     /// Retrieves metadata from a file with the path relative to the specified directory file descriptor.
@@ -1101,33 +1131,54 @@ impl Client {
         path: impl AsRef<Path>,
         flags: AtFlags,
     ) -> PendingIo<'a, io::Result<Metadata>> {
-        let mut statx_buf = Box::new(MaybeUninit::<libc::statx>::uninit());
         let path_cstr = match helpers::path_to_cstring(path.as_ref()) {
             Ok(path_cstr) => path_cstr,
             Err(e) => {
                 return PendingIo::new(FixedValuePendingIo::new(Err(e)));
             }
         };
+        #[cfg(target_os = "linux")]
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Statx::CODE)
         {
             let uring = self.uring.as_ref().expect("uring must be Some");
-            PendingIo::new(UringStatxPath::new(uring, fd, path_cstr, flags))
-        } else {
-            let descriptor = fd.as_file_descriptor();
-            self.spawn_fallback(move || -> io::Result<Metadata> {
-                helpers::syscall_cvt(unsafe {
+            return PendingIo::new(UringStatxPath::new(uring, fd, path_cstr, flags));
+        }
+        let descriptor = fd.as_file_descriptor();
+        self.spawn_fallback(move || -> io::Result<Metadata> {
+            let mut stat_buf = {
+                #[cfg(target_os = "linux")]
+                {
+                    Box::new(MaybeUninit::<libc::statx>::uninit())
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    Box::new(MaybeUninit::<libc::stat>::uninit())
+                }
+            };
+            helpers::syscall_cvt(unsafe {
+                #[cfg(target_os = "linux")]
+                {
                     libc::statx(
                         descriptor.as_raw_fd(),
                         path_cstr.as_ptr(),
                         flags.bits(),
                         libc::STATX_BASIC_STATS,
-                        statx_buf.as_mut_ptr(),
+                        stat_buf.as_mut_ptr(),
                     )
-                })?;
-                Ok(Metadata(unsafe { (*statx_buf).assume_init() }))
-            })
-        }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    libc::fstatat(
+                        descriptor.as_raw_fd(),
+                        path_cstr.as_ptr(),
+                        stat_buf.as_mut_ptr(),
+                        flags.bits(),
+                    )
+                }
+            })?;
+            Ok(Metadata(unsafe { (*stat_buf).assume_init() }))
+        })
     }
 
     /// Standard library compatible method for getting metadata of a file path after following all symlinks, equivalent to [`std::fs::metadata`].
@@ -1138,7 +1189,13 @@ impl Client {
         &'a self,
         path: impl AsRef<Path>,
     ) -> PendingIo<'a, io::Result<Metadata>> {
-        self.statx_at(&Self::AT_FDCWD, path, AtFlags::AT_EMPTY_PATH)
+        #[allow(unused_mut)]
+        let mut flags = AtFlags::empty();
+        #[cfg(target_os = "linux")]
+        {
+            flags |= AtFlags::AT_EMPTY_PATH;
+        }
+        self.statx_at(&Self::AT_FDCWD, path, flags)
     }
 
     /// Standard library compatible method for getting metadata of a file path without following any symlinks, equivalent to [`std::fs::symlink_metadata`].
@@ -1149,17 +1206,20 @@ impl Client {
         &'a self,
         path: impl AsRef<Path>,
     ) -> PendingIo<'a, io::Result<Metadata>> {
-        self.statx_at(
-            &Self::AT_FDCWD,
-            path,
-            AtFlags::AT_SYMLINK_NOFOLLOW | AtFlags::AT_EMPTY_PATH,
-        )
+        #[allow(unused_mut)]
+        let mut flags = AtFlags::AT_SYMLINK_NOFOLLOW;
+        #[cfg(target_os = "linux")]
+        {
+            flags |= AtFlags::AT_EMPTY_PATH;
+        }
+        self.statx_at(&Self::AT_FDCWD, path, flags)
     }
 
     /// Pre-allocate or deallocate space for a file (fallocate). This can be used to pre-allocate space to avoid fragmentation, punch holes in sparse files, or zero-fill regions. Use `libc::FALLOC_FL_*` constants for mode flags.
     ///
     /// # Cancellation safety
     /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
+    #[cfg(target_os = "linux")]
     pub fn fallocate<'a>(
         &'a self,
         file: &'a (impl UringTarget + Sync + ?Sized),
@@ -1220,6 +1280,7 @@ impl Client {
     ///
     /// # Cancellation safety
     /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
+    #[cfg(target_os = "linux")]
     pub fn fadvise<'a>(
         &'a self,
         file: &'a (impl UringTarget + Sync + ?Sized),
@@ -1295,18 +1356,18 @@ impl Client {
                 "len exceeds i64::MAX",
             ))));
         }
+        #[cfg(target_os = "linux")]
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Ftruncate::CODE)
         {
             let uring = self.uring.as_ref().expect("uring must be Some");
-            PendingIo::new(UringFtruncate::new(uring, file, len))
-        } else {
-            let descriptor = file.as_file_descriptor();
-            self.spawn_fallback(move || -> io::Result<()> {
-                nix::unistd::ftruncate(descriptor, len as i64)?;
-                Ok(())
-            })
+            return PendingIo::new(UringFtruncate::new(uring, file, len));
         }
+        let descriptor = file.as_file_descriptor();
+        self.spawn_fallback(move || -> io::Result<()> {
+            nix::unistd::ftruncate(descriptor, len as i64)?;
+            Ok(())
+        })
     }
 
     /// Open a file relative to a directory fd. This is useful for safe path traversal and avoiding TOCTOU races.
@@ -1330,6 +1391,7 @@ impl Client {
         flags: OFlag,
         permissions: Permissions,
     ) -> PendingIo<'a, io::Result<OwnedFd>> {
+        #[cfg(target_os = "linux")]
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::OpenAt::CODE)
         {
@@ -1340,25 +1402,27 @@ impl Client {
                 }
             };
             let uring = self.uring.as_ref().expect("uring must be Some");
-            PendingIo::new(UringOpenAt::new(
+            return PendingIo::new(UringOpenAt::new(
                 uring,
                 dir_fd,
                 path,
                 flags,
                 Mode::from_bits_retain(permissions.mode()),
-            ))
-        } else {
-            let path_owned = path.as_ref().to_owned();
-            let descriptor = dir_fd.as_file_descriptor();
-            self.spawn_fallback(move || -> io::Result<OwnedFd> {
-                Ok(nix::fcntl::openat(
-                    descriptor,
-                    &path_owned,
-                    OFlag::from_bits_retain(flags.bits()),
-                    Mode::from_bits_retain(permissions.mode()),
-                )?)
-            })
+            ));
         }
+        let path_owned = path.as_ref().to_owned();
+        let descriptor = dir_fd.as_file_descriptor();
+        self.spawn_fallback(move || -> io::Result<OwnedFd> {
+            Ok(nix::fcntl::openat(
+                descriptor,
+                &path_owned,
+                OFlag::from_bits_retain(flags.bits()),
+                #[allow(clippy::unnecessary_cast)]
+                Mode::from_bits_retain(
+                    (permissions.mode() & libc::mode_t::MAX as u32) as libc::mode_t,
+                ),
+            )?)
+        })
     }
 
     /// Open a file asynchronously using the path syntax. This is the io_uring equivalent of `open(2)`.
@@ -1477,17 +1541,17 @@ impl Client {
     /// This method is partially cancellation-safe. See [cancellation safety notes](`crate#cancellation-safety-and-correctness`) for details.
     pub fn close<'a>(&'a self, fd: impl Into<OwnedFd>) -> PendingIo<'a, io::Result<()>> {
         let owned_fd = fd.into();
+        #[cfg(target_os = "linux")]
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::Close::CODE)
         {
             let uring = self.uring.as_ref().expect("uring must be Some");
-            PendingIo::new(UringClose::new(uring, owned_fd))
-        } else {
-            self.spawn_fallback(move || -> io::Result<()> {
-                nix::unistd::close(owned_fd)?;
-                Ok(())
-            })
+            return PendingIo::new(UringClose::new(uring, owned_fd));
         }
+        self.spawn_fallback(move || -> io::Result<()> {
+            nix::unistd::close(owned_fd)?;
+            Ok(())
+        })
     }
 
     /// Rename a file relative to directory fds. This is the io_uring equivalent of `renameat2(2)`.
@@ -1502,8 +1566,9 @@ impl Client {
         old_path: impl AsRef<Path>,
         new_dir_fd: &'a (impl UringTarget + Sync + ?Sized),
         new_path: impl AsRef<Path>,
-        flags: RenameFlags,
+        #[cfg(target_os = "linux")] flags: RenameFlags,
     ) -> PendingIo<'a, io::Result<()>> {
+        #[cfg(target_os = "linux")]
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::RenameAt::CODE)
         {
@@ -1520,25 +1585,32 @@ impl Client {
                 }
             };
             let uring = self.uring.as_ref().expect("uring must be Some");
-            PendingIo::new(UringRenameAt::new(
+            return PendingIo::new(UringRenameAt::new(
                 uring, old_dir_fd, old_path, new_dir_fd, new_path, flags,
-            ))
-        } else {
-            let old_path_owned = old_path.as_ref().to_owned();
-            let new_path_owned = new_path.as_ref().to_owned();
-            let old_descriptor = old_dir_fd.as_file_descriptor();
-            let new_descriptor = new_dir_fd.as_file_descriptor();
-            self.spawn_fallback(move || -> io::Result<()> {
-                nix::fcntl::renameat2(
-                    old_descriptor,
-                    &old_path_owned,
-                    new_descriptor,
-                    &new_path_owned,
-                    flags,
-                )?;
-                Ok(())
-            })
+            ));
         }
+        let old_path_owned = old_path.as_ref().to_owned();
+        let new_path_owned = new_path.as_ref().to_owned();
+        let old_descriptor = old_dir_fd.as_file_descriptor();
+        let new_descriptor = new_dir_fd.as_file_descriptor();
+        self.spawn_fallback(move || -> io::Result<()> {
+            #[cfg(target_os = "linux")]
+            nix::fcntl::renameat2(
+                old_descriptor,
+                &old_path_owned,
+                new_descriptor,
+                &new_path_owned,
+                flags,
+            )?;
+            #[cfg(not(target_os = "linux"))]
+            nix::fcntl::renameat(
+                old_descriptor,
+                &old_path_owned,
+                new_descriptor,
+                &new_path_owned,
+            )?;
+            Ok(())
+        })
     }
 
     /// Rename a file asynchronously. This is the io_uring equivalent of `rename(2)`.
@@ -1555,6 +1627,7 @@ impl Client {
             old_path,
             &Self::AT_FDCWD,
             new_path,
+            #[cfg(target_os = "linux")]
             RenameFlags::empty(),
         )
     }
@@ -1571,6 +1644,7 @@ impl Client {
         path: impl AsRef<Path>,
         flags: UnlinkatFlags,
     ) -> PendingIo<'a, io::Result<()>> {
+        #[cfg(target_os = "linux")]
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::UnlinkAt::CODE)
         {
@@ -1581,15 +1655,14 @@ impl Client {
                 }
             };
             let uring = self.uring.as_ref().expect("uring must be Some");
-            PendingIo::new(UringUnlinkAt::new(uring, dir_fd, path, flags))
-        } else {
-            let path_owned = path.as_ref().to_owned();
-            let descriptor = dir_fd.as_file_descriptor();
-            self.spawn_fallback(move || -> io::Result<()> {
-                nix::unistd::unlinkat(descriptor, &path_owned, flags)?;
-                Ok(())
-            })
+            return PendingIo::new(UringUnlinkAt::new(uring, dir_fd, path, flags));
         }
+        let path_owned = path.as_ref().to_owned();
+        let descriptor = dir_fd.as_file_descriptor();
+        self.spawn_fallback(move || -> io::Result<()> {
+            nix::unistd::unlinkat(descriptor, &path_owned, flags)?;
+            Ok(())
+        })
     }
 
     /// Delete a file. This is the io_uring equivalent of `unlink(2)`.
@@ -1627,6 +1700,7 @@ impl Client {
         path: impl AsRef<Path>,
         permissions: Permissions,
     ) -> PendingIo<'a, io::Result<()>> {
+        #[cfg(target_os = "linux")]
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::MkDirAt::CODE)
         {
@@ -1637,24 +1711,26 @@ impl Client {
                 }
             };
             let uring = self.uring.as_ref().expect("uring must be Some");
-            PendingIo::new(UringMkdirAt::new(
+            return PendingIo::new(UringMkdirAt::new(
                 uring,
                 dir_fd,
                 path,
                 Mode::from_bits_retain(permissions.mode()),
-            ))
-        } else {
-            let path_owned = path.as_ref().to_owned();
-            let descriptor = dir_fd.as_file_descriptor();
-            self.spawn_fallback(move || -> io::Result<()> {
-                nix::sys::stat::mkdirat(
-                    descriptor,
-                    &path_owned,
-                    Mode::from_bits_retain(permissions.mode()),
-                )?;
-                Ok(())
-            })
+            ));
         }
+        let path_owned = path.as_ref().to_owned();
+        let descriptor = dir_fd.as_file_descriptor();
+        self.spawn_fallback(move || -> io::Result<()> {
+            nix::sys::stat::mkdirat(
+                descriptor,
+                &path_owned,
+                #[allow(clippy::unnecessary_cast)]
+                Mode::from_bits_retain(
+                    (permissions.mode() & libc::mode_t::MAX as u32) as libc::mode_t,
+                ),
+            )?;
+            Ok(())
+        })
     }
 
     /// Create a directory using path syntax. This is the io_uring equivalent of `mkdir(2)`.
@@ -1781,6 +1857,7 @@ impl Client {
         new_dir_fd: &'a (impl UringTarget + Sync + ?Sized),
         link_path: impl AsRef<Path>,
     ) -> PendingIo<'a, io::Result<()>> {
+        #[cfg(target_os = "linux")]
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::SymlinkAt::CODE)
         {
@@ -1797,16 +1874,15 @@ impl Client {
                 }
             };
             let uring = self.uring.as_ref().expect("uring must be Some");
-            PendingIo::new(UringSymlinkAt::new(uring, new_dir_fd, target, link_path))
-        } else {
-            let target_owned = target.as_ref().to_owned();
-            let link_path_owned = link_path.as_ref().to_owned();
-            let descriptor = new_dir_fd.as_file_descriptor();
-            self.spawn_fallback(move || -> io::Result<()> {
-                nix::unistd::symlinkat(&target_owned, descriptor, &link_path_owned)?;
-                Ok(())
-            })
+            return PendingIo::new(UringSymlinkAt::new(uring, new_dir_fd, target, link_path));
         }
+        let target_owned = target.as_ref().to_owned();
+        let link_path_owned = link_path.as_ref().to_owned();
+        let descriptor = new_dir_fd.as_file_descriptor();
+        self.spawn_fallback(move || -> io::Result<()> {
+            nix::unistd::symlinkat(&target_owned, descriptor, &link_path_owned)?;
+            Ok(())
+        })
     }
 
     /// Standard library compatible method for creating a symbolic link, equivalent to [`std::os::unix::fs::symlink`] or `symlink(2)`.
@@ -1833,6 +1909,7 @@ impl Client {
         new_path: impl AsRef<Path>,
         flags: LinkatFlags,
     ) -> PendingIo<'a, io::Result<()>> {
+        #[cfg(target_os = "linux")]
         if self.is_uring_available_and_active()
             && self.is_uring_operation_supported(opcode::LinkAt::CODE)
         {
@@ -1849,25 +1926,24 @@ impl Client {
                 }
             };
             let uring = self.uring.as_ref().expect("uring must be Some");
-            PendingIo::new(UringLinkAt::new(
+            return PendingIo::new(UringLinkAt::new(
                 uring, old_dir_fd, old_path, new_dir_fd, new_path, flags,
-            ))
-        } else {
-            let old_path_owned = old_path.as_ref().to_owned();
-            let new_path_owned = new_path.as_ref().to_owned();
-            let old_descriptor = old_dir_fd.as_file_descriptor();
-            let new_descriptor = new_dir_fd.as_file_descriptor();
-            self.spawn_fallback(move || -> io::Result<()> {
-                nix::unistd::linkat(
-                    old_descriptor,
-                    &old_path_owned,
-                    new_descriptor,
-                    &new_path_owned,
-                    flags,
-                )?;
-                Ok(())
-            })
+            ));
         }
+        let old_path_owned = old_path.as_ref().to_owned();
+        let new_path_owned = new_path.as_ref().to_owned();
+        let old_descriptor = old_dir_fd.as_file_descriptor();
+        let new_descriptor = new_dir_fd.as_file_descriptor();
+        self.spawn_fallback(move || -> io::Result<()> {
+            nix::unistd::linkat(
+                old_descriptor,
+                &old_path_owned,
+                new_descriptor,
+                &new_path_owned,
+                flags,
+            )?;
+            Ok(())
+        })
     }
 
     /// Create a hard link to the open file handle at a location relative to the specified directory fd.
@@ -1877,13 +1953,19 @@ impl Client {
         new_dir_fd: &'a (impl UringTarget + Sync + ?Sized),
         new_path: impl AsRef<Path>,
     ) -> PendingIo<'a, io::Result<()>> {
+        #[allow(unused_mut)]
+        let mut flags = AtFlags::empty();
+        #[cfg(target_os = "linux")]
+        {
+            flags |= AtFlags::AT_EMPTY_PATH;
+        }
         self.hard_link_at(
             file,
             Path::new(""),
             new_dir_fd,
             new_path,
             // Points to the target file.
-            LinkatFlags::AT_EMPTY_PATH,
+            flags,
         )
     }
 
@@ -1893,13 +1975,13 @@ impl Client {
         file: &'a (impl UringTarget + Sync + ?Sized),
         new_path: impl AsRef<Path>,
     ) -> PendingIo<'a, io::Result<()>> {
-        self.hard_link_at(
-            file,
-            Path::new(""),
-            &Self::AT_FDCWD,
-            new_path,
-            LinkatFlags::AT_EMPTY_PATH,
-        )
+        #[allow(unused_mut)]
+        let mut flags = AtFlags::empty();
+        #[cfg(target_os = "linux")]
+        {
+            flags |= AtFlags::AT_EMPTY_PATH;
+        }
+        self.hard_link_at(file, Path::new(""), &Self::AT_FDCWD, new_path, flags)
     }
 
     /// Standard library compatible method for creating a hard link using path syntax. This is the io_uring equivalent of `link(2)`.
@@ -1911,13 +1993,13 @@ impl Client {
         old_path: impl AsRef<Path>,
         new_path: impl AsRef<Path>,
     ) -> PendingIo<'a, io::Result<()>> {
-        self.hard_link_at(
-            &Self::AT_FDCWD,
-            old_path,
-            &Self::AT_FDCWD,
-            new_path,
-            LinkatFlags::AT_EMPTY_PATH,
-        )
+        #[allow(unused_mut)]
+        let mut flags = AtFlags::empty();
+        #[cfg(target_os = "linux")]
+        {
+            flags |= AtFlags::AT_EMPTY_PATH;
+        }
+        self.hard_link_at(&Self::AT_FDCWD, old_path, &Self::AT_FDCWD, new_path, flags)
     }
 
     /// Alias for [`Self::fchmod`].
@@ -1944,7 +2026,13 @@ impl Client {
     ) -> PendingIo<'a, io::Result<()>> {
         let descriptor = fd.as_file_descriptor();
         self.spawn_fallback(move || -> io::Result<()> {
-            nix::sys::stat::fchmod(descriptor, Mode::from_bits_retain(permissions.mode()))?;
+            nix::sys::stat::fchmod(
+                descriptor,
+                #[allow(clippy::unnecessary_cast)]
+                Mode::from_bits_retain(
+                    (permissions.mode() & libc::mode_t::MAX as u32) as libc::mode_t,
+                ),
+            )?;
             Ok(())
         })
     }
@@ -1966,7 +2054,10 @@ impl Client {
             nix::sys::stat::fchmodat(
                 descriptor,
                 &path,
-                Mode::from_bits_retain(permissions.mode()),
+                #[allow(clippy::unnecessary_cast)]
+                Mode::from_bits_retain(
+                    (permissions.mode() & libc::mode_t::MAX as u32) as libc::mode_t,
+                ),
                 flags,
             )?;
             Ok(())
@@ -2054,13 +2145,13 @@ impl Client {
         uid: Option<Uid>,
         gid: Option<Gid>,
     ) -> PendingIo<'a, io::Result<()>> {
-        self.fchown_at(
-            &Self::AT_FDCWD,
-            path,
-            uid,
-            gid,
-            FchownatFlags::AT_EMPTY_PATH,
-        )
+        #[allow(unused_mut)]
+        let mut flags = AtFlags::empty();
+        #[cfg(target_os = "linux")]
+        {
+            flags |= AtFlags::AT_EMPTY_PATH;
+        }
+        self.fchown_at(&Self::AT_FDCWD, path, uid, gid, flags)
     }
 
     /// Set the user and/ or group ownership of a file or directory using path syntax, but can target a symlink.
@@ -2073,13 +2164,13 @@ impl Client {
         uid: Option<Uid>,
         gid: Option<Gid>,
     ) -> PendingIo<'a, io::Result<()>> {
-        self.fchown_at(
-            &Self::AT_FDCWD,
-            path,
-            uid,
-            gid,
-            FchownatFlags::AT_EMPTY_PATH | FchownatFlags::AT_SYMLINK_NOFOLLOW,
-        )
+        #[allow(unused_mut)]
+        let mut flags = AtFlags::AT_SYMLINK_NOFOLLOW;
+        #[cfg(target_os = "linux")]
+        {
+            flags |= AtFlags::AT_EMPTY_PATH;
+        }
+        self.fchown_at(&Self::AT_FDCWD, path, uid, gid, flags)
     }
 
     /// Alias for [`Self::futimens`].
@@ -2200,17 +2291,28 @@ impl Client {
         kind: MknodType,
         permissions: Permissions,
     ) -> PendingIo<'a, io::Result<()>> {
-        let path_owned = path.as_ref().to_owned();
         let descriptor = dir_fd.as_file_descriptor();
+        let path_cstr = match helpers::path_to_cstring(path.as_ref()) {
+            Ok(path_cstr) => path_cstr,
+            Err(e) => {
+                return PendingIo::new(FixedValuePendingIo::new(Err(e)));
+            }
+        };
         self.spawn_fallback(move || -> io::Result<()> {
             let (kind, device) = kind.to_sflag_and_device();
-            nix::sys::stat::mknodat(
-                descriptor,
-                &path_owned,
-                kind,
-                Mode::from_bits_retain(permissions.mode()),
-                device.into(),
-            )?;
+            unsafe {
+                helpers::syscall_cvt(libc::mknodat(
+                    descriptor.as_raw_fd(),
+                    path_cstr.as_ptr(),
+                    #[allow(clippy::unnecessary_cast)]
+                    Mode::from_bits_retain(
+                        (permissions.mode() & libc::mode_t::MAX as u32) as libc::mode_t
+                            | kind.bits(),
+                    )
+                    .bits(),
+                    device.into(),
+                ))
+            }?;
             Ok(())
         })
     }

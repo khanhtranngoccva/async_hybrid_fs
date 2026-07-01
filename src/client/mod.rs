@@ -2,35 +2,46 @@
 mod completion;
 mod operations;
 pub(crate) mod pending_io;
+#[cfg(target_os = "linux")]
 mod register;
 mod requests;
+#[cfg(target_os = "linux")]
 pub(crate) mod ticketing;
+#[cfg(target_os = "linux")]
+mod uring_background;
 
 pub use completion::{ReadResult, ReadvResult, WriteResult, WritevResult};
 
-use std::collections::VecDeque;
+#[cfg(target_os = "linux")]
+use crate::client::uring_background::InterruptCommand;
+#[cfg(target_os = "linux")]
+use dashmap::DashSet;
+#[cfg(target_os = "linux")]
+use io_uring::IoUring;
+#[cfg(target_os = "linux")]
+use io_uring::cqueue::Entry as CEntry;
+#[cfg(target_os = "linux")]
+use io_uring::squeue::Entry as SEntry;
+use pending_io::fallback::Spawnable;
+#[cfg(target_os = "linux")]
+use pending_io::uring::{PendingMap, UringPendingIoSubmitter};
+#[cfg(target_os = "linux")]
+pub use register::OwnedRegisteredFile;
+#[cfg(target_os = "linux")]
+pub use register::RegisterError;
+#[cfg(target_os = "linux")]
+pub use register::RegisteredFile;
+pub use requests::Target;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::panic::UnwindSafe;
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize};
+#[cfg(target_os = "linux")]
 use std::thread::JoinHandle;
+#[cfg(target_os = "linux")]
 use ticketing::SubmissionTicketQueue;
-
-use dashmap::DashSet;
-use io_uring::IoUring;
-use io_uring::cqueue::Entry as CEntry;
-use io_uring::squeue::Entry as SEntry;
-pub use register::OwnedRegisteredFile;
-pub use register::RegisterError;
-pub use register::RegisteredFile;
-pub use requests::Target;
-
-use pending_io::fallback::Spawnable;
-use pending_io::uring::{PendingMap, UringPendingIoStatus, UringPendingIoSubmitter};
-use ticketing::SubmissionTicketId;
-
-use crate::helpers;
 
 /// Maximum length for a single io_uring read/write operation.
 ///
@@ -38,15 +49,19 @@ use crate::helpers;
 pub const URING_LEN_MAX: u64 = 2 * 1024 * 1024 * 1024 - 4096;
 
 /// Maximum number of files that can be registered with a single Uring instance.
+#[cfg(target_os = "linux")]
 const MAX_REGISTERED_FILES: u32 = 4096;
 
 /// The client instance for asynchronous I/O operations.
 pub struct Client {
+    #[cfg(target_os = "linux")]
     uring: Option<ClientUring>,
+    #[cfg(target_os = "linux")]
     uring_enabled: Arc<AtomicBool>,
     fallback_spawner: Arc<dyn Spawnable>,
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) struct ClientUring {
     submission_sender: crossbeam_channel::Sender<UringPendingIoSubmitter>,
     active_requests: Arc<AtomicUsize>,
@@ -65,17 +80,20 @@ impl UnwindSafe for Client {}
 
 impl Drop for Client {
     fn drop(&mut self) {
-        // Remove the uring instance, then join the threads.
-        let uring = self.uring.take();
-        if let Some(uring) = uring {
-            drop(uring.submission_sender);
-            drop(uring.uring);
-            let _ = uring.sthread.join().inspect_err(|e| {
-                log::error!("submission thread panicked: {:?}", e);
-            });
-            let _ = uring.cthread.join().inspect_err(|e| {
-                log::error!("completion thread panicked: {:?}", e);
-            });
+        #[cfg(target_os = "linux")]
+        {
+            // Remove the uring instance, then join the threads.
+            let uring = self.uring.take();
+            if let Some(uring) = uring {
+                drop(uring.submission_sender);
+                drop(uring.uring);
+                let _ = uring.sthread.join().inspect_err(|e| {
+                    log::error!("submission thread panicked: {:?}", e);
+                });
+                let _ = uring.cthread.join().inspect_err(|e| {
+                    log::error!("completion thread panicked: {:?}", e);
+                });
+            }
         }
     }
 }
@@ -190,6 +208,7 @@ impl Default for UringCfg {
 impl Client {
     /// Builds a new client with the given configuration.
     pub fn build(cfg: UringCfg) -> Result<Client, ClientBuildError> {
+        #[cfg(target_os = "linux")]
         let expected_total_squeue_size = cfg
             .operation_queue_size
             .checked_add(cfg.cancel_queue_size)
@@ -199,9 +218,8 @@ impl Client {
                     "total queue size is too large",
                 ))
             })?;
-
+        #[cfg(target_os = "linux")]
         let ring = {
-            #[cfg(target_os = "linux")]
             let mut builder = IoUring::<SEntry, CEntry>::builder();
             if cfg.coop_taskrun {
                 builder.setup_coop_taskrun();
@@ -228,13 +246,19 @@ impl Client {
                 None
             }
         };
+        #[allow(unused_mut)]
         let mut client = Client {
+            #[cfg(target_os = "linux")]
             uring: None,
+            #[cfg(target_os = "linux")]
             uring_enabled: Arc::new(AtomicBool::new(true)),
             fallback_spawner: cfg.fallback_spawner,
         };
+        #[cfg(target_os = "linux")]
         if let Some(mut ring) = ring {
             // Pre-allocate sparse file table for registration (Linux 5.12+). If this fails, file registration won't work but unregistered fds will still function.
+
+            use crate::client::uring_background::InterruptCommand;
             let _ = ring.submitter().register_files_sparse(MAX_REGISTERED_FILES);
             // Limit squeue to usize::MAX - 3 to avoid conflict with the reserved IDs.
             let actual_total_squeue_size = ring.submission().capacity().min(usize::MAX - 3);
@@ -289,7 +313,7 @@ impl Client {
                     let ring = ring.clone();
                     let pending_map = pending_map.clone();
                     move || {
-                        submission_thread(
+                        uring_background::submission_thread(
                             ring,
                             pending_map,
                             submission_receiver,
@@ -305,7 +329,7 @@ impl Client {
                     let pending = pending_map.clone();
                     let ring = ring.clone();
                     let interrupt_sender = interrupt_sender.clone();
-                    move || completion_thread(ring, pending, interrupt_sender)
+                    move || uring_background::completion_thread(ring, pending, interrupt_sender)
                 })
                 .expect("should spawn thread");
             let mut probe = io_uring::Probe::new();
@@ -325,279 +349,6 @@ impl Client {
             });
         }
         Ok(client)
-    }
-}
-
-/// Dropper for stopping the completion thread by submitting a poison ticket. Should not allocate memory from the heap, and works if the thread either exits normally or panics.
-pub(crate) struct SubmissionDropper {
-    uring: Arc<IoUring>,
-    pending_map: Arc<PendingMap>,
-}
-
-impl SubmissionDropper {
-    pub(crate) fn new(uring: Arc<IoUring>, pending_map: Arc<PendingMap>) -> Self {
-        Self { uring, pending_map }
-    }
-}
-
-impl Drop for SubmissionDropper {
-    // Drop handler. Should not allocate memory from the heap
-    fn drop(&mut self) {
-        let mut submission = unsafe { self.uring.submission_shared() };
-        submission.sync();
-        // Cancel everything in the pending map. At this stage, no operations can be marked as submitted anymore, so there is no race condition.
-        // The existence of the cancellation queue where operations are completed instantaneously guarantees that there is always a space for these special operations.
-        for kv in self.pending_map.iter() {
-            let id = kv.key();
-            let filler = kv.value();
-            if filler.status() != UringPendingIoStatus::Submitted {
-                continue;
-            }
-            // Allowing multiple operations to use the same ticket is OK here because we do not expect a response and no discriminator is necessary.
-            let entry = io_uring::opcode::AsyncCancel::new(id.0)
-                .build()
-                .user_data(SubmissionTicketId::POISON_CANCEL.0);
-            while unsafe { submission.push(&entry) }.is_err() {
-                self.uring.submit_and_wait(1).expect(
-                    "failed to wait for empty submission slot and submit cancellation operations",
-                );
-                submission.sync();
-                continue;
-            }
-        }
-        submission.sync();
-        helpers::retry_on_eintr(|| self.uring.submitter().submit())
-            .expect("failed to submit last batch of cancellation operations");
-        // Poison pill is guaranteed to be the last item, after all operations are done or cancelled. The IO_DRAIN flag ensures that the cancellation have all finished.
-        let entry = io_uring::opcode::Nop::new()
-            .build()
-            .user_data(SubmissionTicketId::POISON.0)
-            .flags(io_uring::squeue::Flags::IO_DRAIN);
-        while unsafe { submission.push(&entry) }.is_err() {
-            // The queue is in latest state, so if we cannot submit, we can safely wait for an event.
-            helpers::retry_on_eintr(|| self.uring.submit_and_wait(1))
-                .expect("failed to wait for empty submission slot");
-            submission.sync();
-        }
-        submission.sync();
-        helpers::retry_on_eintr(|| self.uring.submitter().submit())
-            .expect("failed to submit poison entry");
-    }
-}
-
-pub(crate) enum InterruptCommand {
-    SubmissionCleanup,
-    SubmissionPanic,
-    CompletionPanic,
-}
-
-/// Thread for batching the io_uring_enter syscall to flush entries to the io_uring instance.
-fn submission_thread(
-    ring: Arc<IoUring>,
-    pending_map: Arc<PendingMap>,
-    command_receiver: crossbeam_channel::Receiver<UringPendingIoSubmitter>,
-    ticket_queue: SubmissionTicketQueue,
-    interrupt: crossbeam_channel::Receiver<InterruptCommand>,
-) {
-    let _submission_dropper = SubmissionDropper::new(ring.clone(), pending_map.clone());
-    let mut submission = unsafe { ring.submission_shared() };
-    // Set up reserves for batching. If either the command queue or both ticket queues run out, we need to wait.
-    let mut normal_command_queue =
-        VecDeque::with_capacity(ticket_queue.normal_operation_capacity());
-    let mut normal_ticket_queue = VecDeque::with_capacity(ticket_queue.normal_operation_capacity());
-    let mut cancel_command_queue =
-        VecDeque::with_capacity(ticket_queue.cancel_operation_capacity());
-    let mut cancel_ticket_queue = VecDeque::with_capacity(ticket_queue.cancel_operation_capacity());
-    let total_capacity = ticket_queue.total_capacity();
-    let mut ll_entries = VecDeque::with_capacity(total_capacity);
-    let mut command_submitters = VecDeque::with_capacity(total_capacity);
-    // Low-level receiver is necessary for multiplexing
-    let ticket_receiver = ticket_queue.receiver();
-    loop {
-        crossbeam_channel::select! {
-            recv(interrupt) -> command => {
-                match command {
-                    Ok(InterruptCommand::SubmissionPanic) => {
-                        panic!("submission thread intentionally panicked");
-                    }
-                    Ok(InterruptCommand::CompletionPanic) => {
-                        let entry = io_uring::opcode::Nop::new()
-                            .build()
-                            .user_data(SubmissionTicketId::COMPLETION_PANIC.0);
-                        while unsafe { submission.push(&entry) }.is_err() {
-                            ring.submitter().submit_and_wait(1).expect("failed to wait for empty submission slot");
-                            submission.sync();
-                            continue;
-                        }
-                        submission.sync();
-                        ring.submitter()
-                            .submit()
-                            .expect("failed to submit entry that triggers completion panics");
-                        continue;
-                    }
-                    Ok(InterruptCommand::SubmissionCleanup) => {
-                        break;
-                    }
-                    Err(crossbeam_channel::RecvError) => panic!("interrupt channel closed"),
-                }
-            }
-            recv(ticket_receiver) -> id => {
-                match id {
-                    Ok(id) => {
-                        let ticket = ticket_queue.create_ticket(id);
-                        if ticket_queue.is_cancel_ticket(&ticket) {
-                            cancel_ticket_queue.push_back(ticket);
-                        } else {
-                            normal_ticket_queue.push_back(ticket);
-                        }
-                    },
-                    Err(crossbeam_channel::RecvError) => break,
-                }
-            }
-            recv(command_receiver) -> item => {
-                match item {
-                    Ok(item) => {
-                        if item.is_cancel() {
-                            cancel_command_queue.push_back(item);
-                        } else {
-                            normal_command_queue.push_back(item);
-                        }
-                    },
-                    Err(crossbeam_channel::RecvError) => break,
-                }
-            }
-        };
-        // Receive additional items from the channels if possible
-        while let Ok(additional_item) = command_receiver.try_recv() {
-            if additional_item.is_cancel() {
-                cancel_command_queue.push_back(additional_item);
-            } else {
-                normal_command_queue.push_back(additional_item);
-            }
-        }
-        while let Ok(additional_id) = ticket_receiver.try_recv() {
-            let ticket = ticket_queue.create_ticket(additional_id);
-            if ticket_queue.is_cancel_ticket(&ticket) {
-                cancel_ticket_queue.push_back(ticket);
-            } else {
-                normal_ticket_queue.push_back(ticket);
-            }
-        }
-        // Generate cancel entries from reserve
-        while !cancel_command_queue.is_empty() && !cancel_ticket_queue.is_empty() {
-            let command = cancel_command_queue
-                .pop_front()
-                .expect("cancel command queue should not be empty");
-            let ticket = cancel_ticket_queue
-                .pop_front()
-                .expect("cancel ticket queue should not be empty");
-            let ticket_id = ticket.id();
-            let entry = command.assign_ticket(Arc::new(ticket));
-            if let Some(entry) = entry {
-                pending_map.insert(ticket_id, command.filler());
-                ll_entries.push_back(entry);
-                command_submitters.push_back(command);
-            }
-        }
-        // Generate normal entries from reserve
-        while !normal_command_queue.is_empty() && !normal_ticket_queue.is_empty() {
-            let command = normal_command_queue
-                .pop_front()
-                .expect("normal command queue should not be empty");
-            let ticket = normal_ticket_queue
-                .pop_front()
-                .expect("normal ticket queue should not be empty");
-            let ticket_id = ticket.id();
-            let entry = command.assign_ticket(Arc::new(ticket));
-            if let Some(entry) = entry {
-                pending_map.insert(ticket_id, command.filler());
-                ll_entries.push_back(entry);
-                command_submitters.push_back(command);
-            }
-        }
-        // If there are no entries to submit, we resume the waiting.
-        if ll_entries.is_empty() {
-            continue;
-        }
-        // Submit entries
-        for ll_entry in ll_entries.drain(..) {
-            while unsafe { submission.push(&ll_entry) }.is_err() {
-                // We need to synchronize the head and tail before retrying because it is stale. However, we do not need to block because the queues restrict the number of active tickets.
-                submission.sync();
-                continue;
-            }
-        }
-        submission.sync();
-        helpers::retry_on_eintr(|| ring.submitter().submit())
-            .expect("failed to perform batch submit");
-        // Mark entries as submitted
-        for submitter in command_submitters.drain(..) {
-            submitter.mark_submitted();
-        }
-    }
-}
-
-struct CompletionDropper {
-    interrupt_sender: crossbeam_channel::Sender<InterruptCommand>,
-    poison_lock: std::sync::Mutex<()>,
-}
-
-impl CompletionDropper {
-    pub(crate) fn new(interrupt_sender: crossbeam_channel::Sender<InterruptCommand>) -> Self {
-        Self {
-            interrupt_sender,
-            poison_lock: std::sync::Mutex::new(()),
-        }
-    }
-}
-
-impl Drop for CompletionDropper {
-    fn drop(&mut self) {
-        // If completion thread is panicking, we need to stop the submission thread and mark all entries in the pending map as failed.
-        if self.poison_lock.is_poisoned() {
-            let _ = self
-                .interrupt_sender
-                .send(InterruptCommand::SubmissionCleanup);
-        }
-    }
-}
-
-/// Thread for handling completions from the io_uring completion queue.
-fn completion_thread(
-    ring: Arc<IoUring>,
-    pending: Arc<PendingMap>,
-    interrupt_sender: crossbeam_channel::Sender<InterruptCommand>,
-) {
-    let mut completion = unsafe { ring.completion_shared() };
-    let completion_dropper = CompletionDropper::new(interrupt_sender.clone());
-    {
-        let _poison_guard = completion_dropper.poison_lock.lock().unwrap();
-        loop {
-            let e = loop {
-                let Some(entry) = completion.next() else {
-                    helpers::retry_on_eintr(|| ring.submitter().submit_and_wait(1))
-                        .expect("failed to wait for completion");
-                    completion.sync();
-                    continue;
-                };
-                break entry;
-            };
-            let id = SubmissionTicketId(e.user_data());
-            if id.is_poison() {
-                break;
-            }
-            // Anonymous cancellation operations, we do not need to respond.
-            if id.is_poison_cancel() {
-                continue;
-            }
-            if id.is_completion_panic() {
-                panic!("completion thread intentionally panicked");
-            }
-            let (_, req) = pending
-                .remove(&id)
-                .expect("completion for unknown request id");
-            completion::handle_completion(req, e.result());
-        }
     }
 }
 

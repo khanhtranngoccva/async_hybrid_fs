@@ -1,6 +1,7 @@
 pub mod chained;
 pub(crate) mod fallback;
 pub(crate) mod fixed_value;
+#[cfg(target_os = "linux")]
 pub(crate) mod uring;
 
 use crate::client::pending_io::chained::ChainedPendingIo;
