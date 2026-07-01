@@ -260,6 +260,7 @@ mod tests {
     use crate::UringCfg;
     use tokio::fs::File;
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     #[test_log::test]
     async fn test_registered_file_try_into_owned() {
@@ -280,6 +281,7 @@ mod tests {
             .expect("failed to convert borrowed registered file to owned file");
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     #[test_log::test]
     async fn test_registered_file_owned() {

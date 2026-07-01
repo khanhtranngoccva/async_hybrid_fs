@@ -405,6 +405,7 @@ mod tests {
         drop(client);
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     #[test_log::test]
     async fn submission_thread_panic_should_not_hang() {
@@ -425,6 +426,7 @@ mod tests {
         task.await.expect("task should not panic");
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     #[test_log::test]
     async fn completion_thread_panic_should_not_hang() {
