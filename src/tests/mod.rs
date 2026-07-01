@@ -1,4 +1,4 @@
-use crate::{Client, HybridFile, HybridRead, HybridSeek, HybridWrite, UringCfg, fs::OpenOptions};
+use crate::{HybridFile, HybridRead, HybridSeek, HybridWrite, fs::OpenOptions};
 use futures::StreamExt;
 use nix::sys::time::TimeSpec;
 use std::{
@@ -8,6 +8,7 @@ use std::{
 };
 use tokio::{fs::File, runtime::Runtime};
 
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn is_uring_available() {
     println!(
@@ -226,16 +227,13 @@ async fn test_read_dir() {
 async fn test_fcntl() {
     let runtime = Runtime::new().unwrap();
     let task = runtime.spawn(async move {
-        let (read_half, _write_half) = std::io::pipe().expect("should be able to create a pipe");
-        let client = Client::build(UringCfg::default()).expect("failed to build client");
-        let mut registered_read_half = client
-            .register_owned(read_half.into())
-            .expect("should be able to register file");
-        registered_read_half
+        let (mut read_half, _write_half) =
+            std::io::pipe().expect("should be able to create a pipe");
+        read_half
             .hybrid_set_nonblocking(true)
             .await
             .expect("should be able to set nonblocking");
-        registered_read_half
+        read_half
             .hybrid_set_nonblocking(false)
             .await
             .expect("should be able to set nonblocking");

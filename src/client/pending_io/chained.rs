@@ -156,6 +156,7 @@ mod tests {
     use std::{io::pipe, os::fd::AsFd};
     use tokio::{runtime::Handle, sync::oneshot};
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn should_not_run_processor_code_if_canceled() {
         if !default_client().is_uring_available_and_active() {

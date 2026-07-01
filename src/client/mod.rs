@@ -394,9 +394,9 @@ impl<'a> UringTarget for BoxedUringTarget<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
-
     use crate::{Client, UringCfg};
+    #[cfg(target_os = "linux")]
+    use std::{sync::Arc, time::Duration};
 
     #[tokio::test]
     #[test_log::test]
