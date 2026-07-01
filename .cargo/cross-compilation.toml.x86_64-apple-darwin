@@ -1,4 +1,4 @@
-[target.aarch64-apple-darwin] 
+[target.x86_64-apple-darwin] 
 linker = ~/SDK/osxcross/target/bin/x86_64-apple-darwin25.1-clang 
 ar = ~/SDK/osxcross/target/bin/x86_64-apple-darwin25.1-ar 
 [env]
